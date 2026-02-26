@@ -136,10 +136,11 @@ class WanModel(nn.Module):
         h_out = h // ph
         w_out = w // pw
 
-        # Reshape: [C, F, H, W] -> [F', pt, H', ph, W', pw, C] -> [F'*H'*W', pt*ph*pw*C]
+        # Reshape: [C, F, H, W] -> [F', H', W', C, pt, ph, pw] -> [F'*H'*W', C*pt*ph*pw]
+        # Order must be [C, pt, ph, pw] (C slowest) to match Conv3d weight layout
         x = x.reshape(c, f_out, pt, h_out, ph, w_out, pw)
-        x = x.transpose(1, 3, 5, 2, 4, 6, 0)  # [F', H', W', pt, ph, pw, C]
-        x = x.reshape(f_out * h_out * w_out, -1)  # [L, patch_dim]
+        x = x.transpose(1, 3, 5, 0, 2, 4, 6)  # [F', H', W', C, pt, ph, pw]
+        x = x.reshape(f_out * h_out * w_out, -1)  # [L, C*pt*ph*pw]
 
         # Project and cast to model dtype to prevent float32 cascade from input latents
         patches = self.patch_embedding_proj(x)  # [L, dim]
