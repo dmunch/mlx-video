@@ -147,6 +147,9 @@ python -m mlx_video.convert_wan \
 | `--output-dir` | `wan_mlx_model` | Output path for MLX model |
 | `--dtype` | `bfloat16` | Target dtype (`float16`, `float32`, `bfloat16`) |
 | `--model-version` | `auto` | Model version: `2.1`, `2.2`, or `auto` |
+| `--quantize` | off | Quantize transformer weights for reduced memory |
+| `--bits` | `4` | Quantization bits: `4` or `8` |
+| `--group-size` | `64` | Quantization group size: `32`, `64`, or `128` |
 
 The converter produces:
 ```
@@ -207,6 +210,32 @@ The pipeline auto-detects the model version from `config.json` and selects the r
 | `--shift` | from config | Noise schedule shift |
 | `--seed` | -1 (random) | Random seed for reproducibility |
 | `--output-path` | `output.mp4` | Output video path |
+
+### Quantization (Reduced Memory)
+
+Quantize the transformer weights to reduce memory usage by ~3.4x. This is especially useful for the 14B model or memory-constrained devices:
+
+```bash
+# Convert with 4-bit quantization
+python -m mlx_video.convert_wan \
+    --checkpoint-dir /path/to/Wan2.1-T2V-1.3B \
+    --output-dir wan21_mlx_q4 \
+    --quantize --bits 4 --group-size 64
+
+# Generate with quantized model (auto-detected from config.json)
+python -m mlx_video.generate_wan \
+    --model-dir wan21_mlx_q4 \
+    --prompt "A cat playing piano"
+```
+
+**What gets quantized**: Self-attention (Q/K/V/O), cross-attention (Q/K/V/O), and FFN (fc1/fc2) — 10 layers × N blocks = ~95% of model weights. Embeddings, norms, and the output head remain in bfloat16 for precision.
+
+| Model | BF16 Size | 4-bit Size | Notes |
+|-------|-----------|------------|-------|
+| 1.3B | 2.7 GB | 799 MB | ~3.4x smaller |
+| 14B | ~28 GB | ~8 GB | Enables running on 16GB devices |
+
+> **Note**: On Apple Silicon, the 1.3B model fits comfortably in unified memory at bf16. Quantization reduces memory but may not speed up inference for small models. For the 14B model, quantization is essential to fit in memory and will also improve speed.
 
 ### Wan Model Specifications
 

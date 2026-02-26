@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict
 
 import mlx.core as mx
+import mlx.utils
 import numpy as np
 
 
@@ -214,6 +215,9 @@ def convert_wan_checkpoint(
     output_dir: str,
     dtype: str = "bfloat16",
     model_version: str = "auto",
+    quantize: bool = False,
+    bits: int = 4,
+    group_size: int = 64,
 ):
     """Convert a Wan2.1 or Wan2.2 checkpoint directory to MLX format.
 
@@ -235,6 +239,9 @@ def convert_wan_checkpoint(
         output_dir: Path to output MLX model directory
         dtype: Target dtype
         model_version: "2.1", "2.2", or "auto" (detect from directory)
+        quantize: Whether to quantize the transformer weights
+        bits: Quantization bits (4 or 8)
+        group_size: Quantization group size (32, 64, or 128)
     """
     import json
 
@@ -358,7 +365,87 @@ def convert_wan_checkpoint(
         json.dump(config.to_dict(), f, indent=2)
     print(f"  Saved config to {config_path}")
 
+    # Quantize transformer weights if requested
+    if quantize:
+        print(f"\nQuantizing transformer weights ({bits}-bit, group_size={group_size})...")
+        _quantize_saved_model(output_dir, config, is_dual, bits, group_size)
+
     print(f"\nConversion complete! Output: {output_dir}")
+
+
+def _quantize_predicate(path: str, module) -> bool:
+    """Return True for layers that should be quantized.
+
+    Targets heavyweight Linear layers in attention and FFN blocks.
+    Skips embeddings, norms, head, and modulation (small, precision-sensitive).
+    """
+    if not hasattr(module, "to_quantized"):
+        return False
+    # Quantize attention Q/K/V/O and FFN fc1/fc2
+    quantize_patterns = (
+        ".self_attn.q", ".self_attn.k", ".self_attn.v", ".self_attn.o",
+        ".cross_attn.q", ".cross_attn.k", ".cross_attn.v", ".cross_attn.o",
+        ".ffn.fc1", ".ffn.fc2",
+    )
+    return any(path.endswith(p) for p in quantize_patterns)
+
+
+def _quantize_saved_model(
+    output_dir: Path,
+    config,
+    is_dual: bool,
+    bits: int,
+    group_size: int,
+):
+    """Load saved bf16 model, quantize, and re-save."""
+    import json
+
+    import mlx.nn as nn
+
+    from mlx_video.models.wan.model import WanModel
+
+    model_files = []
+    if is_dual:
+        for name in ["low_noise_model.safetensors", "high_noise_model.safetensors"]:
+            p = output_dir / name
+            if p.exists():
+                model_files.append(p)
+    else:
+        p = output_dir / "model.safetensors"
+        if p.exists():
+            model_files.append(p)
+
+    for model_path in model_files:
+        print(f"  Quantizing {model_path.name}...")
+        model = WanModel(config)
+        weights = mx.load(str(model_path))
+        model.load_weights(list(weights.items()), strict=False)
+
+        # Apply quantization to targeted layers
+        nn.quantize(
+            model,
+            group_size=group_size,
+            bits=bits,
+            class_predicate=lambda path, m: _quantize_predicate(path, m),
+        )
+
+        # Save quantized weights
+        weights_dict = dict(mlx.utils.tree_flatten(model.parameters()))
+        mx.save_safetensors(str(model_path), weights_dict)
+        n_quantized = sum(1 for k in weights_dict if ".scales" in k)
+        print(f"    {n_quantized} layers quantized, {len(weights_dict)} tensors saved")
+
+    # Update config.json with quantization metadata
+    config_path = output_dir / "config.json"
+    with open(config_path) as f:
+        cfg = json.load(f)
+    cfg["quantization"] = {
+        "group_size": group_size,
+        "bits": bits,
+    }
+    with open(config_path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"  Updated config.json with quantization metadata")
 
 
 if __name__ == "__main__":
@@ -391,7 +478,27 @@ if __name__ == "__main__":
         default="auto",
         help="Wan model version (auto-detect by default)",
     )
+    parser.add_argument(
+        "--quantize",
+        action="store_true",
+        help="Quantize transformer weights for faster inference",
+    )
+    parser.add_argument(
+        "--bits",
+        type=int,
+        choices=[4, 8],
+        default=4,
+        help="Quantization bits (default: 4)",
+    )
+    parser.add_argument(
+        "--group-size",
+        type=int,
+        choices=[32, 64, 128],
+        default=64,
+        help="Quantization group size (default: 64)",
+    )
     args = parser.parse_args()
     convert_wan_checkpoint(
-        args.checkpoint_dir, args.output_dir, args.dtype, args.model_version
+        args.checkpoint_dir, args.output_dir, args.dtype, args.model_version,
+        quantize=args.quantize, bits=args.bits, group_size=args.group_size,
     )

@@ -47,6 +47,7 @@ class WanAttentionBlock(nn.Module):
         freqs: mx.array,
         context: mx.array,
         context_lens: list | None = None,
+        cross_kv_cache: tuple | None = None,
     ) -> mx.array:
         # Compute modulation: e is [B, 1, 6, dim] (broadcasts over tokens)
         mod = (self.modulation + e)  # [1, 6, dim] + [B, 1, 6, dim] -> [B, 1, 6, dim]
@@ -65,7 +66,7 @@ class WanAttentionBlock(nn.Module):
 
         # Cross-attention (no modulation, just norm)
         x_cross = self.norm3(x) if self.norm3 is not None else x
-        x = x + self.cross_attn(x_cross, context, context_lens)
+        x = x + self.cross_attn(x_cross, context, context_lens, kv_cache=cross_kv_cache)
 
         # FFN with modulation
         x_mod = self.norm2(x) * (1 + e4) + e3

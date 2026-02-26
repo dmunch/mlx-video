@@ -25,11 +25,29 @@ class Colors:
     RESET = "\033[0m"
 
 
-def load_wan_model(model_path: Path, config):
-    """Load and initialize WanModel."""
+def load_wan_model(model_path: Path, config, quantization: dict | None = None):
+    """Load and initialize WanModel, with optional quantization support.
+
+    Args:
+        model_path: Path to model safetensors file
+        config: WanModelConfig
+        quantization: Optional dict with 'bits' and 'group_size' keys.
+                      If provided, creates QuantizedLinear stubs before loading.
+    """
     from mlx_video.models.wan.model import WanModel
 
     model = WanModel(config)
+
+    if quantization:
+        from mlx_video.convert_wan import _quantize_predicate
+
+        nn.quantize(
+            model,
+            group_size=quantization["group_size"],
+            bits=quantization["bits"],
+            class_predicate=lambda path, m: _quantize_predicate(path, m),
+        )
+
     weights = mx.load(str(model_path))
     model.load_weights(list(weights.items()), strict=False)
     mx.eval(model.parameters())
@@ -138,9 +156,12 @@ def generate_video(
 
     # Load config from model dir if available, otherwise auto-detect
     config_path = model_dir / "config.json"
+    quantization = None
     if config_path.exists():
         with open(config_path) as f:
             config_dict = json.load(f)
+        # Extract quantization config (not a model config field)
+        quantization = config_dict.pop("quantization", None)
         # Handle tuple fields stored as lists in JSON
         for key in ("patch_size", "vae_stride", "window_size", "sample_guide_scale"):
             if key in config_dict and isinstance(config_dict[key], list):
@@ -269,15 +290,17 @@ def generate_video(
 
     # Load transformer models
     print(f"\n{Colors.BLUE}Loading transformer model(s)...{Colors.RESET}")
+    if quantization:
+        print(f"{Colors.DIM}  Using {quantization['bits']}-bit quantized weights (group_size={quantization['group_size']}){Colors.RESET}")
     t2 = time.time()
 
     if is_dual:
         low_noise_path = model_dir / "low_noise_model.safetensors"
         high_noise_path = model_dir / "high_noise_model.safetensors"
-        low_noise_model = load_wan_model(low_noise_path, config)
-        high_noise_model = load_wan_model(high_noise_path, config)
+        low_noise_model = load_wan_model(low_noise_path, config, quantization)
+        high_noise_model = load_wan_model(high_noise_path, config, quantization)
     else:
-        single_model = load_wan_model(model_dir / "model.safetensors", config)
+        single_model = load_wan_model(model_dir / "model.safetensors", config, quantization)
     print(f"{Colors.DIM}  Models loaded: {time.time() - t2:.1f}s{Colors.RESET}")
 
     # Precompute text embeddings once (avoids redundant MLP in every step)
@@ -288,6 +311,15 @@ def generate_video(
     context_uncond = context_emb[1:2]  # [1, text_len, dim]
     # Stack for batched CFG: [2, text_len, dim]
     context_cfg = mx.concatenate([context_cond, context_uncond], axis=0)
+
+    # Precompute cross-attention K/V caches (constant across all steps)
+    if is_dual:
+        cross_kv_low = low_noise_model.prepare_cross_kv(context_cfg)
+        cross_kv_high = high_noise_model.prepare_cross_kv(context_cfg)
+        mx.eval(cross_kv_low, cross_kv_high)
+    else:
+        cross_kv = single_model.prepare_cross_kv(context_cfg)
+        mx.eval(cross_kv)
 
     # Setup scheduler
     scheduler = FlowMatchEulerScheduler(num_train_timesteps=config.num_train_timesteps)
@@ -307,17 +339,20 @@ def generate_video(
     for i, t in enumerate(tqdm(range(steps), desc="Diffusion")):
         timestep_val = scheduler.timesteps[i].item()
 
-        # Select model and guide scale
+        # Select model, guide scale, and cached K/V
         if is_dual:
             if timestep_val >= boundary:
                 model = high_noise_model
                 gs = guide_scale[1]
+                kv = cross_kv_high
             else:
                 model = low_noise_model
                 gs = guide_scale[0]
+                kv = cross_kv_low
         else:
             model = single_model
             gs = guide_scale if isinstance(guide_scale, (int, float)) else guide_scale[0]
+            kv = cross_kv
 
         # CFG: batch cond + uncond into single B=2 forward pass
         preds = model(
@@ -325,6 +360,7 @@ def generate_video(
             t=mx.array([timestep_val, timestep_val]),
             context=context_cfg,
             seq_len=seq_len,
+            cross_kv_caches=kv,
         )
         noise_pred_cond, noise_pred_uncond = preds[0], preds[1]
 

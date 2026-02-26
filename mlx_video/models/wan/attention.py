@@ -138,30 +138,52 @@ class WanCrossAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else None
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else None
 
+    def prepare_kv(self, context: mx.array) -> tuple:
+        """Pre-compute K and V projections for caching.
+
+        Args:
+            context: [B, L_ctx, dim]
+
+        Returns:
+            (k, v) each [B, N, L_ctx, D] ready for attention
+        """
+        b = context.shape[0]
+        n, d = self.num_heads, self.head_dim
+        k = self.k(context)
+        if self.norm_k is not None:
+            k = self.norm_k(k)
+        k = k.reshape(b, -1, n, d).transpose(0, 2, 1, 3)
+        v = self.v(context).reshape(b, -1, n, d).transpose(0, 2, 1, 3)
+        return k, v
+
     def __call__(
         self,
         x: mx.array,
         context: mx.array,
         context_lens: list | None = None,
+        kv_cache: tuple | None = None,
     ) -> mx.array:
         b = x.shape[0]
         n, d = self.num_heads, self.head_dim
 
         q = self.q(x)
-        k = self.k(context)
         if self.norm_q is not None:
             q = self.norm_q(q)
-        if self.norm_k is not None:
-            k = self.norm_k(k)
-
         q = q.reshape(b, -1, n, d).transpose(0, 2, 1, 3)
-        k = k.reshape(b, -1, n, d).transpose(0, 2, 1, 3)
-        v = self.v(context).reshape(b, -1, n, d).transpose(0, 2, 1, 3)
+
+        if kv_cache is not None:
+            k, v = kv_cache
+        else:
+            k = self.k(context)
+            if self.norm_k is not None:
+                k = self.norm_k(k)
+            k = k.reshape(b, -1, n, d).transpose(0, 2, 1, 3)
+            v = self.v(context).reshape(b, -1, n, d).transpose(0, 2, 1, 3)
 
         # Optional context masking
         mask = None
         if context_lens is not None:
-            ctx_len = context.shape[1]
+            ctx_len = k.shape[2]
             mask = mx.zeros((b, 1, 1, ctx_len), dtype=q.dtype)
             for i, cl in enumerate(context_lens):
                 mask[i, :, :, cl:] = -1e9

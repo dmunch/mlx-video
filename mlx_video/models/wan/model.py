@@ -197,12 +197,30 @@ class WanModel(nn.Module):
         )
         return context_batch.astype(model_dtype)
 
+    def prepare_cross_kv(self, context: mx.array) -> list:
+        """Pre-compute cross-attention K/V for all blocks.
+
+        Call once before the diffusion loop to cache K/V projections,
+        eliminating redundant computation at each denoising step.
+
+        Args:
+            context: Pre-embedded text [B, text_len, dim]
+
+        Returns:
+            List of (k, v) tuples, one per block
+        """
+        kv_caches = []
+        for block in self.blocks:
+            kv_caches.append(block.cross_attn.prepare_kv(context))
+        return kv_caches
+
     def __call__(
         self,
         x_list: list,
         t: mx.array,
         context: list | mx.array,
         seq_len: int,
+        cross_kv_caches: list | None = None,
     ) -> list:
         """Forward pass.
 
@@ -212,6 +230,8 @@ class WanModel(nn.Module):
             context: List of raw text embeddings, OR pre-embedded tensor
                      from embed_text() [B, text_len, dim]
             seq_len: Maximum sequence length for padding
+            cross_kv_caches: Optional list of (k, v) tuples from
+                             prepare_cross_kv(), one per block.
 
         Returns:
             List of denoised tensors [C, F, H, W]
@@ -275,8 +295,9 @@ class WanModel(nn.Module):
             context_lens=None,
         )
 
-        for block in self.blocks:
-            x = block(x, **kwargs)
+        for i, block in enumerate(self.blocks):
+            kv = cross_kv_caches[i] if cross_kv_caches is not None else None
+            x = block(x, cross_kv_cache=kv, **kwargs)
 
         # Output head
         x = self.head(x, e)
