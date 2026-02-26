@@ -159,8 +159,8 @@ class AttentionBlock(nn.Module):
         identity = x
         b, c, t, h, w = x.shape
 
-        # Process each frame: [B,C,T,H,W] -> [BT,C,H,W] -> norm -> [BT,H,W,C]
-        x = x.reshape(b * t, c, h, w)
+        # [B,C,T,H,W] -> [B,T,C,H,W] -> [BT,C,H,W] -> norm -> [BT,H,W,C]
+        x = x.transpose(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
         x = self.norm(x)
         x = x.transpose(0, 2, 3, 1)  # [BT, H, W, C]
 
@@ -175,7 +175,7 @@ class AttentionBlock(nn.Module):
         out = out.squeeze(1).reshape(b * t, h, w, c)  # [BT, H, W, C]
 
         out = self.proj(out)  # [BT, H, W, C]
-        out = out.transpose(0, 3, 1, 2).reshape(b, c, t, h, w)  # [B, C, T, H, W]
+        out = out.reshape(b, t, h, w, c).transpose(0, 4, 1, 2, 3)  # [B, C, T, H, W]
         return out + identity
 
 
