@@ -19,7 +19,9 @@ dependencies = [
     "tqdm",
     "opencv-python>=4.12.0.88",
     "Pillow>=10.3.0",
-    "mlx-vlm"
+    "mlx-vlm",
+    "imageio>=2.37.2",
+    "imageio-ffmpeg>=0.6.0",
 ]
 license = {text="MIT"}
 authors = [
