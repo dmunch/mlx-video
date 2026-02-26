@@ -280,6 +280,15 @@ def generate_video(
         single_model = load_wan_model(model_dir / "model.safetensors", config)
     print(f"{Colors.DIM}  Models loaded: {time.time() - t2:.1f}s{Colors.RESET}")
 
+    # Precompute text embeddings once (avoids redundant MLP in every step)
+    ref_model = single_model if not is_dual else low_noise_model
+    context_emb = ref_model.embed_text([context, context_null])
+    mx.eval(context_emb)
+    context_cond = context_emb[0:1]   # [1, text_len, dim]
+    context_uncond = context_emb[1:2]  # [1, text_len, dim]
+    # Stack for batched CFG: [2, text_len, dim]
+    context_cfg = mx.concatenate([context_cond, context_uncond], axis=0)
+
     # Setup scheduler
     scheduler = FlowMatchEulerScheduler(num_train_timesteps=config.num_train_timesteps)
     scheduler.set_timesteps(steps, shift=shift)
@@ -297,7 +306,6 @@ def generate_video(
 
     for i, t in enumerate(tqdm(range(steps), desc="Diffusion")):
         timestep_val = scheduler.timesteps[i].item()
-        timestep = mx.array([timestep_val])
 
         # Select model and guide scale
         if is_dual:
@@ -311,27 +319,21 @@ def generate_video(
             model = single_model
             gs = guide_scale if isinstance(guide_scale, (int, float)) else guide_scale[0]
 
-        # CFG: compute both predictions, apply guidance, and step
-        noise_pred_cond = model(
-            [latents],
-            t=timestep,
-            context=[context],
+        # CFG: batch cond + uncond into single B=2 forward pass
+        preds = model(
+            [latents, latents],
+            t=mx.array([timestep_val, timestep_val]),
+            context=context_cfg,
             seq_len=seq_len,
-        )[0]
-
-        noise_pred_uncond = model(
-            [latents],
-            t=timestep,
-            context=[context_null],
-            seq_len=seq_len,
-        )[0]
+        )
+        noise_pred_cond, noise_pred_uncond = preds[0], preds[1]
 
         # Classifier-free guidance + scheduler step
         noise_pred = noise_pred_uncond + gs * (noise_pred_cond - noise_pred_uncond)
-        latents = scheduler.step(noise_pred[None], timestep, latents[None]).squeeze(0)
+        latents = scheduler.step(noise_pred[None], timestep_val, latents[None]).squeeze(0)
 
         # Release temporaries before eval to free memory for graph execution
-        del noise_pred_cond, noise_pred_uncond, noise_pred
+        del noise_pred_cond, noise_pred_uncond, noise_pred, preds
         mx.eval(latents)
 
     print(f"{Colors.DIM}  Denoising: {time.time() - t3:.1f}s{Colors.RESET}")

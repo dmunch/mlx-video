@@ -172,11 +172,36 @@ class WanModel(nn.Module):
             out.append(u)
         return out
 
+    def embed_text(self, context: list) -> mx.array:
+        """Precompute text embeddings (call once, reuse across steps).
+
+        Args:
+            context: List of text embeddings [L_text, text_dim]
+
+        Returns:
+            Embedded context [B, text_len, dim] in model dtype
+        """
+        model_dtype = self.patch_embedding_proj.weight.dtype
+        context_padded = []
+        for ctx in context:
+            pad_len = self.text_len - ctx.shape[0]
+            if pad_len > 0:
+                ctx = mx.concatenate(
+                    [ctx, mx.zeros((pad_len, ctx.shape[1]), dtype=ctx.dtype)],
+                    axis=0,
+                )
+            context_padded.append(ctx)
+        context_batch = mx.stack(context_padded)  # [B, text_len, text_dim]
+        context_batch = self.text_embedding_1(
+            self.text_embedding_act(self.text_embedding_0(context_batch))
+        )
+        return context_batch.astype(model_dtype)
+
     def __call__(
         self,
         x_list: list,
         t: mx.array,
-        context: list,
+        context: list | mx.array,
         seq_len: int,
     ) -> list:
         """Forward pass.
@@ -184,7 +209,8 @@ class WanModel(nn.Module):
         Args:
             x_list: List of video latent tensors [C, F, H, W]
             t: Timestep tensor [B]
-            context: List of text embeddings [L_text, text_dim]
+            context: List of raw text embeddings, OR pre-embedded tensor
+                     from embed_text() [B, text_len, dim]
             seq_len: Maximum sequence length for padding
 
         Returns:
@@ -216,36 +242,28 @@ class WanModel(nn.Module):
         )  # [B, seq_len, dim]
 
         # Time embedding: compute once per sample, then broadcast to all tokens
-        # t is [B] — same timestep for every token in the sequence
         if t.ndim == 0:
             t = t[None]
         sin_emb = sinusoidal_embedding_1d(self.freq_dim, t)  # [B, freq_dim]
 
-        # Compute time embedding MLP in float32 for precision, then cast to model dtype
+        model_dtype = self.patch_embedding_proj.weight.dtype
         e = self.time_embedding_1(
             self.time_embedding_act(self.time_embedding_0(sin_emb))
         )  # [B, dim]
         e0 = self.time_projection(self.time_projection_act(e))  # [B, dim*6]
-        # Cast to model dtype to prevent float32 cascade through all transformer layers
-        model_dtype = self.patch_embedding_proj.weight.dtype
         e0 = e0.reshape(batch_size, 1, 6, self.dim).astype(model_dtype)
         e = e.astype(model_dtype)
 
-        # Text embedding
-        context_padded = []
-        for ctx in context:
-            pad_len = self.text_len - ctx.shape[0]
-            if pad_len > 0:
-                ctx = mx.concatenate(
-                    [ctx, mx.zeros((pad_len, ctx.shape[1]), dtype=ctx.dtype)],
-                    axis=0,
+        # Text embedding: skip MLP if context is already embedded (mx.array)
+        if isinstance(context, mx.array):
+            # Pre-embedded: expand to batch size if needed
+            context_batch = context
+            if context_batch.shape[0] == 1 and batch_size > 1:
+                context_batch = mx.broadcast_to(
+                    context_batch, (batch_size,) + context_batch.shape[1:]
                 )
-            context_padded.append(ctx)
-        context_batch = mx.stack(context_padded)  # [B, text_len, text_dim]
-        context_batch = self.text_embedding_1(
-            self.text_embedding_act(self.text_embedding_0(context_batch))
-        )
-        context_batch = context_batch.astype(model_dtype)
+        else:
+            context_batch = self.embed_text(context)
 
         # Run transformer blocks
         kwargs = dict(

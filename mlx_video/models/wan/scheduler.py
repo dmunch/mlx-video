@@ -47,31 +47,25 @@ class FlowMatchEulerScheduler:
     def step(
         self,
         model_output: mx.array,
-        timestep: mx.array,
+        timestep,
         sample: mx.array,
     ) -> mx.array:
         """Euler step for flow matching.
 
         In flow matching, model predicts velocity v, and:
-            x0_pred = sample - sigma * v
-            x_{t-1} = x0_pred + sigma_{t-1} * v
-
-        Equivalently (Euler form):
             x_{t-1} = sample + (sigma_{t-1} - sigma_t) * v
 
         Args:
             model_output: Predicted velocity [B, C, T, H, W]
-            timestep: Current timestep
+            timestep: Current timestep (unused, step index is tracked internally)
             sample: Current noisy sample [B, C, T, H, W]
 
         Returns:
             Updated sample
         """
-        sigma = self.sigmas[self._step_index]
-        sigma_next = self.sigmas[self._step_index + 1]
-
-        # Euler step
-        dt = sigma_next - sigma
+        # Use Python floats to avoid creating mx.array scalars that
+        # could trigger type promotion (per fast-mlx guide)
+        dt = float(self.sigmas[self._step_index + 1].item()) - float(self.sigmas[self._step_index].item())
         x_next = sample + dt * model_output
 
         self._step_index += 1
