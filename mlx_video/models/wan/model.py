@@ -44,14 +44,16 @@ class Head(nn.Module):
         """
         Args:
             x: [B, L, dim]
-            e: [B, L, dim] (time embedding)
+            e: [B, dim] or [B, 1, dim] (time embedding, broadcast to all tokens)
         """
+        if e.ndim == 2:
+            e = e[:, None, :]  # [B, 1, dim]
         e_f32 = e.astype(mx.float32)
-        mod = (self.modulation[None, :, :, :] + e_f32[:, :, None, :])  # [B, L, 2, dim]
-        e0 = mod[:, :, 0, :]  # shift
-        e1 = mod[:, :, 1, :]  # scale
+        mod = (self.modulation + e_f32)  # broadcasts [1, 2, dim] + [B, 1, dim] -> [B, 2, dim]
+        e0 = mod[:, 0:1, :]  # [B, 1, dim] shift
+        e1 = mod[:, 1:2, :]  # [B, 1, dim] scale
         x_norm = self.norm(x).astype(mx.float32)
-        x_mod = x_norm * (1 + e1) + e0
+        x_mod = x_norm * (1 + e1) + e0  # broadcasts over L
         return self.head(x_mod.astype(x.dtype))
 
 
@@ -139,8 +141,9 @@ class WanModel(nn.Module):
         x = x.transpose(1, 3, 5, 2, 4, 6, 0)  # [F', H', W', pt, ph, pw, C]
         x = x.reshape(f_out * h_out * w_out, -1)  # [L, patch_dim]
 
-        # Project
+        # Project and cast to model dtype to prevent float32 cascade from input latents
         patches = self.patch_embedding_proj(x)  # [L, dim]
+        patches = patches.astype(self.patch_embedding_proj.weight.dtype)
         patches = patches[None, :, :]  # [1, L, dim]
 
         return patches, (f_out, h_out, w_out)
@@ -201,7 +204,8 @@ class WanModel(nn.Module):
         x = mx.concatenate(
             [
                 mx.concatenate(
-                    [p, mx.zeros((1, seq_len - p.shape[1], self.dim))], axis=1
+                    [p, mx.zeros((1, seq_len - p.shape[1], self.dim), dtype=p.dtype)],
+                    axis=1,
                 )
                 if p.shape[1] < seq_len
                 else p
@@ -210,21 +214,21 @@ class WanModel(nn.Module):
             axis=0,
         )  # [B, seq_len, dim]
 
-        # Time embedding: sinusoidal -> MLP -> project to 6*dim for modulation
-        if t.ndim == 1:
-            t_expanded = mx.broadcast_to(t[:, None], (batch_size, seq_len))
-        else:
-            t_expanded = t
-        t_flat = t_expanded.reshape(-1)
+        # Time embedding: compute once per sample, then broadcast to all tokens
+        # t is [B] — same timestep for every token in the sequence
+        if t.ndim == 0:
+            t = t[None]
+        sin_emb = sinusoidal_embedding_1d(self.freq_dim, t)  # [B, freq_dim]
 
-        sin_emb = sinusoidal_embedding_1d(self.freq_dim, t_flat)
-        sin_emb = sin_emb.reshape(batch_size, seq_len, self.freq_dim).astype(mx.float32)
-
+        # Compute time embedding MLP in float32 for precision, then cast to model dtype
         e = self.time_embedding_1(
             self.time_embedding_act(self.time_embedding_0(sin_emb))
-        )
-        e0 = self.time_projection(self.time_projection_act(e))
-        e0 = e0.reshape(batch_size, seq_len, 6, self.dim).astype(mx.float32)
+        )  # [B, dim]
+        e0 = self.time_projection(self.time_projection_act(e))  # [B, dim*6]
+        # Cast to model dtype to prevent float32 cascade through all transformer layers
+        model_dtype = self.patch_embedding_proj.weight.dtype
+        e0 = e0.reshape(batch_size, 1, 6, self.dim).astype(model_dtype)
+        e = e.astype(model_dtype)
 
         # Text embedding
         context_padded = []
@@ -232,13 +236,15 @@ class WanModel(nn.Module):
             pad_len = self.text_len - ctx.shape[0]
             if pad_len > 0:
                 ctx = mx.concatenate(
-                    [ctx, mx.zeros((pad_len, ctx.shape[1]))], axis=0
+                    [ctx, mx.zeros((pad_len, ctx.shape[1]), dtype=ctx.dtype)],
+                    axis=0,
                 )
             context_padded.append(ctx)
         context_batch = mx.stack(context_padded)  # [B, text_len, text_dim]
         context_batch = self.text_embedding_1(
             self.text_embedding_act(self.text_embedding_0(context_batch))
         )
+        context_batch = context_batch.astype(model_dtype)
 
         # Run transformer blocks
         kwargs = dict(

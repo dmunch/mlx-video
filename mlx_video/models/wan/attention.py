@@ -13,8 +13,7 @@ class WanRMSNorm(nn.Module):
         self.weight = mx.ones((dim,))
 
     def __call__(self, x: mx.array) -> mx.array:
-        output = mx.fast.rms_norm(x.astype(mx.float32), mx.ones((x.shape[-1],)), self.eps)
-        return output.astype(x.dtype) * self.weight
+        return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
 class WanLayerNorm(nn.Module):
@@ -29,14 +28,10 @@ class WanLayerNorm(nn.Module):
             self.bias = mx.zeros((dim,))
 
     def __call__(self, x: mx.array) -> mx.array:
-        x_f32 = x.astype(mx.float32)
-        mean = mx.mean(x_f32, axis=-1, keepdims=True)
-        var = mx.var(x_f32, axis=-1, keepdims=True)
-        out = (x_f32 - mean) * mx.rsqrt(var + self.eps)
-        out = out.astype(x.dtype)
         if self.elementwise_affine:
-            out = out * self.weight + self.bias
-        return out
+            return mx.fast.layer_norm(x, self.weight, self.bias, self.eps)
+        else:
+            return mx.fast.layer_norm(x, None, None, self.eps)
 
 
 class WanSelfAttention(nn.Module):
@@ -100,17 +95,22 @@ class WanSelfAttention(nn.Module):
         max_len = s
         mask = None
         if any(sl < max_len for sl in seq_lens):
-            # Create mask: [B, 1, 1, L] where True = attend
-            mask = mx.zeros((b, 1, 1, max_len))
+            mask = mx.zeros((b, 1, 1, max_len), dtype=q.dtype)
             for i, sl in enumerate(seq_lens):
                 mask[i, :, :, sl:] = -1e9
 
-        attn_weights = (q @ k.transpose(0, 1, 3, 2)) * self.scale
+        # Use memory-efficient scaled dot-product attention
+        # mx.fast.scaled_dot_product_attention expects [B, N, L, D]
         if mask is not None:
-            attn_weights = attn_weights + mask
-        attn_weights = mx.softmax(attn_weights.astype(mx.float32), axis=-1).astype(x.dtype)
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.scale, mask=mask
+            )
+        else:
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.scale
+            )
 
-        out = (attn_weights @ v).transpose(0, 2, 1, 3).reshape(b, s, -1)
+        out = out.transpose(0, 2, 1, 3).reshape(b, s, -1)
         return self.o(out)
 
 
@@ -162,14 +162,18 @@ class WanCrossAttention(nn.Module):
         mask = None
         if context_lens is not None:
             ctx_len = context.shape[1]
-            mask = mx.zeros((b, 1, 1, ctx_len))
+            mask = mx.zeros((b, 1, 1, ctx_len), dtype=q.dtype)
             for i, cl in enumerate(context_lens):
                 mask[i, :, :, cl:] = -1e9
 
-        attn_weights = (q @ k.transpose(0, 1, 3, 2)) * self.scale
         if mask is not None:
-            attn_weights = attn_weights + mask
-        attn_weights = mx.softmax(attn_weights.astype(mx.float32), axis=-1).astype(x.dtype)
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.scale, mask=mask
+            )
+        else:
+            out = mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.scale
+            )
 
-        out = (attn_weights @ v).transpose(0, 2, 1, 3).reshape(b, -1, n * d)
+        out = out.transpose(0, 2, 1, 3).reshape(b, -1, n * d)
         return self.o(out)

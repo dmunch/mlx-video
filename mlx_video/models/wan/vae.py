@@ -56,7 +56,7 @@ class CausalConv3d(nn.Module):
 
         # Causal temporal padding: only pad before
         if self._causal_pad_t > 0:
-            pad_t = mx.zeros((b, c, self._causal_pad_t, h, w))
+            pad_t = mx.zeros((b, c, self._causal_pad_t, h, w), dtype=x.dtype)
             x = mx.concatenate([pad_t, x], axis=2)
 
         # Spatial padding
@@ -94,6 +94,8 @@ class CausalConv3d(nn.Module):
         w_out = (w - kw) // sw + 1
 
         # Unfold time dimension and use 2D conv per time window
+        # Pre-reshape weight once instead of per timestep
+        w_2d = self.weight.transpose(0, 2, 3, 1, 4).reshape(c_out, kh, kw, kt * c_in)
         outputs = []
         for t_i in range(t_out):
             t_start = t_i * st
@@ -101,9 +103,6 @@ class CausalConv3d(nn.Module):
             window = x[:, t_start : t_start + kt]
             # Reshape to [B, H, W, kt * C_in]
             window = window.transpose(0, 2, 3, 1, 4).reshape(b, h, w, kt * c_in)
-
-            # Reshape weight: [O, kt, kh, kw, C_in] -> [O, kh, kw, kt * C_in]
-            w_2d = self.weight.transpose(0, 2, 3, 1, 4).reshape(c_out, kh, kw, kt * c_in)
 
             # 2D convolution
             out_2d = _conv2d(window, w_2d, self.bias, (sh, sw))
@@ -199,8 +198,8 @@ class AttentionBlock(nn.Module):
         k = k[:, None, :, :]
         v = v[:, None, :, :]
         scale = c**-0.5
-        attn = mx.softmax((q @ k.transpose(0, 1, 3, 2)) * scale, axis=-1)
-        out = (attn @ v).squeeze(1)  # [BT, HW, C]
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
+        out = out.squeeze(1)  # [BT, HW, C]
         out = out.reshape(b * t, h, w, c)
 
         out = self.proj(out)

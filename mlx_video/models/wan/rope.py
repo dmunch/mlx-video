@@ -39,6 +39,10 @@ def rope_apply(
     b, s, n, d = x.shape
     half_d = d // 2
 
+    # Cast freqs to input dtype to prevent float32 promotion cascade
+    if freqs.dtype != x.dtype:
+        freqs = freqs.astype(x.dtype)
+
     # Split frequency dimensions: temporal gets more capacity
     d_t = half_d - 2 * (half_d // 3)
     d_h = half_d // 3

@@ -48,10 +48,9 @@ class WanAttentionBlock(nn.Module):
         context: mx.array,
         context_lens: list | None = None,
     ) -> mx.array:
-        # Compute modulation: e is [B, L, 6, dim]
-        e_f32 = e.astype(mx.float32)
-        mod = (self.modulation[None, :, :, :] + e_f32)  # [B, L, 6, dim]
-        # Split into 6 modulation vectors
+        # Compute modulation: e is [B, 1, 6, dim] (broadcasts over tokens)
+        mod = (self.modulation + e)  # [1, 6, dim] + [B, 1, 6, dim] -> [B, 1, 6, dim]
+        # Split into 6 modulation vectors (each [B, 1, dim], broadcast over L)
         e0 = mod[:, :, 0, :]  # shift for self-attn
         e1 = mod[:, :, 1, :]  # scale for self-attn
         e2 = mod[:, :, 2, :]  # gate for self-attn
@@ -60,20 +59,18 @@ class WanAttentionBlock(nn.Module):
         e5 = mod[:, :, 5, :]  # gate for ffn
 
         # Self-attention with modulation
-        x_norm = self.norm1(x).astype(mx.float32)
-        x_mod = (x_norm * (1 + e1) + e0).astype(x.dtype)
+        x_mod = self.norm1(x) * (1 + e1) + e0
         y = self.self_attn(x_mod, seq_lens, grid_sizes, freqs)
-        x = (x.astype(mx.float32) + y.astype(mx.float32) * e2).astype(x.dtype)
+        x = x + y * e2
 
         # Cross-attention (no modulation, just norm)
         x_cross = self.norm3(x) if self.norm3 is not None else x
         x = x + self.cross_attn(x_cross, context, context_lens)
 
         # FFN with modulation
-        x_norm = self.norm2(x).astype(mx.float32)
-        x_mod = (x_norm * (1 + e4) + e3).astype(x.dtype)
+        x_mod = self.norm2(x) * (1 + e4) + e3
         y = self.ffn(x_mod)
-        x = (x.astype(mx.float32) + y.astype(mx.float32) * e5).astype(x.dtype)
+        x = x + y * e5
 
         return x
 

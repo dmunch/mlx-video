@@ -323,12 +323,36 @@ def convert_wan_checkpoint(
         mx.save_safetensors(str(out_path), weights)
         print(f"  Saved {len(weights)} weight tensors to {out_path}")
 
-    # Save config
+    # Save config — detect model size from transformer weights
     from mlx_video.models.wan.config import WanModelConfig
+
+    def _detect_config(weights_dict, is_dual_model):
+        """Detect config from transformer weight shapes."""
+        dim = None
+        for k, v in weights_dict.items():
+            if "patch_embedding_proj.weight" in k:
+                dim = v.shape[0]
+                break
+        if is_dual_model:
+            return WanModelConfig.wan22_t2v_14b()
+        elif dim is not None and dim <= 2048:
+            print(f"  Auto-detected 1.3B model (dim={dim})")
+            return WanModelConfig.wan21_t2v_1_3b()
+        else:
+            return WanModelConfig.wan21_t2v_14b()
+
+    # Load back the saved transformer weights to detect size
     if is_dual:
         config = WanModelConfig.wan22_t2v_14b()
     else:
-        config = WanModelConfig.wan21_t2v_14b()
+        saved_model = output_dir / "model.safetensors"
+        if saved_model.exists():
+            det_weights = mx.load(str(saved_model))
+            config = _detect_config(det_weights, False)
+            del det_weights
+        else:
+            config = WanModelConfig.wan21_t2v_14b()
+
     config_path = output_dir / "config.json"
     with open(config_path, "w") as f:
         json.dump(config.to_dict(), f, indent=2)

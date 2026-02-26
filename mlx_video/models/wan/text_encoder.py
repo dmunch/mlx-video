@@ -15,10 +15,7 @@ class T5LayerNorm(nn.Module):
         self.weight = mx.ones((dim,))
 
     def __call__(self, x: mx.array) -> mx.array:
-        x_f32 = x.astype(mx.float32)
-        rms = mx.rsqrt(mx.mean(x_f32 * x_f32, axis=-1, keepdims=True) + self.eps)
-        out = x_f32 * rms
-        return (out * self.weight).astype(x.dtype)
+        return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
 class T5RelativeEmbedding(nn.Module):
@@ -115,19 +112,23 @@ class T5Attention(nn.Module):
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
-        attn = q @ k.transpose(0, 1, 3, 2)  # [B, N, Lq, Lk]
-
+        # Combine position bias and attention mask for SDPA
+        attn_mask = None
         if pos_bias is not None:
-            attn = attn + pos_bias
+            attn_mask = pos_bias.astype(q.dtype)
         if mask is not None:
             if mask.ndim == 2:
                 mask = mask[:, None, None, :]  # [B, 1, 1, Lk]
             elif mask.ndim == 3:
                 mask = mask[:, None, :, :]  # [B, 1, Lq, Lk]
-            attn = mx.where(mask == 0, mx.array(float("-inf")), attn)
+            additive_mask = mx.where(mask == 0, -1e9, 0.0).astype(q.dtype)
+            attn_mask = (attn_mask + additive_mask) if attn_mask is not None else additive_mask
 
-        attn = mx.softmax(attn.astype(mx.float32), axis=-1).astype(x.dtype)
-        out = (attn @ v).transpose(0, 2, 1, 3).reshape(b, -1, n * c)
+        # T5 uses no scaling (scale=1.0)
+        out = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=1.0, mask=attn_mask
+        )
+        out = out.transpose(0, 2, 1, 3).reshape(b, -1, n * c)
         return self.o(out)
 
 

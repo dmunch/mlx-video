@@ -461,7 +461,7 @@ class TestHead:
         head = Head(dim=64, out_dim=16, patch_size=(1, 2, 2))
         B, L = 1, 24
         x = mx.random.normal((B, L, 64))
-        e = mx.random.normal((B, L, 64))
+        e = mx.random.normal((B, 64))  # time embedding: [B, dim]
         out = head(x, e)
         mx.eval(out)
         expected_proj_dim = 16 * 1 * 2 * 2  # 64

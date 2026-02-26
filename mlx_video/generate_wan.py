@@ -31,7 +31,7 @@ def load_wan_model(model_path: Path, config):
 
     model = WanModel(config)
     weights = mx.load(str(model_path))
-    model.load_weights(list(weights.items()))
+    model.load_weights(list(weights.items()), strict=False)
     mx.eval(model.parameters())
     return model
 
@@ -141,6 +141,10 @@ def generate_video(
     if config_path.exists():
         with open(config_path) as f:
             config_dict = json.load(f)
+        # Handle tuple fields stored as lists in JSON
+        for key in ("patch_size", "vae_stride", "window_size", "sample_guide_scale"):
+            if key in config_dict and isinstance(config_dict[key], list):
+                config_dict[key] = tuple(config_dict[key])
         config = WanModelConfig(**{
             k: v for k, v in config_dict.items()
             if k in WanModelConfig.__dataclass_fields__
@@ -150,9 +154,42 @@ def generate_video(
         if (model_dir / "low_noise_model.safetensors").exists():
             config = WanModelConfig.wan22_t2v_14b()
         else:
-            config = WanModelConfig.wan21_t2v_14b()
+            # Detect 1.3B vs 14B from weight shapes
+            model_path = model_dir / "model.safetensors"
+            if model_path.exists():
+                probe = mx.load(str(model_path), return_metadata=False)
+                for k, v in probe.items():
+                    if "patch_embedding_proj.weight" in k:
+                        dim = v.shape[0]
+                        if dim <= 2048:
+                            config = WanModelConfig.wan21_t2v_1_3b()
+                        else:
+                            config = WanModelConfig.wan21_t2v_14b()
+                        break
+                else:
+                    config = WanModelConfig.wan21_t2v_14b()
+                del probe
+            else:
+                config = WanModelConfig.wan21_t2v_14b()
 
     is_dual = config.dual_model
+
+    # Validate config against actual weights (handles mismatched config.json)
+    if not is_dual:
+        model_path = model_dir / "model.safetensors"
+        if model_path.exists():
+            probe = mx.load(str(model_path), return_metadata=False)
+            for k, v in probe.items():
+                if "patch_embedding_proj.weight" in k:
+                    actual_dim = v.shape[0]
+                    if actual_dim != config.dim:
+                        print(f"{Colors.YELLOW}  Config dim={config.dim} doesn't match weights dim={actual_dim}, auto-correcting...{Colors.RESET}")
+                        if actual_dim <= 2048:
+                            config = WanModelConfig.wan21_t2v_1_3b()
+                        else:
+                            config = WanModelConfig.wan21_t2v_14b()
+                    break
+            del probe
 
     # Apply defaults from config if not overridden
     if steps is None:
@@ -184,7 +221,7 @@ def generate_video(
 
     # Seed
     if seed < 0:
-        seed = random.randint(0, sys.maxsize)
+        seed = random.randint(0, 2**32 - 1)
     mx.random.seed(seed)
     np.random.seed(seed)
     print(f"{Colors.DIM}  Seed: {seed}{Colors.RESET}")
@@ -274,7 +311,7 @@ def generate_video(
             model = single_model
             gs = guide_scale if isinstance(guide_scale, (int, float)) else guide_scale[0]
 
-        # Conditional prediction
+        # CFG: compute both predictions, apply guidance, and step
         noise_pred_cond = model(
             [latents],
             t=timestep,
@@ -282,7 +319,6 @@ def generate_video(
             seq_len=seq_len,
         )[0]
 
-        # Unconditional prediction
         noise_pred_uncond = model(
             [latents],
             t=timestep,
@@ -290,11 +326,12 @@ def generate_video(
             seq_len=seq_len,
         )[0]
 
-        # Classifier-free guidance
+        # Classifier-free guidance + scheduler step
         noise_pred = noise_pred_uncond + gs * (noise_pred_cond - noise_pred_uncond)
-
-        # Scheduler step
         latents = scheduler.step(noise_pred[None], timestep, latents[None]).squeeze(0)
+
+        # Release temporaries before eval to free memory for graph execution
+        del noise_pred_cond, noise_pred_uncond, noise_pred
         mx.eval(latents)
 
     print(f"{Colors.DIM}  Denoising: {time.time() - t3:.1f}s{Colors.RESET}")
