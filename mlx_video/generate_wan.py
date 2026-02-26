@@ -108,13 +108,13 @@ def generate_video(
     width: int = 1280,
     height: int = 720,
     num_frames: int = 81,
-    steps: int = 40,
-    guide_scale: tuple = (3.0, 4.0),
-    shift: float = 12.0,
+    steps: int = None,
+    guide_scale: str | float | tuple = None,
+    shift: float = None,
     seed: int = -1,
     output_path: str = "output.mp4",
 ):
-    """Generate video using Wan2.2 T2V pipeline.
+    """Generate video using Wan T2V pipeline (supports 2.1 and 2.2).
 
     Args:
         model_dir: Path to converted MLX model directory
@@ -123,23 +123,59 @@ def generate_video(
         width: Video width
         height: Video height
         num_frames: Number of frames (must be 4n+1)
-        steps: Number of diffusion steps
-        guide_scale: (low_noise_scale, high_noise_scale)
-        shift: Noise schedule shift
+        steps: Number of diffusion steps (None = use config default)
+        guide_scale: Guidance scale: float for single, (low,high) for dual (None = config default)
+        shift: Noise schedule shift (None = use config default)
         seed: Random seed (-1 for random)
         output_path: Output video path
     """
+    import json
+
     from mlx_video.models.wan.config import WanModelConfig
     from mlx_video.models.wan.scheduler import FlowMatchEulerScheduler
 
     model_dir = Path(model_dir)
-    config = WanModelConfig()
+
+    # Load config from model dir if available, otherwise auto-detect
+    config_path = model_dir / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            config_dict = json.load(f)
+        config = WanModelConfig(**{
+            k: v for k, v in config_dict.items()
+            if k in WanModelConfig.__dataclass_fields__
+        })
+    else:
+        # Auto-detect: dual model files → 2.2, single model → 2.1
+        if (model_dir / "low_noise_model.safetensors").exists():
+            config = WanModelConfig.wan22_t2v_14b()
+        else:
+            config = WanModelConfig.wan21_t2v_14b()
+
+    is_dual = config.dual_model
+
+    # Apply defaults from config if not overridden
+    if steps is None:
+        steps = config.sample_steps
+    if shift is None:
+        shift = config.sample_shift
+    if guide_scale is None:
+        guide_scale = config.sample_guide_scale
+
+    # Normalize guide_scale
+    if isinstance(guide_scale, (int, float)):
+        guide_scale = float(guide_scale)
+    elif isinstance(guide_scale, str):
+        parts = [float(x) for x in guide_scale.split(",")]
+        guide_scale = tuple(parts) if len(parts) > 1 else parts[0]
 
     # Validate frame count
     assert (num_frames - 1) % 4 == 0, f"num_frames must be 4n+1, got {num_frames}"
 
+    version_str = f"Wan{config.model_version}"
+    mode_str = "dual-model" if is_dual else "single-model"
     print(f"{Colors.CYAN}{'='*60}")
-    print(f"  Wan2.2 Text-to-Video Generation (MLX)")
+    print(f"  {version_str} Text-to-Video Generation (MLX, {mode_str})")
     print(f"{'='*60}{Colors.RESET}")
     print(f"{Colors.DIM}  Prompt: {prompt}")
     print(f"  Size: {width}x{height}, Frames: {num_frames}")
@@ -195,13 +231,16 @@ def generate_video(
     print(f"{Colors.DIM}  T5 encoding: {time.time() - t1:.1f}s{Colors.RESET}")
 
     # Load transformer models
-    print(f"\n{Colors.BLUE}Loading transformer models...{Colors.RESET}")
+    print(f"\n{Colors.BLUE}Loading transformer model(s)...{Colors.RESET}")
     t2 = time.time()
 
-    low_noise_path = model_dir / "low_noise_model.safetensors"
-    high_noise_path = model_dir / "high_noise_model.safetensors"
-    low_noise_model = load_wan_model(low_noise_path, config)
-    high_noise_model = load_wan_model(high_noise_path, config)
+    if is_dual:
+        low_noise_path = model_dir / "low_noise_model.safetensors"
+        high_noise_path = model_dir / "high_noise_model.safetensors"
+        low_noise_model = load_wan_model(low_noise_path, config)
+        high_noise_model = load_wan_model(high_noise_path, config)
+    else:
+        single_model = load_wan_model(model_dir / "model.safetensors", config)
     print(f"{Colors.DIM}  Models loaded: {time.time() - t2:.1f}s{Colors.RESET}")
 
     # Setup scheduler
@@ -211,8 +250,8 @@ def generate_video(
     # Generate initial noise
     noise = mx.random.normal(target_shape)
 
-    # Boundary for model switching
-    boundary = config.boundary * config.num_train_timesteps
+    # Boundary for model switching (dual model only)
+    boundary = (config.boundary * config.num_train_timesteps) if is_dual else None
 
     # Diffusion loop
     print(f"\n{Colors.GREEN}Denoising ({steps} steps)...{Colors.RESET}")
@@ -223,13 +262,17 @@ def generate_video(
         timestep_val = scheduler.timesteps[i].item()
         timestep = mx.array([timestep_val])
 
-        # Select model and guide scale based on timestep
-        if timestep_val >= boundary:
-            model = high_noise_model
-            gs = guide_scale[1]
+        # Select model and guide scale
+        if is_dual:
+            if timestep_val >= boundary:
+                model = high_noise_model
+                gs = guide_scale[1]
+            else:
+                model = low_noise_model
+                gs = guide_scale[0]
         else:
-            model = low_noise_model
-            gs = guide_scale[0]
+            model = single_model
+            gs = guide_scale if isinstance(guide_scale, (int, float)) else guide_scale[0]
 
         # Conditional prediction
         noise_pred_cond = model(
@@ -257,7 +300,10 @@ def generate_video(
     print(f"{Colors.DIM}  Denoising: {time.time() - t3:.1f}s{Colors.RESET}")
 
     # Free transformer models
-    del low_noise_model, high_noise_model
+    if is_dual:
+        del low_noise_model, high_noise_model
+    else:
+        del single_model
     mx.metal.clear_cache() if hasattr(mx, "metal") else None
 
     # Load VAE and decode
@@ -308,24 +354,25 @@ def save_video(frames: np.ndarray, output_path: str, fps: int = 16):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Wan2.2 Text-to-Video Generation (MLX)")
+    parser = argparse.ArgumentParser(description="Wan Text-to-Video Generation (MLX)")
     parser.add_argument("--model-dir", type=str, required=True, help="Path to converted MLX model directory")
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt")
     parser.add_argument("--negative-prompt", type=str, default="", help="Negative prompt")
     parser.add_argument("--width", type=int, default=1280, help="Video width")
     parser.add_argument("--height", type=int, default=720, help="Video height")
     parser.add_argument("--num-frames", type=int, default=81, help="Number of frames (must be 4n+1)")
-    parser.add_argument("--steps", type=int, default=40, help="Number of diffusion steps")
-    parser.add_argument("--guide-scale", type=str, default="3.0,4.0", help="Guidance scale (low,high)")
-    parser.add_argument("--shift", type=float, default=12.0, help="Noise schedule shift")
+    parser.add_argument("--steps", type=int, default=None, help="Number of diffusion steps (default: from config)")
+    parser.add_argument("--guide-scale", type=str, default=None, help="Guidance scale: single float or low,high pair")
+    parser.add_argument("--shift", type=float, default=None, help="Noise schedule shift (default: from config)")
     parser.add_argument("--seed", type=int, default=-1, help="Random seed")
     parser.add_argument("--output-path", type=str, default="output.mp4", help="Output video path")
     args = parser.parse_args()
 
     # Parse guide scale
-    guide_scale = tuple(float(x) for x in args.guide_scale.split(","))
-    if len(guide_scale) == 1:
-        guide_scale = (guide_scale[0], guide_scale[0])
+    guide_scale = None
+    if args.guide_scale is not None:
+        parts = [float(x) for x in args.guide_scale.split(",")]
+        guide_scale = tuple(parts) if len(parts) > 1 else parts[0]
 
     generate_video(
         model_dir=args.model_dir,

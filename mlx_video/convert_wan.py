@@ -213,20 +213,28 @@ def convert_wan_checkpoint(
     checkpoint_dir: str,
     output_dir: str,
     dtype: str = "bfloat16",
+    model_version: str = "auto",
 ):
-    """Convert a full Wan2.2 checkpoint directory to MLX format.
+    """Convert a Wan2.1 or Wan2.2 checkpoint directory to MLX format.
 
-    Expected directory structure:
+    Wan2.2 expected structure:
         checkpoint_dir/
-            models_t5_umt5-xxl-enc-bf16.pth  (T5 encoder)
-            Wan2.1_VAE.pth                     (VAE)
-            low_noise_model/                   (safetensors)
-            high_noise_model/                  (safetensors)
+            models_t5_umt5-xxl-enc-bf16.pth
+            Wan2.1_VAE.pth
+            low_noise_model/   (safetensors)
+            high_noise_model/  (safetensors)
+
+    Wan2.1 expected structure:
+        checkpoint_dir/
+            models_t5_umt5-xxl-enc-bf16.pth
+            Wan2.1_VAE.pth
+            diffusion_pytorch_model*.safetensors  (single model)
 
     Args:
-        checkpoint_dir: Path to Wan2.2 checkpoint directory
+        checkpoint_dir: Path to Wan checkpoint directory
         output_dir: Path to output MLX model directory
         dtype: Target dtype
+        model_version: "2.1", "2.2", or "auto" (detect from directory)
     """
     import json
 
@@ -241,27 +249,57 @@ def convert_wan_checkpoint(
     }
     target_dtype = dtype_map.get(dtype, mx.bfloat16)
 
-    # Convert low-noise transformer
-    low_noise_path = checkpoint_dir / "low_noise_model"
-    if low_noise_path.exists():
-        print("Converting low-noise transformer...")
-        weights = load_safetensors_weights(str(low_noise_path))
-        weights = sanitize_wan_transformer_weights(weights)
-        weights = {k: v.astype(target_dtype) for k, v in weights.items()}
-        out_path = output_dir / "low_noise_model.safetensors"
-        mx.save_safetensors(str(out_path), weights)
-        print(f"  Saved {len(weights)} weight tensors to {out_path}")
+    # Auto-detect version
+    if model_version == "auto":
+        if (checkpoint_dir / "low_noise_model").exists():
+            model_version = "2.2"
+        else:
+            model_version = "2.1"
+        print(f"Auto-detected Wan{model_version} checkpoint")
 
-    # Convert high-noise transformer
-    high_noise_path = checkpoint_dir / "high_noise_model"
-    if high_noise_path.exists():
-        print("Converting high-noise transformer...")
-        weights = load_safetensors_weights(str(high_noise_path))
-        weights = sanitize_wan_transformer_weights(weights)
-        weights = {k: v.astype(target_dtype) for k, v in weights.items()}
-        out_path = output_dir / "high_noise_model.safetensors"
-        mx.save_safetensors(str(out_path), weights)
-        print(f"  Saved {len(weights)} weight tensors to {out_path}")
+    is_dual = model_version == "2.2"
+
+    if is_dual:
+        # Wan2.2: Convert dual transformer models
+        low_noise_path = checkpoint_dir / "low_noise_model"
+        if low_noise_path.exists():
+            print("Converting low-noise transformer...")
+            weights = load_safetensors_weights(str(low_noise_path))
+            weights = sanitize_wan_transformer_weights(weights)
+            weights = {k: v.astype(target_dtype) for k, v in weights.items()}
+            out_path = output_dir / "low_noise_model.safetensors"
+            mx.save_safetensors(str(out_path), weights)
+            print(f"  Saved {len(weights)} weight tensors to {out_path}")
+
+        high_noise_path = checkpoint_dir / "high_noise_model"
+        if high_noise_path.exists():
+            print("Converting high-noise transformer...")
+            weights = load_safetensors_weights(str(high_noise_path))
+            weights = sanitize_wan_transformer_weights(weights)
+            weights = {k: v.astype(target_dtype) for k, v in weights.items()}
+            out_path = output_dir / "high_noise_model.safetensors"
+            mx.save_safetensors(str(out_path), weights)
+            print(f"  Saved {len(weights)} weight tensors to {out_path}")
+    else:
+        # Wan2.1: Convert single transformer model
+        # Try safetensors in the checkpoint dir itself
+        print("Converting transformer (single model)...")
+        weights = load_safetensors_weights(str(checkpoint_dir))
+        if not weights:
+            # Fallback: look for .pth files
+            for pth in sorted(checkpoint_dir.glob("*.pth")):
+                if "t5" not in pth.name.lower() and "vae" not in pth.name.lower():
+                    print(f"  Loading from {pth.name}...")
+                    weights = load_torch_weights(str(pth))
+                    break
+        if weights:
+            weights = sanitize_wan_transformer_weights(weights)
+            weights = {k: v.astype(target_dtype) for k, v in weights.items()}
+            out_path = output_dir / "model.safetensors"
+            mx.save_safetensors(str(out_path), weights)
+            print(f"  Saved {len(weights)} weight tensors to {out_path}")
+        else:
+            print("  Warning: No transformer weights found!")
 
     # Convert T5 encoder
     t5_path = checkpoint_dir / "models_t5_umt5-xxl-enc-bf16.pth"
@@ -287,7 +325,10 @@ def convert_wan_checkpoint(
 
     # Save config
     from mlx_video.models.wan.config import WanModelConfig
-    config = WanModelConfig()
+    if is_dual:
+        config = WanModelConfig.wan22_t2v_14b()
+    else:
+        config = WanModelConfig.wan21_t2v_14b()
     config_path = output_dir / "config.json"
     with open(config_path, "w") as f:
         json.dump(config.to_dict(), f, indent=2)
@@ -299,12 +340,12 @@ def convert_wan_checkpoint(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Convert Wan2.2 model to MLX format")
+    parser = argparse.ArgumentParser(description="Convert Wan model to MLX format")
     parser.add_argument(
         "--checkpoint-dir",
         type=str,
         required=True,
-        help="Path to Wan2.2 checkpoint directory",
+        help="Path to Wan checkpoint directory",
     )
     parser.add_argument(
         "--output-dir",
@@ -319,5 +360,14 @@ if __name__ == "__main__":
         default="bfloat16",
         help="Target dtype",
     )
+    parser.add_argument(
+        "--model-version",
+        type=str,
+        choices=["2.1", "2.2", "auto"],
+        default="auto",
+        help="Wan model version (auto-detect by default)",
+    )
     args = parser.parse_args()
-    convert_wan_checkpoint(args.checkpoint_dir, args.output_dir, args.dtype)
+    convert_wan_checkpoint(
+        args.checkpoint_dir, args.output_dir, args.dtype, args.model_version
+    )

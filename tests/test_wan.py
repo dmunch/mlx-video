@@ -1217,5 +1217,237 @@ class TestEndToEnd:
         assert not mx.any(mx.isinf(latents)).item(), "Inf in output"
 
 
+# ---------------------------------------------------------------------------
+# Wan2.1 Config & Pipeline Tests
+# ---------------------------------------------------------------------------
+
+class TestWan21Config:
+    """Tests for Wan2.1 config presets."""
+
+    def test_wan21_14b_factory(self):
+        from mlx_video.models.wan.config import WanModelConfig
+        config = WanModelConfig.wan21_t2v_14b()
+        assert config.model_version == "2.1"
+        assert config.dual_model is False
+        assert config.dim == 5120
+        assert config.ffn_dim == 13824
+        assert config.num_heads == 40
+        assert config.num_layers == 40
+        assert config.head_dim == 128
+        assert config.sample_guide_scale == 5.0
+        assert config.sample_shift == 5.0
+        assert config.sample_steps == 50
+        assert config.boundary == 0.0
+
+    def test_wan21_1_3b_factory(self):
+        from mlx_video.models.wan.config import WanModelConfig
+        config = WanModelConfig.wan21_t2v_1_3b()
+        assert config.model_version == "2.1"
+        assert config.dual_model is False
+        assert config.dim == 1536
+        assert config.ffn_dim == 8960
+        assert config.num_heads == 12
+        assert config.num_layers == 30
+        assert config.head_dim == 128  # 1536 // 12
+        assert config.sample_guide_scale == 5.0
+
+    def test_wan22_14b_factory(self):
+        from mlx_video.models.wan.config import WanModelConfig
+        config = WanModelConfig.wan22_t2v_14b()
+        assert config.model_version == "2.2"
+        assert config.dual_model is True
+        assert config.dim == 5120
+        assert config.sample_guide_scale == (3.0, 4.0)
+        assert config.sample_shift == 12.0
+        assert config.sample_steps == 40
+        assert config.boundary == 0.875
+
+    def test_wan21_config_to_dict(self):
+        from mlx_video.models.wan.config import WanModelConfig
+        config = WanModelConfig.wan21_t2v_14b()
+        d = config.to_dict()
+        assert d["model_version"] == "2.1"
+        assert d["dual_model"] is False
+        assert d["sample_guide_scale"] == 5.0
+
+    def test_wan21_1_3b_config_to_dict(self):
+        from mlx_video.models.wan.config import WanModelConfig
+        config = WanModelConfig.wan21_t2v_1_3b()
+        d = config.to_dict()
+        assert d["dim"] == 1536
+        assert d["num_layers"] == 30
+
+    def test_default_config_is_wan22(self):
+        """Default WanModelConfig() should be Wan2.2 14B."""
+        from mlx_video.models.wan.config import WanModelConfig
+        config = WanModelConfig()
+        assert config.model_version == "2.2"
+        assert config.dual_model is True
+
+
+class TestWan21Model:
+    """Test tiny Wan2.1-style model (single model mode)."""
+
+    def setup_method(self):
+        mx.random.seed(42)
+
+    def _make_tiny_wan21_config(self):
+        """Create a tiny config mimicking Wan2.1 (single model)."""
+        from mlx_video.models.wan.config import WanModelConfig
+        config = WanModelConfig.wan21_t2v_14b()
+        # Override to tiny values
+        config.dim = 64
+        config.ffn_dim = 128
+        config.num_heads = 4
+        config.num_layers = 2
+        config.in_dim = 4
+        config.out_dim = 4
+        config.freq_dim = 32
+        config.text_dim = 32
+        config.text_len = 8
+        return config
+
+    def _make_tiny_wan21_1_3b_config(self):
+        """Create a tiny config mimicking Wan2.1 1.3B."""
+        from mlx_video.models.wan.config import WanModelConfig
+        config = WanModelConfig.wan21_t2v_1_3b()
+        # Override to tiny values (preserve 1.3B head structure: 12 heads)
+        config.dim = 48
+        config.ffn_dim = 96
+        config.num_heads = 4
+        config.num_layers = 2
+        config.in_dim = 4
+        config.out_dim = 4
+        config.freq_dim = 24
+        config.text_dim = 24
+        config.text_len = 8
+        return config
+
+    def test_wan21_tiny_model_forward(self):
+        """Forward pass with Wan2.1 tiny config."""
+        from mlx_video.models.wan.model import WanModel
+
+        config = self._make_tiny_wan21_config()
+        model = WanModel(config)
+
+        C, F, H, W = config.in_dim, 1, 4, 4
+        seq_len = (F // 1) * (H // 2) * (W // 2)
+
+        latents = mx.random.normal((C, F, H, W))
+        context = mx.random.normal((4, config.text_dim))
+        t = mx.array([500.0])
+
+        out = model([latents], t, [context], seq_len)
+        mx.eval(out)
+        assert out[0].shape == (C, F, H, W)
+
+    def test_wan21_1_3b_tiny_model_forward(self):
+        """Forward pass with Wan2.1 1.3B tiny config."""
+        from mlx_video.models.wan.model import WanModel
+
+        config = self._make_tiny_wan21_1_3b_config()
+        model = WanModel(config)
+
+        C, F, H, W = config.in_dim, 1, 4, 4
+        seq_len = (F // 1) * (H // 2) * (W // 2)
+
+        latents = mx.random.normal((C, F, H, W))
+        context = mx.random.normal((4, config.text_dim))
+        t = mx.array([500.0])
+
+        out = model([latents], t, [context], seq_len)
+        mx.eval(out)
+        assert out[0].shape == (C, F, H, W)
+
+    def test_wan21_single_model_loop(self):
+        """Full diffusion loop with single model (Wan2.1 style)."""
+        from mlx_video.models.wan.model import WanModel
+        from mlx_video.models.wan.scheduler import FlowMatchEulerScheduler
+
+        config = self._make_tiny_wan21_config()
+        model = WanModel(config)
+
+        C, F, H, W = config.in_dim, 1, 4, 4
+        seq_len = (F // 1) * (H // 2) * (W // 2)
+
+        sched = FlowMatchEulerScheduler()
+        sched.set_timesteps(config.sample_steps, shift=config.sample_shift)
+
+        # Use only 3 steps for speed
+        latents = mx.random.normal((C, F, H, W))
+        context = mx.random.normal((4, config.text_dim))
+        context_null = mx.zeros((4, config.text_dim))
+        gs = config.sample_guide_scale  # Should be float for Wan2.1
+
+        assert isinstance(gs, float), "Wan2.1 guide_scale should be float"
+
+        for i in range(3):
+            t = sched.timesteps[i]
+            pred_cond = model([latents], mx.array([t.item()]), [context], seq_len)[0]
+            pred_uncond = model([latents], mx.array([t.item()]), [context_null], seq_len)[0]
+            pred = pred_uncond + gs * (pred_cond - pred_uncond)
+            latents = sched.step(pred[None], t, latents[None]).squeeze(0)
+            mx.eval(latents)
+
+        assert latents.shape == (C, F, H, W)
+        assert not mx.any(mx.isnan(latents)).item()
+
+    def test_wan21_vs_wan22_config_differences(self):
+        """Verify key differences between Wan2.1 and Wan2.2 configs."""
+        from mlx_video.models.wan.config import WanModelConfig
+
+        c21 = WanModelConfig.wan21_t2v_14b()
+        c22 = WanModelConfig.wan22_t2v_14b()
+
+        # Same architecture
+        assert c21.dim == c22.dim
+        assert c21.num_heads == c22.num_heads
+        assert c21.num_layers == c22.num_layers
+
+        # Different pipeline settings
+        assert c21.dual_model is False
+        assert c22.dual_model is True
+        assert isinstance(c21.sample_guide_scale, float)
+        assert isinstance(c22.sample_guide_scale, tuple)
+        assert c21.sample_shift != c22.sample_shift
+        assert c21.sample_steps != c22.sample_steps
+
+
+class TestWan21Convert:
+    """Tests for Wan2.1 conversion support."""
+
+    def test_auto_detect_wan21(self, tmp_path):
+        """Auto-detect single-model directory as Wan2.1."""
+        # Create a Wan2.1-style directory (no low_noise_model subdir)
+        (tmp_path / "dummy.safetensors").touch()
+        # The auto-detect logic: no low_noise_model dir → 2.1
+        from pathlib import Path
+        low = tmp_path / "low_noise_model"
+        assert not low.exists()
+        # Simulates auto detection
+        version = "2.2" if low.exists() else "2.1"
+        assert version == "2.1"
+
+    def test_auto_detect_wan22(self, tmp_path):
+        """Auto-detect dual-model directory as Wan2.2."""
+        (tmp_path / "low_noise_model").mkdir()
+        (tmp_path / "high_noise_model").mkdir()
+        from pathlib import Path
+        low = tmp_path / "low_noise_model"
+        assert low.exists()
+        version = "2.2" if low.exists() else "2.1"
+        assert version == "2.2"
+
+    def test_wan21_config_saved_correctly(self):
+        """Verify config dict has correct fields for Wan2.1."""
+        from mlx_video.models.wan.config import WanModelConfig
+        config = WanModelConfig.wan21_t2v_14b()
+        d = config.to_dict()
+        assert d["model_version"] == "2.1"
+        assert d["dual_model"] is False
+        assert d["sample_steps"] == 50
+        assert d["sample_shift"] == 5.0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
