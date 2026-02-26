@@ -57,12 +57,12 @@ def load_t5_encoder(model_path: Path, config):
 
 
 def load_vae_decoder(model_path: Path):
-    """Load VAE decoder."""
+    """Load VAE decoder (skips encoder weights with strict=False)."""
     from mlx_video.models.wan.vae import WanVAE
 
     vae = WanVAE(z_dim=16)
     weights = mx.load(str(model_path))
-    vae.load_weights(list(weights.items()))
+    vae.load_weights(list(weights.items()), strict=False)
     mx.eval(vae.parameters())
     return vae
 
