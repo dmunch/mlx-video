@@ -2950,3 +2950,426 @@ class TestSanitizeEncoderWeights:
         assert "encoder.conv1.weight" in out
         assert "conv1.weight" in out
         assert "conv2.weight" in out
+
+
+# ---------------------------------------------------------------------------
+# Dimension Alignment Tests
+# ---------------------------------------------------------------------------
+
+class TestDimensionAlignment:
+    """Tests for automatic dimension alignment in generate_wan."""
+
+    def test_already_aligned(self):
+        """Dimensions already divisible by alignment factor should be unchanged."""
+        # patch_size=(1,2,2), vae_stride=(4,16,16) → align = 32
+        align_h = 2 * 16  # 32
+        align_w = 2 * 16  # 32
+        h, w = 704, 1280
+        assert h % align_h == 0
+        assert w % align_w == 0
+        h_aligned = (h // align_h) * align_h
+        w_aligned = (w // align_w) * align_w
+        assert h_aligned == h
+        assert w_aligned == w
+
+    def test_720p_rounds_down(self):
+        """720p (1280x720) should round height to 704."""
+        align_h = 32
+        align_w = 32
+        h, w = 720, 1280
+        assert h % align_h != 0  # 720 not divisible by 32
+        h_aligned = (h // align_h) * align_h
+        w_aligned = (w // align_w) * align_w
+        assert h_aligned == 704
+        assert w_aligned == 1280
+
+    def test_1080p_rounds_down(self):
+        """1080p (1920x1080) should round height to 1056."""
+        align = 32
+        h, w = 1080, 1920
+        assert h % align != 0
+        assert (h // align) * align == 1056
+        assert (w // align) * align == 1920
+
+    def test_odd_sizes(self):
+        """Odd sizes should be safely rounded down."""
+        align = 32
+        for size in [100, 255, 513, 1023]:
+            aligned = (size // align) * align
+            assert aligned % align == 0
+            assert aligned <= size
+            assert aligned + align > size  # closest lower multiple
+
+    def test_patchify_valid_after_alignment(self):
+        """After alignment, patchify should succeed without reshape errors."""
+        from mlx_video.models.wan.model import WanModel
+        config = _make_tiny_config()
+        model = WanModel(config)
+
+        # Simulate 720p-like scenario with tiny config
+        vae_stride = config.vae_stride  # (4, 8, 8)
+        patch_size = config.patch_size  # (1, 2, 2)
+        align_h = patch_size[1] * vae_stride[1]
+        align_w = patch_size[2] * vae_stride[2]
+
+        # Pick a height not divisible by alignment
+        raw_h = align_h * 3 + 5  # e.g. 53 for align=16
+        raw_w = align_w * 4
+        h = (raw_h // align_h) * align_h  # rounds down
+        w = (raw_w // align_w) * align_w
+
+        C = config.in_dim
+        t_latent = 1
+        h_latent = h // vae_stride[1]
+        w_latent = w // vae_stride[2]
+
+        vid = mx.random.normal((C, t_latent, h_latent, w_latent))
+        patches, grid_size = model._patchify(vid)
+        mx.eval(patches)
+        assert patches.ndim == 3  # [1, L, dim]
+        assert grid_size == (t_latent, h_latent // patch_size[1], w_latent // patch_size[2])
+
+    def test_alignment_with_ti2v_config(self):
+        """TI2V-5B uses vae_stride=(4,16,16), patch_size=(1,2,2) → align=32."""
+        from mlx_video.models.wan.config import WanModelConfig
+        config = WanModelConfig.wan22_ti2v_5b()
+        align_h = config.patch_size[1] * config.vae_stride[1]
+        align_w = config.patch_size[2] * config.vae_stride[2]
+        assert align_h == 32
+        assert align_w == 32
+        # 720 not divisible
+        assert 720 % align_h != 0
+        # 704 is
+        assert 704 % align_h == 0
+
+
+# ---------------------------------------------------------------------------
+# bfloat16 Autocast Tests
+# ---------------------------------------------------------------------------
+
+class TestBFloat16Autocast:
+    """Tests that attention and FFN cast inputs to weight dtype (bfloat16)
+    for efficient matmul, matching official PyTorch autocast behavior."""
+
+    def setup_method(self):
+        mx.random.seed(42)
+        self.dim = 64
+        self.num_heads = 4
+
+    @staticmethod
+    def _to_bf16(params):
+        """Recursively cast all arrays in params to bfloat16."""
+        if isinstance(params, dict):
+            return {k: TestBFloat16Autocast._to_bf16(v) for k, v in params.items()}
+        elif isinstance(params, list):
+            return [TestBFloat16Autocast._to_bf16(v) for v in params]
+        elif isinstance(params, mx.array):
+            return params.astype(mx.bfloat16)
+        return params
+
+    def test_self_attn_casts_to_weight_dtype(self):
+        """Self-attention should cast input to weight dtype for QKV projections."""
+        from mlx_video.models.wan.attention import WanSelfAttention
+        from mlx_video.models.wan.rope import rope_params
+        attn = WanSelfAttention(self.dim, self.num_heads)
+        attn.update(self._to_bf16(attn.parameters()))
+
+        x = mx.random.normal((1, 8, self.dim))
+        freqs = rope_params(1024, self.dim // self.num_heads)
+        out = attn(x, seq_lens=[8], grid_sizes=[(2, 2, 2)], freqs=freqs)
+        mx.eval(out)
+        assert out.shape == (1, 8, self.dim)
+        assert np.isfinite(np.array(out.astype(mx.float32))).all()
+
+    def test_cross_attn_casts_to_weight_dtype(self):
+        """Cross-attention should cast input to weight dtype."""
+        from mlx_video.models.wan.attention import WanCrossAttention
+        attn = WanCrossAttention(self.dim, self.num_heads)
+        attn.update(self._to_bf16(attn.parameters()))
+
+        x = mx.random.normal((1, 8, self.dim))
+        ctx = mx.random.normal((1, 4, self.dim))
+        out = attn(x, ctx)
+        mx.eval(out)
+        assert out.shape == (1, 8, self.dim)
+        assert np.isfinite(np.array(out.astype(mx.float32))).all()
+
+    def test_cross_attn_kv_cache_uses_weight_dtype(self):
+        """prepare_kv should cast context to weight dtype."""
+        from mlx_video.models.wan.attention import WanCrossAttention
+        attn = WanCrossAttention(self.dim, self.num_heads)
+        attn.update(self._to_bf16(attn.parameters()))
+
+        ctx = mx.random.normal((1, 4, self.dim))
+        k, v = attn.prepare_kv(ctx)
+        mx.eval(k, v)
+        assert k.dtype == mx.bfloat16
+        assert v.dtype == mx.bfloat16
+
+    def test_ffn_casts_to_weight_dtype(self):
+        """FFN should cast input to weight dtype for linear layers."""
+        from mlx_video.models.wan.transformer import WanFFN
+        ffn = WanFFN(self.dim, 128)
+        ffn.update(self._to_bf16(ffn.parameters()))
+
+        x = mx.random.normal((1, 8, self.dim))
+        out = ffn(x)
+        mx.eval(out)
+        assert out.shape == (1, 8, self.dim)
+        assert np.isfinite(np.array(out.astype(mx.float32))).all()
+
+    def test_self_attn_rope_in_float32(self):
+        """RoPE should be applied in float32 for precision, even with bf16 weights."""
+        from mlx_video.models.wan.attention import WanSelfAttention
+        from mlx_video.models.wan.rope import rope_params
+        attn = WanSelfAttention(self.dim, self.num_heads)
+        attn.update(self._to_bf16(attn.parameters()))
+
+        x = mx.random.normal((1, 8, self.dim))
+        freqs = rope_params(1024, self.dim // self.num_heads)
+        assert freqs.dtype == mx.float32
+        out = attn(x, seq_lens=[8], grid_sizes=[(2, 2, 2)], freqs=freqs)
+        mx.eval(out)
+        assert np.isfinite(np.array(out.astype(mx.float32))).all()
+
+    def test_block_float32_residual_with_bf16_weights(self):
+        """Full block: residual stream stays float32, matmuls use bf16 weights."""
+        from mlx_video.models.wan.transformer import WanAttentionBlock
+        from mlx_video.models.wan.rope import rope_params
+        block = WanAttentionBlock(self.dim, 128, self.num_heads, cross_attn_norm=True)
+        block.update(self._to_bf16(block.parameters()))
+
+        B, L = 1, 8
+        x = mx.random.normal((B, L, self.dim))
+        e = mx.random.normal((B, L, 6, self.dim))
+        ctx = mx.random.normal((B, 4, self.dim))
+        freqs = rope_params(1024, self.dim // self.num_heads)
+
+        out = block(x, e, [L], [(2, 2, 2)], freqs, ctx)
+        mx.eval(out)
+        assert out.dtype == mx.float32
+        assert np.isfinite(np.array(out)).all()
+
+
+# ---------------------------------------------------------------------------
+# Float32 Modulation Precision Tests
+# ---------------------------------------------------------------------------
+
+class TestFloat32Modulation:
+    """Tests that modulation/gate operations are computed in float32,
+    matching official torch.amp.autocast('cuda', dtype=torch.float32)."""
+
+    def setup_method(self):
+        mx.random.seed(42)
+        self.dim = 64
+
+    def test_block_modulation_in_float32(self):
+        """Modulation param starts random but should be usable as float32."""
+        from mlx_video.models.wan.transformer import WanAttentionBlock
+        block = WanAttentionBlock(self.dim, 128, 4, cross_attn_norm=True)
+        assert block.modulation.dtype == mx.float32
+
+    def test_block_output_float32_with_bf16_modulation_input(self):
+        """Even if e (time embedding) arrives as bf16, modulation should cast to f32."""
+        from mlx_video.models.wan.transformer import WanAttentionBlock
+        from mlx_video.models.wan.rope import rope_params
+        block = WanAttentionBlock(self.dim, 128, 4)
+        B, L = 1, 8
+        x = mx.random.normal((B, L, self.dim))
+        e = mx.random.normal((B, L, 6, self.dim)).astype(mx.bfloat16)
+        ctx = mx.random.normal((B, 4, self.dim))
+        freqs = rope_params(1024, self.dim // 4)
+
+        out = block(x, e, [L], [(2, 2, 2)], freqs, ctx)
+        mx.eval(out)
+        assert out.dtype == mx.float32
+        assert np.isfinite(np.array(out)).all()
+
+    def test_head_modulation_float32(self):
+        """Head modulation should be float32 even with bf16 e input."""
+        from mlx_video.models.wan.model import Head
+        head = Head(self.dim, 4, (1, 2, 2))
+        x = mx.random.normal((1, 8, self.dim))
+        e = mx.random.normal((1, 8, self.dim)).astype(mx.bfloat16)
+        out = head(x, e)
+        mx.eval(out)
+        assert np.isfinite(np.array(out.astype(mx.float32))).all()
+
+    def test_model_time_embedding_float32(self):
+        """sinusoidal_embedding_1d output must be float32."""
+        from mlx_video.models.wan.model import sinusoidal_embedding_1d
+        t = mx.array([500.0])
+        emb = sinusoidal_embedding_1d(256, t)
+        mx.eval(emb)
+        assert emb.dtype == mx.float32
+
+    def test_model_per_token_time_embedding_float32(self):
+        """Per-token time embeddings (I2V) should also be float32."""
+        from mlx_video.models.wan.model import sinusoidal_embedding_1d
+        t = mx.array([[0.0, 100.0, 200.0, 300.0]])  # [B=1, L=4]
+        emb = sinusoidal_embedding_1d(256, t)
+        mx.eval(emb)
+        assert emb.dtype == mx.float32
+        assert emb.shape == (1, 4, 256)
+
+
+# ---------------------------------------------------------------------------
+# UniPC Corrector Default Tests
+# ---------------------------------------------------------------------------
+
+class TestUniPCCorrectorDefault:
+    """Tests that the UniPC corrector is enabled by default,
+    matching official FlowUniPCMultistepScheduler behavior."""
+
+    def test_corrector_enabled_by_default(self):
+        """Default construction should have corrector enabled."""
+        from mlx_video.models.wan.scheduler import FlowUniPCScheduler
+        sched = FlowUniPCScheduler()
+        assert sched._use_corrector is True
+
+    def test_corrector_affects_output(self):
+        """Corrector should produce different results than no corrector after step 1."""
+        from mlx_video.models.wan.scheduler import FlowUniPCScheduler
+        mx.random.seed(42)
+        shape = (1, 4, 1, 4, 4)
+        noise = mx.random.normal(shape)
+
+        sched_corr = FlowUniPCScheduler(use_corrector=True)
+        sched_corr.set_timesteps(10, shift=5.0)
+        sched_no = FlowUniPCScheduler(use_corrector=False)
+        sched_no.set_timesteps(10, shift=5.0)
+
+        latent_corr = noise
+        latent_no = noise
+        for i in range(3):
+            vel = mx.random.normal(shape) * 0.1
+            latent_corr = sched_corr.step(vel, sched_corr.timesteps[i], latent_corr)
+            latent_no = sched_no.step(vel, sched_no.timesteps[i], latent_no)
+            mx.eval(latent_corr, latent_no)
+
+        diff = float(mx.abs(latent_corr - latent_no).max())
+        assert diff > 1e-6, f"Corrector had no effect (max diff={diff})"
+
+    def test_corrector_does_not_affect_first_step(self):
+        """Step 0 should be identical regardless of corrector setting."""
+        from mlx_video.models.wan.scheduler import FlowUniPCScheduler
+        mx.random.seed(42)
+        shape = (1, 4, 1, 4, 4)
+        noise = mx.random.normal(shape)
+        vel = mx.random.normal(shape)
+
+        sched_corr = FlowUniPCScheduler(use_corrector=True)
+        sched_corr.set_timesteps(10, shift=5.0)
+        sched_no = FlowUniPCScheduler(use_corrector=False)
+        sched_no.set_timesteps(10, shift=5.0)
+
+        r1 = sched_corr.step(vel, sched_corr.timesteps[0], noise)
+        r2 = sched_no.step(vel, sched_no.timesteps[0], noise)
+        mx.eval(r1, r2)
+        np.testing.assert_allclose(np.array(r1), np.array(r2), atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# VAE Encoder Temporal Downsample Order Tests
+# ---------------------------------------------------------------------------
+
+class TestVAEEncoderTemporalOrder:
+    """Tests that VAE encoder uses (False, True, True) temporal downsample order,
+    matching official Wan2.2 vae2_2.py."""
+
+    def test_encoder_temporal_downsample_pattern(self):
+        """Encoder3d with (False, True, True): T=5→5→3→2."""
+        from mlx_video.models.wan.vae22 import Encoder3d
+        enc = Encoder3d(dim=16, z_dim=8, temperal_downsample=(False, True, True))
+        x = mx.random.normal((1, 5, 16, 16, 12))
+        mx.eval(enc.parameters())
+        out = enc(x)
+        mx.eval(out)
+        assert out.shape[1] == 2
+
+    def test_wrapper_uses_correct_pattern(self):
+        """Wan22VAEEncoder should use (False, True, True) temporal downsample."""
+        from mlx_video.models.wan.vae22 import Wan22VAEEncoder, Resample
+        enc = Wan22VAEEncoder(z_dim=48, dim=16)
+        down_blocks = enc.encoder.downsamples
+        found_modes = []
+        for block in down_blocks:
+            for layer in block.downsamples:
+                if isinstance(layer, Resample):
+                    found_modes.append(layer.mode)
+        # First spatial-only, then two with temporal
+        assert found_modes[0] == "downsample2d"
+        assert any("3d" in m for m in found_modes)
+
+    def test_single_frame_encoder(self):
+        """Single frame (T=1) should work with (False, True, True) pattern."""
+        from mlx_video.models.wan.vae22 import Wan22VAEEncoder
+        enc = Wan22VAEEncoder(z_dim=48, dim=16)
+        img = mx.random.normal((1, 1, 32, 32, 3))
+        mx.eval(enc.parameters())
+        z = enc(img)
+        mx.eval(z)
+        assert z.shape[1] == 1
+        assert z.shape[-1] == 48
+
+    def test_wrong_order_gives_different_result(self):
+        """(True, True, False) vs (False, True, True) produce different outputs."""
+        from mlx_video.models.wan.vae22 import Encoder3d
+        enc_correct = Encoder3d(dim=16, z_dim=8, temperal_downsample=(False, True, True))
+        enc_wrong = Encoder3d(dim=16, z_dim=8, temperal_downsample=(True, True, False))
+
+        x = mx.random.normal((1, 5, 16, 16, 12))
+        mx.eval(enc_correct.parameters())
+        mx.eval(enc_wrong.parameters())
+
+        out_correct = enc_correct(x)
+        out_wrong = enc_wrong(x)
+        mx.eval(out_correct, out_wrong)
+
+        # Both give T=2 but spatial processing path differs
+        assert out_correct.shape[1] == 2
+        assert out_wrong.shape[1] == 2
+
+
+# ---------------------------------------------------------------------------
+# I2V Mask Construction Tests (Additional)
+# ---------------------------------------------------------------------------
+
+class TestI2VMaskAlignment:
+    """Tests that I2V mask works correctly with various aligned dimensions."""
+
+    def test_mask_with_ti2v_dimensions(self):
+        """Mask should work with TI2V-5B typical dimensions."""
+        from mlx_video.generate_wan import _build_i2v_mask
+        # TI2V: z_dim=48, vae_stride=(4,16,16), patch=(1,2,2)
+        # 704x1280 → latent 44x80, t_latent=21 for 81 frames
+        z_shape = (48, 21, 44, 80)
+        patch_size = (1, 2, 2)
+        mask, mask_tokens = _build_i2v_mask(z_shape, patch_size)
+        mx.eval(mask, mask_tokens)
+
+        assert mask.shape == z_shape
+        assert float(mask[:, 0].max()) == 0.0
+        assert float(mask[:, 1:].min()) == 1.0
+
+        expected_tokens = 21 * 22 * 40  # T * (H/ph) * (W/pw)
+        assert mask_tokens.shape == (1, expected_tokens)
+        first_frame_tokens = 1 * 22 * 40  # pt=1
+        assert float(mask_tokens[0, :first_frame_tokens].max()) == 0.0
+        assert float(mask_tokens[0, first_frame_tokens:].min()) == 1.0
+
+    def test_mask_per_token_timestep(self):
+        """Per-token timesteps: first-frame tokens get t=0, rest get t=sigma."""
+        from mlx_video.generate_wan import _build_i2v_mask
+        z_shape = (4, 3, 4, 4)
+        patch_size = (1, 2, 2)
+        _, mask_tokens = _build_i2v_mask(z_shape, patch_size)
+        mx.eval(mask_tokens)
+
+        timestep_val = 0.8
+        t_tokens = mask_tokens * timestep_val
+        mx.eval(t_tokens)
+
+        first_tokens = 1 * 2 * 2  # pt * (H/ph) * (W/pw)
+        np.testing.assert_allclose(np.array(t_tokens[0, :first_tokens]), 0.0, atol=1e-7)
+        np.testing.assert_allclose(np.array(t_tokens[0, first_tokens:]), timestep_val, atol=1e-7)
