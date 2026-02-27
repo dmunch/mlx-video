@@ -210,6 +210,7 @@ The pipeline auto-detects the model version from `config.json` and selects the r
 | `--shift` | from config | Noise schedule shift |
 | `--seed` | -1 (random) | Random seed for reproducibility |
 | `--output-path` | `output.mp4` | Output video path |
+| `--teacache-thresh` | `0` (off) | TeaCache threshold (e.g. `0.1` for ~2× speedup) |
 
 ### Quantization (Reduced Memory)
 
@@ -236,6 +237,28 @@ python -m mlx_video.generate_wan \
 | 14B | ~28 GB | ~8 GB | Enables running on 16GB devices |
 
 > **Note**: On Apple Silicon, the 1.3B model fits comfortably in unified memory at bf16. Quantization reduces memory but may not speed up inference for small models. For the 14B model, quantization is essential to fit in memory and will also improve speed.
+
+### Performance Optimizations
+
+#### TeaCache (Timestep Embedding Aware Cache)
+
+TeaCache speeds up inference by skipping transformer blocks when consecutive diffusion steps produce similar outputs. It monitors timestep embedding distances and reuses cached results when changes are small — providing up to ~2× speedup with minimal quality loss.
+
+```bash
+# ~2x speedup (conservative, near-lossless)
+python -m mlx_video.generate_wan \
+    --model-dir wan22_mlx \
+    --prompt "A cat playing piano" \
+    --teacache-thresh 0.1
+
+# ~3x speedup (good quality/speed tradeoff)
+python -m mlx_video.generate_wan \
+    --model-dir wan22_mlx \
+    --prompt "A cat playing piano" \
+    --teacache-thresh 0.2
+```
+
+Set `--teacache-thresh 0` (the default) to disable. Higher thresholds = more speedup but lower quality.
 
 ### Wan Model Specifications
 

@@ -105,14 +105,7 @@ class WanSelfAttention(nn.Module):
 
         # Use memory-efficient scaled dot-product attention
         # mx.fast.scaled_dot_product_attention expects [B, N, L, D]
-        if mask is not None:
-            out = mx.fast.scaled_dot_product_attention(
-                q, k, v, scale=self.scale, mask=mask
-            )
-        else:
-            out = mx.fast.scaled_dot_product_attention(
-                q, k, v, scale=self.scale
-            )
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
 
         out = out.transpose(0, 2, 1, 3).reshape(b, s, -1)
         return self.o(out)
@@ -198,14 +191,7 @@ class WanCrossAttention(nn.Module):
             for i, cl in enumerate(context_lens):
                 mask[i, :, :, cl:] = -1e9
 
-        if mask is not None:
-            out = mx.fast.scaled_dot_product_attention(
-                q, k, v, scale=self.scale, mask=mask
-            )
-        else:
-            out = mx.fast.scaled_dot_product_attention(
-                q, k, v, scale=self.scale
-            )
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
 
         out = out.transpose(0, 2, 1, 3).reshape(b, -1, n * d)
         return self.o(out)

@@ -213,6 +213,24 @@ mx.eval(latents)
 
 MLX's lazy evaluation means `mx.eval()` triggers the full computation graph. Deleting intermediate arrays before eval allows MLX to reuse their memory during execution.
 
+### TeaCache (Timestep Embedding Aware Cache)
+
+TeaCache adaptively skips transformer blocks when consecutive diffusion steps produce similar outputs. It monitors the relative L1 distance between timestep embeddings (`e0`), applies a polynomial rescaling (model-specific coefficients), and accumulates the distance. When the accumulated distance is below a configurable threshold, the cached residual from the previous step is reused instead of running all 40 transformer blocks.
+
+```bash
+# ~2x speedup (conservative, near-lossless)
+python -m mlx_video.generate_wan --model-dir ... --prompt "..." --teacache-thresh 0.1
+
+# ~3x speedup (good quality/speed tradeoff)
+python -m mlx_video.generate_wan --model-dir ... --prompt "..." --teacache-thresh 0.2
+```
+
+Key implementation details:
+- Polynomial coefficients are from the official TeaCache4Wan2.1 (same architecture as 2.2)
+- First 2 and last 2 steps always compute (they change the most)
+- Works with both single and dual-model modes (each model tracks its own state)
+- Batched CFG (B=2) shares a single cache since both elements get the same timestep
+
 ---
 
 ## Weight Conversion

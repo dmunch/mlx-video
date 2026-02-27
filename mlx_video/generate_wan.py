@@ -43,6 +43,7 @@ def generate_video(
     seed: int = -1,
     output_path: str = "output.mp4",
     scheduler: str = "unipc",
+    teacache_thresh: float = 0.0,
 ):
     """Generate video using Wan pipeline (supports T2V and I2V).
 
@@ -60,6 +61,7 @@ def generate_video(
         seed: Random seed (-1 for random)
         output_path: Output video path
         scheduler: Solver type: 'euler', 'dpm++', or 'unipc' (default)
+        teacache_thresh: TeaCache threshold (0=disabled, 0.1=~2x speedup, 0.2=~3x speedup)
     """
     import json
 
@@ -326,6 +328,27 @@ def generate_video(
     print(f"\n{Colors.GREEN}Denoising ({steps} steps)...{Colors.RESET}")
     t3 = time.time()
 
+    # Configure TeaCache
+    if teacache_thresh > 0:
+        if config.teacache_coefficients is None:
+            print(f"{Colors.YELLOW}  Warning: TeaCache not available for this model (no profiled coefficients). Ignoring --teacache-thresh.{Colors.RESET}")
+        else:
+            def _configure_teacache(m, steps):
+                m.teacache.enabled = True
+                m.teacache.threshold = teacache_thresh
+                m.teacache.coefficients = config.teacache_coefficients
+                m.teacache.num_steps = steps
+                m.teacache.ret_steps = 2
+                m.teacache.cutoff_steps = steps - 2
+                m.teacache.reset()
+
+            if is_dual:
+                _configure_teacache(low_noise_model, steps)
+                _configure_teacache(high_noise_model, steps)
+            else:
+                _configure_teacache(single_model, steps)
+            print(f"{Colors.DIM}  TeaCache: threshold={teacache_thresh}{Colors.RESET}")
+
     for i, t in enumerate(tqdm(range(steps), desc="Diffusion")):
         timestep_val = sched.timesteps[i].item()
 
@@ -381,6 +404,18 @@ def generate_video(
         mx.eval(latents)
 
     print(f"{Colors.DIM}  Denoising: {time.time() - t3:.1f}s{Colors.RESET}")
+
+    if teacache_thresh > 0:
+        models_to_report = (
+            [("low-noise", low_noise_model), ("high-noise", high_noise_model)]
+            if is_dual
+            else [("model", single_model)]
+        )
+        total_skipped = sum(m.teacache.steps_skipped for _, m in models_to_report)
+        total_computed = sum(m.teacache.steps_computed for _, m in models_to_report)
+        total = total_skipped + total_computed
+        if total > 0:
+            print(f"{Colors.DIM}  TeaCache: {total_skipped}/{total} steps skipped ({total_skipped/total*100:.0f}%){Colors.RESET}")
 
     # Free transformer models and text embeddings
     if is_dual:
@@ -449,6 +484,10 @@ def main():
         choices=["euler", "dpm++", "unipc"],
         help="Diffusion solver: euler (1st order), dpm++ (2nd order), unipc (2nd order PC, default/official)",
     )
+    parser.add_argument(
+        "--teacache-thresh", type=float, default=0.0,
+        help="TeaCache threshold (0=disabled, 0.1=~2x speedup, 0.2=~3x speedup)"
+    )
     args = parser.parse_args()
 
     # Parse guide scale
@@ -476,6 +515,7 @@ def main():
         seed=args.seed,
         output_path=args.output_path,
         scheduler=args.scheduler,
+        teacache_thresh=args.teacache_thresh,
     )
 
 

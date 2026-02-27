@@ -25,6 +25,18 @@ class WanModelConfig(BaseModelConfig):
     cross_attn_norm: bool = True
     eps: float = 1e-6
 
+    # TeaCache polynomial coefficients (from official TeaCache4Wan2.1).
+    # Maps relative L1 distance of timestep embeddings to output distance.
+    # Format: np.poly1d convention (highest degree first).
+    # These are overridden per model variant in the classmethod constructors.
+    teacache_coefficients: Optional[tuple] = (
+        -5784.54975374,
+        5449.50911966,
+        -1811.16591783,
+        256.27178429,
+        -13.02252404,
+    )
+
     # VAE
     vae_stride: Tuple[int, int, int] = (4, 8, 8)
     vae_z_dim: int = 16
@@ -84,6 +96,13 @@ class WanModelConfig(BaseModelConfig):
             sample_shift=5.0,
             sample_steps=50,
             sample_guide_scale=5.0,
+            teacache_coefficients=(
+                2.39676752e+03,
+                -1.31110545e+03,
+                2.01331979e+02,
+                -8.29855975e+00,
+                1.37887774e-01,
+            ),
         )
 
     @classmethod
@@ -110,4 +129,6 @@ class WanModelConfig(BaseModelConfig):
             sample_steps=50,
             sample_guide_scale=5.0,
             sample_fps=24,
+            # No profiled TeaCache coefficients for this model yet
+            teacache_coefficients=None,
         )

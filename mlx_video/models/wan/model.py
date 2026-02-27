@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -8,6 +9,47 @@ from .attention import WanLayerNorm
 from .config import WanModelConfig
 from .rope import rope_params
 from .transformer import WanAttentionBlock
+
+
+@dataclass
+class TeaCacheState:
+    """Tracks TeaCache state for skipping redundant transformer computations.
+
+    TeaCache (Timestep Embedding Aware Cache) monitors the relative L1 distance
+    between consecutive timestep embeddings (e0). When the accumulated rescaled
+    distance is below a threshold, the transformer blocks are skipped and the
+    cached residual from the previous step is reused.
+
+    Since batched CFG shares the same scalar timestep across cond/uncond, we
+    track a single e0 / residual for the whole batch.
+    """
+
+    enabled: bool = False
+    threshold: float = 0.0
+    coefficients: tuple = ()
+
+    # Single tracking for the whole batch (same timestep → same e0)
+    previous_e0: object = None  # mx.array | None
+    accumulated_distance: float = 0.0
+    previous_residual: object = None  # mx.array | None
+
+    # Step counter and bounds
+    cnt: int = 0
+    num_steps: int = 0
+    ret_steps: int = 2  # always compute first N steps
+    cutoff_steps: int = 0  # always compute last N steps (set to num_steps - 2)
+
+    # Stats
+    steps_skipped: int = 0
+    steps_computed: int = 0
+
+    def reset(self):
+        self.previous_e0 = None
+        self.accumulated_distance = 0.0
+        self.previous_residual = None
+        self.cnt = 0
+        self.steps_skipped = 0
+        self.steps_computed = 0
 
 
 def sinusoidal_embedding_1d(dim: int, position: mx.array) -> mx.array:
@@ -120,6 +162,9 @@ class WanModel(nn.Module):
         freqs_w = rope_params(1024, d_w)
         # Concatenate along the frequency dimension: [1024, d//2, 2]
         self.freqs = mx.concatenate([freqs_t, freqs_h, freqs_w], axis=1)
+
+        # TeaCache state (disabled by default)
+        self.teacache = TeaCacheState()
 
     def _patchify(self, x: mx.array) -> tuple:
         """Convert video tensor to patch embeddings.
@@ -298,7 +343,6 @@ class WanModel(nn.Module):
         else:
             context_batch = self.embed_text(context)
 
-        # Run transformer blocks
         kwargs = dict(
             e=e0,
             seq_lens=seq_lens_list,
@@ -308,9 +352,54 @@ class WanModel(nn.Module):
             context_lens=None,
         )
 
-        for i, block in enumerate(self.blocks):
-            kv = cross_kv_caches[i] if cross_kv_caches is not None else None
-            x = block(x, cross_kv_cache=kv, **kwargs)
+        # Run transformer blocks (with optional TeaCache skip)
+        if self.teacache.enabled:
+            tc = self.teacache
+            should_skip = False
+
+            if tc.cnt < tc.ret_steps or tc.cnt >= tc.cutoff_steps:
+                # Always compute first/last steps (they change the most)
+                tc.accumulated_distance = 0.0
+            elif tc.previous_e0 is not None:
+                # Compute relative L1 distance between current and previous e0
+                rel_l1 = (
+                    mx.abs(e0 - tc.previous_e0).mean()
+                    / mx.abs(tc.previous_e0).mean()
+                ).item()
+
+                # Polynomial rescaling (Horner's method, np.poly1d convention)
+                rescaled = tc.coefficients[0]
+                for c in tc.coefficients[1:]:
+                    rescaled = rescaled * rel_l1 + c
+
+                tc.accumulated_distance += rescaled
+
+                if tc.accumulated_distance < tc.threshold:
+                    should_skip = True
+                else:
+                    tc.accumulated_distance = 0.0
+
+            tc.previous_e0 = e0
+
+            if should_skip and tc.previous_residual is not None:
+                # Reuse cached residual — skip all transformer blocks
+                x = x + tc.previous_residual
+                tc.steps_skipped += 1
+            else:
+                # Full forward pass through transformer blocks
+                ori_x = x
+                for i, block in enumerate(self.blocks):
+                    kv = cross_kv_caches[i] if cross_kv_caches is not None else None
+                    x = block(x, cross_kv_cache=kv, **kwargs)
+                # Cache the residual for potential reuse
+                tc.previous_residual = x - ori_x
+                tc.steps_computed += 1
+
+            tc.cnt += 1
+        else:
+            for i, block in enumerate(self.blocks):
+                kv = cross_kv_caches[i] if cross_kv_caches is not None else None
+                x = block(x, cross_kv_cache=kv, **kwargs)
 
         # Output head
         x = self.head(x, e)
