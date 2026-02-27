@@ -119,8 +119,9 @@ class RMS_norm(nn.Module):
 
     def __call__(self, x):
         # x: [..., C] (channels-last)
-        norm = mx.rsqrt(mx.sum(x * x, axis=-1, keepdims=True) / x.shape[-1] + 1e-8)
-        return x * norm * self.scale * self.gamma
+        # PyTorch uses F.normalize (L2 norm), not RMS: x / max(||x||_2, eps)
+        l2_sq = mx.sum(x * x, axis=-1, keepdims=True)
+        return x * mx.rsqrt(mx.maximum(l2_sq, mx.array(1e-24))) * self.scale * self.gamma
 
 
 class ResidualBlock(nn.Module):
