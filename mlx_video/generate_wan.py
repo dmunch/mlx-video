@@ -91,6 +91,8 @@ def load_vae_decoder(model_path: Path, config=None):
         vae = WanVAE(z_dim=16)
 
     weights = mx.load(str(model_path))
+    # Upcast VAE weights to float32 for quality — official Wan2.2 runs VAE in float32
+    weights = {k: v.astype(mx.float32) for k, v in weights.items()}
     vae.load_weights(list(weights.items()), strict=False)
     mx.eval(vae.parameters())
     return vae
@@ -133,7 +135,7 @@ def encode_text(
 def generate_video(
     model_dir: str,
     prompt: str,
-    negative_prompt: str = "",
+    negative_prompt: str | None = None,
     width: int = 1280,
     height: int = 720,
     num_frames: int = 81,
@@ -149,7 +151,7 @@ def generate_video(
     Args:
         model_dir: Path to converted MLX model directory
         prompt: Text prompt
-        negative_prompt: Negative prompt
+        negative_prompt: Negative prompt (None = use config default, "" = no negative prompt)
         width: Video width
         height: Video height
         num_frames: Number of frames (must be 4n+1)
@@ -259,10 +261,17 @@ def generate_video(
 
     version_str = f"Wan{config.model_version}"
     mode_str = "dual-model" if is_dual else "single-model"
+    # Resolve negative prompt: explicit user value > empty default
+    # The official Wan2.2 uses a Chinese negative prompt (config.sample_neg_prompt),
+    # but it can cause blurriness if T5 encoding differs. Use --negative-prompt to opt in.
+    neg_prompt_resolved = negative_prompt if negative_prompt is not None else ""
     print(f"{Colors.CYAN}{'='*60}")
     print(f"  {version_str} Text-to-Video Generation (MLX, {mode_str})")
     print(f"{'='*60}{Colors.RESET}")
     print(f"{Colors.DIM}  Prompt: {prompt}")
+    if neg_prompt_resolved and neg_prompt_resolved.strip():
+        neg_display = neg_prompt_resolved[:60] + "..." if len(neg_prompt_resolved) > 60 else neg_prompt_resolved
+        print(f"  Neg prompt: {neg_display}")
     print(f"  Size: {width}x{height}, Frames: {num_frames}")
     print(f"  Steps: {steps}, Guide: {guide_scale}, Shift: {shift}, Solver: {scheduler}")
     print(f"{Colors.RESET}")
@@ -304,10 +313,7 @@ def generate_video(
     # Encode prompts
     print(f"{Colors.BLUE}Encoding text...{Colors.RESET}")
     context = encode_text(t5_encoder, tokenizer, prompt, config.text_len)
-    if negative_prompt:
-        context_null = encode_text(t5_encoder, tokenizer, negative_prompt, config.text_len)
-    else:
-        context_null = encode_text(t5_encoder, tokenizer, "", config.text_len)
+    context_null = encode_text(t5_encoder, tokenizer, neg_prompt_resolved, config.text_len)
     mx.eval(context, context_null)
 
     # Free T5 from memory
@@ -488,7 +494,8 @@ def main():
     parser = argparse.ArgumentParser(description="Wan Text-to-Video Generation (MLX)")
     parser.add_argument("--model-dir", type=str, required=True, help="Path to converted MLX model directory")
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt")
-    parser.add_argument("--negative-prompt", type=str, default="", help="Negative prompt")
+    parser.add_argument("--negative-prompt", type=str, default="",
+                        help="Negative prompt for CFG (try official Chinese prompt from config for quality)")
     parser.add_argument("--width", type=int, default=1280, help="Video width")
     parser.add_argument("--height", type=int, default=720, help="Video height")
     parser.add_argument("--num-frames", type=int, default=81, help="Number of frames (must be 4n+1)")
@@ -513,7 +520,7 @@ def main():
     generate_video(
         model_dir=args.model_dir,
         prompt=args.prompt,
-        negative_prompt=args.negative_prompt,
+        negative_prompt=args.negative_prompt or None,
         width=args.width,
         height=args.height,
         num_frames=args.num_frames,
