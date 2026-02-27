@@ -90,3 +90,24 @@ class WanModelConfig(BaseModelConfig):
     def wan22_t2v_14b(cls) -> "WanModelConfig":
         """Wan2.2 T2V 14B: dual model, 40 layers, dim=5120 (default)."""
         return cls()
+
+    @classmethod
+    def wan22_ti2v_5b(cls) -> "WanModelConfig":
+        """Wan2.2 TI2V 5B: text+image to video, 30 layers, dim=3072."""
+        return cls(
+            model_type="ti2v",
+            dim=3072,
+            ffn_dim=14336,
+            in_dim=48,
+            out_dim=48,
+            num_heads=24,
+            num_layers=30,
+            vae_z_dim=48,
+            vae_stride=(4, 16, 16),
+            dual_model=False,
+            boundary=0.0,
+            sample_shift=5.0,
+            sample_steps=50,
+            sample_guide_scale=5.0,
+            sample_fps=24,
+        )

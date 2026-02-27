@@ -104,6 +104,21 @@ def load_vae_decoder(model_path: Path, config=None):
     return vae
 
 
+def load_vae_encoder(model_path: Path, config=None):
+    """Load VAE encoder for I2V image encoding.
+
+    Only supports Wan2.2 (vae_z_dim=48).
+    """
+    from mlx_video.models.wan.vae22 import Wan22VAEEncoder
+
+    encoder = Wan22VAEEncoder(z_dim=config.vae_z_dim)
+    weights = mx.load(str(model_path))
+    weights = {k: v.astype(mx.float32) for k, v in weights.items()}
+    encoder.load_weights(list(weights.items()), strict=False)
+    mx.eval(encoder.parameters())
+    return encoder
+
+
 def _clean_text(text: str) -> str:
     """Clean text matching official Wan2.2 tokenizer preprocessing.
 
@@ -159,10 +174,65 @@ def encode_text(
     return embeddings[0, :seq_len]
 
 
+def preprocess_image(image_path: str, width: int, height: int) -> mx.array:
+    """Load, resize, center-crop, and normalize an image for I2V.
+
+    Args:
+        image_path: Path to input image
+        width: Target width
+        height: Target height
+
+    Returns:
+        Image tensor [1, 1, H, W, 3] in [-1, 1] (channels-last, batch + temporal dims)
+    """
+    from PIL import Image
+
+    img = Image.open(image_path).convert("RGB")
+
+    # Resize so that the image covers the target size (LANCZOS)
+    scale = max(width / img.width, height / img.height)
+    img = img.resize((round(img.width * scale), round(img.height * scale)), Image.LANCZOS)
+
+    # Center crop
+    x1 = (img.width - width) // 2
+    y1 = (img.height - height) // 2
+    img = img.crop((x1, y1, x1 + width, y1 + height))
+
+    # To tensor: [H, W, 3] float32 in [-1, 1]
+    arr = np.array(img, dtype=np.float32) / 255.0
+    arr = arr * 2.0 - 1.0  # [0,1] → [-1,1]
+    return mx.array(arr[None, None])  # [1, 1, H, W, 3]
+
+
+def _build_i2v_mask(z_shape, patch_size):
+    """Build temporal mask for I2V: first frame = 0, rest = 1.
+
+    Args:
+        z_shape: Latent shape (C, T, H, W) in channels-first
+        patch_size: (pt, ph, pw) patch size
+
+    Returns:
+        mask: (C, T, H, W) float32 — 0 for first frame, 1 for rest
+        mask_tokens: (1, L) float32 — 0 for first-frame tokens, 1 for rest
+    """
+    C, T, H, W = z_shape
+    mask = mx.ones(z_shape)
+    # Zero out the first temporal position
+    mask = mx.concatenate([mx.zeros((C, 1, H, W)), mask[:, 1:]], axis=1)
+
+    # Token-level mask for per-token timesteps: subsample to patch grid
+    # mask shape [C, T, H, W] → take first channel, subsample by patch_size
+    pt, ph, pw = patch_size
+    mask_tokens = mask[0, ::pt, ::ph, ::pw]  # [T', H', W']
+    mask_tokens = mask_tokens.reshape(1, -1)  # [1, L]
+    return mask, mask_tokens
+
+
 def generate_video(
     model_dir: str,
     prompt: str,
     negative_prompt: str | None = None,
+    image: str | None = None,
     width: int = 1280,
     height: int = 720,
     num_frames: int = 81,
@@ -173,12 +243,13 @@ def generate_video(
     output_path: str = "output.mp4",
     scheduler: str = "unipc",
 ):
-    """Generate video using Wan T2V pipeline (supports 2.1 and 2.2).
+    """Generate video using Wan pipeline (supports T2V and I2V).
 
     Args:
         model_dir: Path to converted MLX model directory
         prompt: Text prompt
         negative_prompt: Negative prompt (None = use config default, "" = no negative prompt)
+        image: Path to input image for I2V (None = T2V mode)
         width: Video width
         height: Video height
         num_frames: Number of frames (must be 4n+1)
@@ -240,6 +311,7 @@ def generate_video(
                 config = WanModelConfig.wan21_t2v_14b()
 
     is_dual = config.dual_model
+    is_i2v = image is not None
 
     # Validate config against actual weights (handles mismatched config.json)
     if not is_dual:
@@ -288,6 +360,7 @@ def generate_video(
 
     version_str = f"Wan{config.model_version}"
     mode_str = "dual-model" if is_dual else "single-model"
+    pipeline_str = "Image-to-Video" if is_i2v else "Text-to-Video"
     # Resolve negative prompt: explicit user value > config default
     # The official Wan2.2 uses a Chinese negative prompt (config.sample_neg_prompt)
     # that prevents oversaturation, artifacts, and comic look. We use it by default.
@@ -297,9 +370,11 @@ def generate_video(
     else:
         neg_prompt_resolved = negative_prompt
     print(f"{Colors.CYAN}{'='*60}")
-    print(f"  {version_str} Text-to-Video Generation (MLX, {mode_str})")
+    print(f"  {version_str} {pipeline_str} Generation (MLX, {mode_str})")
     print(f"{'='*60}{Colors.RESET}")
     print(f"{Colors.DIM}  Prompt: {prompt}")
+    if is_i2v:
+        print(f"  Image: {image}")
     if neg_prompt_resolved and neg_prompt_resolved.strip():
         neg_display = neg_prompt_resolved[:60] + "..." if len(neg_prompt_resolved) > 60 else neg_prompt_resolved
         print(f"  Neg prompt: {neg_display}")
@@ -352,6 +427,31 @@ def generate_video(
     gc.collect(); mx.clear_cache()
     print(f"{Colors.DIM}  T5 encoding: {time.time() - t1:.1f}s{Colors.RESET}")
 
+    # I2V: encode image to latent space
+    z_img = None
+    i2v_mask = None
+    i2v_mask_tokens = None
+    if is_i2v:
+        print(f"\n{Colors.BLUE}Encoding input image...{Colors.RESET}")
+        t_img = time.time()
+        img_tensor = preprocess_image(image, width, height)
+        mx.eval(img_tensor)
+
+        vae_path = model_dir / "vae.safetensors"
+        vae_enc = load_vae_encoder(vae_path, config)
+        z_img = vae_enc(img_tensor)  # [1, 1, H_lat, W_lat, z_dim]
+        mx.eval(z_img)
+
+        # Convert to channels-first: [z_dim, 1, H_lat, W_lat]
+        z_img = z_img[0].transpose(3, 0, 1, 2)
+
+        # Build I2V mask
+        i2v_mask, i2v_mask_tokens = _build_i2v_mask(target_shape, config.patch_size)
+
+        del vae_enc, img_tensor
+        gc.collect(); mx.clear_cache()
+        print(f"{Colors.DIM}  Image encoding: {time.time() - t_img:.1f}s{Colors.RESET}")
+
     # Load transformer models
     print(f"\n{Colors.BLUE}Loading transformer model(s)...{Colors.RESET}")
     if quantization:
@@ -398,12 +498,18 @@ def generate_video(
     # Generate initial noise
     noise = mx.random.normal(target_shape)
 
+    # I2V: blend first-frame latent into noise
+    if is_i2v:
+        # Broadcast z_img [z_dim, 1, H, W] across T for first-frame conditioning
+        latents = (1.0 - i2v_mask) * z_img + i2v_mask * noise
+    else:
+        latents = noise
+
     # Boundary for model switching (dual model only)
     boundary = (config.boundary * config.num_train_timesteps) if is_dual else None
 
     # Diffusion loop
     print(f"\n{Colors.GREEN}Denoising ({steps} steps)...{Colors.RESET}")
-    latents = noise
     t3 = time.time()
 
     for i, t in enumerate(tqdm(range(steps), desc="Diffusion")):
@@ -424,10 +530,24 @@ def generate_video(
             gs = guide_scale if isinstance(guide_scale, (int, float)) else guide_scale[0]
             kv = cross_kv
 
+        # Build per-token timesteps for I2V (first-frame patches get t=0)
+        if is_i2v:
+            t_tokens = i2v_mask_tokens * timestep_val  # [1, L]
+            # Pad to seq_len if needed
+            pad_len = seq_len - t_tokens.shape[1]
+            if pad_len > 0:
+                t_tokens = mx.concatenate(
+                    [t_tokens, mx.full((1, pad_len), timestep_val)], axis=1
+                )
+            # Batch for CFG: both cond and uncond get same timesteps
+            t_batch = mx.concatenate([t_tokens, t_tokens], axis=0)  # [2, L]
+        else:
+            t_batch = mx.array([timestep_val, timestep_val])
+
         # CFG: batch cond + uncond into single B=2 forward pass
         preds = model(
             [latents, latents],
-            t=mx.array([timestep_val, timestep_val]),
+            t=t_batch,
             context=context_cfg,
             seq_len=seq_len,
             cross_kv_caches=kv,
@@ -437,6 +557,10 @@ def generate_video(
         # Classifier-free guidance + scheduler step
         noise_pred = noise_pred_uncond + gs * (noise_pred_cond - noise_pred_uncond)
         latents = sched.step(noise_pred[None], timestep_val, latents[None]).squeeze(0)
+
+        # I2V: re-apply mask to keep first frame frozen
+        if is_i2v:
+            latents = (1.0 - i2v_mask) * z_img + i2v_mask * latents
 
         # Release temporaries before eval to free memory for graph execution
         del noise_pred_cond, noise_pred_uncond, noise_pred, preds
@@ -525,6 +649,8 @@ def main():
     parser = argparse.ArgumentParser(description="Wan Text-to-Video Generation (MLX)")
     parser.add_argument("--model-dir", type=str, required=True, help="Path to converted MLX model directory")
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt")
+    parser.add_argument("--image", type=str, default=None,
+                        help="Path to input image for I2V (omit for T2V mode)")
     parser.add_argument("--negative-prompt", type=str, default=None,
                         help="Negative prompt for CFG (default: official Chinese prompt from config)")
     parser.add_argument("--no-negative-prompt", action="store_true",
@@ -559,6 +685,7 @@ def main():
         model_dir=args.model_dir,
         prompt=args.prompt,
         negative_prompt=neg_prompt,
+        image=args.image,
         width=args.width,
         height=args.height,
         num_frames=args.num_frames,

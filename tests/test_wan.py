@@ -2710,3 +2710,243 @@ class TestUpResidualBlock:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# =============================================================================
+# I2V-specific tests
+# =============================================================================
+
+
+class TestPatchify:
+    """Tests for _patchify and _unpatchify round-trip."""
+
+    def test_roundtrip(self):
+        from mlx_video.models.wan.vae22 import _patchify, _unpatchify
+
+        x = mx.random.normal((1, 1, 64, 64, 3))
+        p = _patchify(x, patch_size=2)
+        assert p.shape == (1, 1, 32, 32, 12)
+        back = _unpatchify(p, patch_size=2)
+        assert back.shape == x.shape
+        assert float(mx.abs(x - back).max()) == 0.0
+
+    def test_identity_patch_1(self):
+        from mlx_video.models.wan.vae22 import _patchify, _unpatchify
+
+        x = mx.random.normal((1, 2, 8, 8, 3))
+        assert _patchify(x, patch_size=1).shape == x.shape
+        assert _unpatchify(x, patch_size=1).shape == x.shape
+
+
+class TestAvgDown3D:
+    """Tests for AvgDown3D downsampling."""
+
+    def test_spatial_only(self):
+        from mlx_video.models.wan.vae22 import AvgDown3D
+
+        down = AvgDown3D(8, 16, factor_t=1, factor_s=2)
+        x = mx.random.normal((1, 2, 8, 8, 8))
+        out = down(x)
+        mx.eval(out)
+        assert out.shape == (1, 2, 4, 4, 16)
+
+    def test_temporal_and_spatial(self):
+        from mlx_video.models.wan.vae22 import AvgDown3D
+
+        down = AvgDown3D(8, 16, factor_t=2, factor_s=2)
+        x = mx.random.normal((1, 4, 8, 8, 8))
+        out = down(x)
+        mx.eval(out)
+        assert out.shape == (1, 2, 4, 4, 16)
+
+    def test_single_frame(self):
+        from mlx_video.models.wan.vae22 import AvgDown3D
+
+        down = AvgDown3D(8, 8, factor_t=2, factor_s=2)
+        x = mx.random.normal((1, 1, 8, 8, 8))
+        out = down(x)
+        mx.eval(out)
+        # T=1 with factor_t=2: pads to T=2 then averages → T=1
+        assert out.shape == (1, 1, 4, 4, 8)
+
+
+class TestDownResidualBlock:
+    """Tests for Down_ResidualBlock."""
+
+    def test_no_downsample(self):
+        from mlx_video.models.wan.vae22 import Down_ResidualBlock
+
+        block = Down_ResidualBlock(8, 8, num_res_blocks=1, temperal_downsample=False, down_flag=False)
+        x = mx.random.normal((1, 2, 8, 8, 8))
+        out = block(x)
+        mx.eval(out)
+        assert out.shape == (1, 2, 8, 8, 8)
+
+    def test_spatial_downsample(self):
+        from mlx_video.models.wan.vae22 import Down_ResidualBlock
+
+        block = Down_ResidualBlock(8, 16, num_res_blocks=1, temperal_downsample=False, down_flag=True)
+        x = mx.random.normal((1, 2, 8, 8, 8))
+        out = block(x)
+        mx.eval(out)
+        assert out.shape == (1, 2, 4, 4, 16)
+
+    def test_spatial_temporal_downsample(self):
+        from mlx_video.models.wan.vae22 import Down_ResidualBlock
+
+        block = Down_ResidualBlock(8, 16, num_res_blocks=1, temperal_downsample=True, down_flag=True)
+        x = mx.random.normal((1, 4, 8, 8, 8))
+        out = block(x)
+        mx.eval(out)
+        assert out.shape == (1, 2, 4, 4, 16)
+
+
+class TestEncoder3d:
+    """Tests for Encoder3d."""
+
+    def test_output_shape(self):
+        from mlx_video.models.wan.vae22 import Encoder3d
+
+        enc = Encoder3d(dim=16, z_dim=8)
+        x = mx.random.normal((1, 1, 16, 16, 12))
+        mx.eval(enc.parameters())
+        out = enc(x)
+        mx.eval(out)
+        # 3 spatial downsamples ÷8: 16→2
+        assert out.shape == (1, 1, 2, 2, 8)
+
+    def test_multi_frame(self):
+        from mlx_video.models.wan.vae22 import Encoder3d
+
+        enc = Encoder3d(dim=16, z_dim=8, temperal_downsample=(True, True, False))
+        x = mx.random.normal((1, 5, 16, 16, 12))
+        mx.eval(enc.parameters())
+        out = enc(x)
+        mx.eval(out)
+        # T: 5→3 (1st t_down) →2 (2nd t_down), spatial ÷8
+        assert out.shape[2:] == (2, 2, 8)
+
+
+class TestWan22VAEEncoder:
+    """Tests for Wan22VAEEncoder wrapper."""
+
+    def test_output_shape(self):
+        from mlx_video.models.wan.vae22 import Wan22VAEEncoder
+
+        enc = Wan22VAEEncoder(z_dim=48, dim=16)
+        # Input: single image 32×32 (patchify÷2 → 16×16, then 3 spatial ÷8 → 2×2)
+        img = mx.random.normal((1, 1, 32, 32, 3))
+        mx.eval(enc.parameters())
+        z = enc(img)
+        mx.eval(z)
+        assert z.shape == (1, 1, 2, 2, 48)
+
+    def test_full_dim(self):
+        from mlx_video.models.wan.vae22 import Wan22VAEEncoder
+
+        enc = Wan22VAEEncoder(z_dim=48, dim=160)
+        img = mx.random.normal((1, 1, 64, 64, 3))
+        mx.eval(enc.parameters())
+        z = enc(img)
+        mx.eval(z)
+        # 64 / 16 = 4 (vae stride 16×)
+        assert z.shape == (1, 1, 4, 4, 48)
+
+
+class TestNormalizeLatents:
+    """Tests for normalize/denormalize latent roundtrip."""
+
+    def test_roundtrip(self):
+        from mlx_video.models.wan.vae22 import denormalize_latents, normalize_latents
+
+        z = mx.random.normal((1, 2, 4, 4, 48))
+        z_norm = normalize_latents(z)
+        z_back = denormalize_latents(z_norm)
+        mx.eval(z_back)
+        assert float(mx.abs(z - z_back).max()) < 1e-4
+
+
+class TestPerTokenTimestep:
+    """Tests for per-token sinusoidal embedding."""
+
+    def test_1d_unchanged(self):
+        from mlx_video.models.wan.model import sinusoidal_embedding_1d
+
+        pos = mx.array([0.0, 100.0, 500.0])
+        emb = sinusoidal_embedding_1d(256, pos)
+        assert emb.shape == (3, 256)
+
+    def test_2d_per_token(self):
+        from mlx_video.models.wan.model import sinusoidal_embedding_1d
+
+        pos = mx.array([[0.0, 100.0, 100.0], [50.0, 50.0, 50.0]])
+        emb = sinusoidal_embedding_1d(256, pos)
+        assert emb.shape == (2, 3, 256)
+
+    def test_consistency(self):
+        from mlx_video.models.wan.model import sinusoidal_embedding_1d
+
+        pos_1d = mx.array([0.0, 100.0])
+        emb_1d = sinusoidal_embedding_1d(256, pos_1d)
+        pos_2d = mx.array([[0.0, 100.0]])
+        emb_2d = sinusoidal_embedding_1d(256, pos_2d)
+        assert mx.array_equal(emb_1d[0], emb_2d[0, 0])
+        assert mx.array_equal(emb_1d[1], emb_2d[0, 1])
+
+
+class TestI2VMask:
+    """Tests for _build_i2v_mask."""
+
+    def test_mask_shapes(self):
+        from mlx_video.generate_wan import _build_i2v_mask
+
+        z_shape = (48, 5, 4, 4)  # C, T, H, W
+        patch_size = (1, 2, 2)
+        mask, mask_tokens = _build_i2v_mask(z_shape, patch_size)
+        assert mask.shape == z_shape
+        # Tokens: T=5, H/2=2, W/2=2 → 5*2*2 = 20
+        assert mask_tokens.shape == (1, 20)
+
+    def test_first_frame_zero(self):
+        from mlx_video.generate_wan import _build_i2v_mask
+
+        z_shape = (48, 5, 4, 4)
+        mask, mask_tokens = _build_i2v_mask(z_shape, (1, 2, 2))
+        mx.eval(mask, mask_tokens)
+        # First temporal position should be 0
+        assert float(mask[:, 0, :, :].max()) == 0.0
+        # Rest should be 1
+        assert float(mask[:, 1:, :, :].min()) == 1.0
+        # First-frame tokens (T=0) should be 0 in mask_tokens
+        # With T=5, H'=2, W'=2: first 4 tokens are frame 0
+        assert float(mask_tokens[0, :4].max()) == 0.0
+        assert float(mask_tokens[0, 4:].min()) == 1.0
+
+
+class TestSanitizeEncoderWeights:
+    """Tests for sanitize_wan22_vae_weights with include_encoder."""
+
+    def test_exclude_encoder_by_default(self):
+        from mlx_video.models.wan.vae22 import sanitize_wan22_vae_weights
+
+        weights = {
+            "encoder.conv1.weight": mx.zeros((8, 1, 3, 3, 3)),
+            "conv1.weight": mx.zeros((8, 1, 1, 1, 8)),
+            "conv2.weight": mx.zeros((8, 1, 1, 1, 8)),
+        }
+        out = sanitize_wan22_vae_weights(weights, include_encoder=False)
+        assert "conv2.weight" in out
+        assert not any("encoder" in k or k.startswith("conv1") for k in out)
+
+    def test_include_encoder(self):
+        from mlx_video.models.wan.vae22 import sanitize_wan22_vae_weights
+
+        weights = {
+            "encoder.conv1.weight": mx.zeros((8, 1, 3, 3, 3)),
+            "conv1.weight": mx.zeros((8, 1, 1, 1, 8)),
+            "conv2.weight": mx.zeros((8, 1, 1, 1, 8)),
+        }
+        out = sanitize_wan22_vae_weights(weights, include_encoder=True)
+        assert "encoder.conv1.weight" in out
+        assert "conv1.weight" in out
+        assert "conv2.weight" in out
