@@ -142,6 +142,7 @@ def generate_video(
     shift: float = None,
     seed: int = -1,
     output_path: str = "output.mp4",
+    scheduler: str = "unipc",
 ):
     """Generate video using Wan T2V pipeline (supports 2.1 and 2.2).
 
@@ -157,11 +158,16 @@ def generate_video(
         shift: Noise schedule shift (None = use config default)
         seed: Random seed (-1 for random)
         output_path: Output video path
+        scheduler: Solver type: 'euler', 'dpm++', or 'unipc' (default)
     """
     import json
 
     from mlx_video.models.wan.config import WanModelConfig
-    from mlx_video.models.wan.scheduler import FlowMatchEulerScheduler
+    from mlx_video.models.wan.scheduler import (
+        FlowDPMPP2MScheduler,
+        FlowMatchEulerScheduler,
+        FlowUniPCScheduler,
+    )
 
     model_dir = Path(model_dir)
 
@@ -258,7 +264,7 @@ def generate_video(
     print(f"{'='*60}{Colors.RESET}")
     print(f"{Colors.DIM}  Prompt: {prompt}")
     print(f"  Size: {width}x{height}, Frames: {num_frames}")
-    print(f"  Steps: {steps}, Guide: {guide_scale}, Shift: {shift}")
+    print(f"  Steps: {steps}, Guide: {guide_scale}, Shift: {shift}, Solver: {scheduler}")
     print(f"{Colors.RESET}")
 
     # Seed
@@ -343,8 +349,14 @@ def generate_video(
         mx.eval(cross_kv)
 
     # Setup scheduler
-    scheduler = FlowMatchEulerScheduler(num_train_timesteps=config.num_train_timesteps)
-    scheduler.set_timesteps(steps, shift=shift)
+    _schedulers = {
+        "euler": FlowMatchEulerScheduler,
+        "dpm++": FlowDPMPP2MScheduler,
+        "unipc": FlowUniPCScheduler,
+    }
+    sched_cls = _schedulers.get(scheduler, FlowUniPCScheduler)
+    sched = sched_cls(num_train_timesteps=config.num_train_timesteps)
+    sched.set_timesteps(steps, shift=shift)
 
     # Generate initial noise
     noise = mx.random.normal(target_shape)
@@ -358,7 +370,7 @@ def generate_video(
     t3 = time.time()
 
     for i, t in enumerate(tqdm(range(steps), desc="Diffusion")):
-        timestep_val = scheduler.timesteps[i].item()
+        timestep_val = sched.timesteps[i].item()
 
         # Select model, guide scale, and cached K/V
         if is_dual:
@@ -387,7 +399,7 @@ def generate_video(
 
         # Classifier-free guidance + scheduler step
         noise_pred = noise_pred_uncond + gs * (noise_pred_cond - noise_pred_uncond)
-        latents = scheduler.step(noise_pred[None], timestep_val, latents[None]).squeeze(0)
+        latents = sched.step(noise_pred[None], timestep_val, latents[None]).squeeze(0)
 
         # Release temporaries before eval to free memory for graph execution
         del noise_pred_cond, noise_pred_uncond, noise_pred, preds
@@ -485,6 +497,11 @@ def main():
     parser.add_argument("--shift", type=float, default=None, help="Noise schedule shift (default: from config)")
     parser.add_argument("--seed", type=int, default=-1, help="Random seed")
     parser.add_argument("--output-path", type=str, default="output.mp4", help="Output video path")
+    parser.add_argument(
+        "--scheduler", type=str, default="unipc",
+        choices=["euler", "dpm++", "unipc"],
+        help="Diffusion solver: euler (1st order), dpm++ (2nd order), unipc (2nd order, default)",
+    )
     args = parser.parse_args()
 
     # Parse guide scale
@@ -505,6 +522,7 @@ def main():
         shift=args.shift,
         seed=args.seed,
         output_path=args.output_path,
+        scheduler=args.scheduler,
     )
 
 
