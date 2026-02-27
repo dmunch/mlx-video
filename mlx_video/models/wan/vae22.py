@@ -297,8 +297,15 @@ class Resample(nn.Module):
             stream1 = tc_out[:, :, :, :, 1, :]  # [B, T, H, W, C]
             x = mx.stack([stream0, stream1], axis=2)  # [B, T, 2, H, W, C]
             x = x.reshape(B, T * 2, H, W, C)
-            mx.eval(x)  # Evaluate temporal upsample before spatial
-            T = T * 2
+
+            if first_chunk:
+                # PyTorch skips time_conv for first chunk entirely. In all-at-once
+                # mode, we trim the first frame to match (the first interleaved
+                # frame is from zero-padded causal context and shouldn't be kept).
+                x = x[:, 1:, :, :, :]
+
+            mx.eval(x)
+            T = x.shape[1]
 
         # Spatial upsample in temporal chunks to limit peak memory
         chunk_size = 8
@@ -467,8 +474,9 @@ class Wan22VAEDecoder(nn.Module):
         """
         x = self.conv2(z)
 
-        # Non-chunked: process all frames at once, no temporal trimming
-        out = self.decoder(x, first_chunk=False)
+        # All-at-once decode with first_chunk=True to trim extra temporal
+        # frames from causal padding (matches PyTorch's chunked behavior)
+        out = self.decoder(x, first_chunk=True)
 
         # Unpatchify: 12 channels → 3 RGB (spatial 2×2)
         out = _unpatchify(out, patch_size=2)
