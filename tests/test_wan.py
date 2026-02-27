@@ -1788,6 +1788,335 @@ class TestFlowUniPCScheduler:
 
 
 # ---------------------------------------------------------------------------
+# Cross-Scheduler Coherence Tests
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerCoherence:
+    """Tests that Euler, DPM++, and UniPC schedulers produce coherent results.
+
+    All three schedulers should agree on shared structure (sigma schedules,
+    first-step behavior) and converge to the same result given perfect
+    velocity oracles, even though they use different update rules.
+    """
+
+    @staticmethod
+    def _make_schedulers(steps=10, shift=5.0):
+        from mlx_video.models.wan.scheduler import (
+            FlowDPMPP2MScheduler,
+            FlowMatchEulerScheduler,
+            FlowUniPCScheduler,
+        )
+
+        scheds = {
+            "euler": FlowMatchEulerScheduler(),
+            "dpm++": FlowDPMPP2MScheduler(),
+            "unipc": FlowUniPCScheduler(),
+        }
+        for s in scheds.values():
+            s.set_timesteps(steps, shift=shift)
+        return scheds
+
+    def test_identical_sigma_schedules(self):
+        """All schedulers must use the same sigma schedule."""
+        scheds = self._make_schedulers(20, shift=5.0)
+        ref = np.array(scheds["euler"].sigmas)
+        for name in ("dpm++", "unipc"):
+            np.testing.assert_allclose(
+                np.array(scheds[name].sigmas),
+                ref,
+                atol=1e-6,
+                err_msg=f"{name} sigma schedule differs from Euler",
+            )
+
+    def test_identical_timesteps(self):
+        """All schedulers must produce the same timestep sequence."""
+        scheds = self._make_schedulers(20, shift=5.0)
+        ref = np.array(scheds["euler"].timesteps)
+        for name in ("dpm++", "unipc"):
+            np.testing.assert_allclose(
+                np.array(scheds[name].timesteps),
+                ref,
+                atol=1e-6,
+                err_msg=f"{name} timesteps differ from Euler",
+            )
+
+    def test_first_step_matches_euler(self):
+        """Step 0 (1st-order for all solvers) should match Euler exactly."""
+        mx.random.seed(42)
+        shape = (1, 4, 1, 4, 4)
+        noise = mx.random.normal(shape)
+        vel = mx.random.normal(shape)
+
+        scheds = self._make_schedulers(10, shift=5.0)
+        results = {}
+        for name, sched in scheds.items():
+            r = sched.step(vel, sched.timesteps[0], noise)
+            mx.eval(r)
+            results[name] = np.array(r)
+
+        np.testing.assert_allclose(
+            results["dpm++"], results["euler"], atol=1e-5,
+            err_msg="DPM++ step 0 should match Euler",
+        )
+        np.testing.assert_allclose(
+            results["unipc"], results["euler"], atol=1e-5,
+            err_msg="UniPC step 0 should match Euler",
+        )
+
+    def test_first_step_matches_across_shifts(self):
+        """Step 0 should match Euler for different shift values."""
+        mx.random.seed(99)
+        shape = (1, 2, 1, 2, 2)
+        noise = mx.random.normal(shape)
+        vel = mx.random.normal(shape)
+
+        for shift in (1.0, 5.0, 12.0):
+            scheds = self._make_schedulers(10, shift=shift)
+            euler_r = scheds["euler"].step(vel, scheds["euler"].timesteps[0], noise)
+            dpm_r = scheds["dpm++"].step(vel, scheds["dpm++"].timesteps[0], noise)
+            unipc_r = scheds["unipc"].step(vel, scheds["unipc"].timesteps[0], noise)
+            mx.eval(euler_r, dpm_r, unipc_r)
+            np.testing.assert_allclose(
+                np.array(dpm_r), np.array(euler_r), atol=1e-5,
+                err_msg=f"DPM++ step 0 differs from Euler at shift={shift}",
+            )
+            np.testing.assert_allclose(
+                np.array(unipc_r), np.array(euler_r), atol=1e-5,
+                err_msg=f"UniPC step 0 differs from Euler at shift={shift}",
+            )
+
+    def test_oracle_all_converge_to_target(self):
+        """Given a perfect velocity oracle v=x/sigma, all solvers should
+        denoise to approximately zero (the target)."""
+        mx.random.seed(7)
+        shape = (1, 2, 1, 4, 4)
+        noise = mx.random.normal(shape)
+
+        for name, sched in self._make_schedulers(20, shift=5.0).items():
+            latents = noise
+            for i in range(20):
+                sigma = float(sched.sigmas[i].item())
+                v = latents / max(sigma, 1e-8)
+                latents = sched.step(v, sched.timesteps[i], latents)
+                mx.eval(latents)
+            np.testing.assert_allclose(
+                np.array(latents), 0.0, atol=1e-3,
+                err_msg=f"{name} did not converge to target with oracle",
+            )
+
+    def test_oracle_higher_order_closer_to_target(self):
+        """With few steps and a perfect oracle, higher-order solvers should
+        be at least as accurate as Euler."""
+        mx.random.seed(12)
+        shape = (1, 2, 1, 4, 4)
+        noise = mx.random.normal(shape)
+        steps = 5
+
+        errors = {}
+        for name, sched in self._make_schedulers(steps, shift=5.0).items():
+            latents = noise
+            for i in range(steps):
+                sigma = float(sched.sigmas[i].item())
+                v = latents / max(sigma, 1e-8)
+                latents = sched.step(v, sched.timesteps[i], latents)
+                mx.eval(latents)
+            errors[name] = float(mx.mean(mx.abs(latents)).item())
+
+        # Higher-order solvers should not be significantly worse than Euler
+        assert errors["dpm++"] <= errors["euler"] * 1.5, (
+            f"DPM++ error {errors['dpm++']:.6f} much worse than Euler {errors['euler']:.6f}"
+        )
+        assert errors["unipc"] <= errors["euler"] * 1.5, (
+            f"UniPC error {errors['unipc']:.6f} much worse than Euler {errors['euler']:.6f}"
+        )
+
+    def test_multistep_trajectory_similar_magnitude(self):
+        """Over a full denoising loop with constant velocity, all solvers
+        should produce outputs of similar magnitude (not diverging)."""
+        mx.random.seed(42)
+        shape = (1, 4, 1, 4, 4)
+        noise = mx.random.normal(shape)
+        steps = 20
+
+        final_means = {}
+        for name, sched in self._make_schedulers(steps, shift=5.0).items():
+            latents = noise
+            for i in range(steps):
+                vel = latents * 0.1
+                latents = sched.step(vel, sched.timesteps[i], latents)
+                mx.eval(latents)
+            final_means[name] = float(mx.mean(mx.abs(latents)).item())
+
+        # All solvers should produce results within the same order of magnitude
+        vals = list(final_means.values())
+        ratio = max(vals) / max(min(vals), 1e-10)
+        assert ratio < 10.0, (
+            f"Scheduler outputs diverge too much: {final_means}, ratio={ratio:.1f}"
+        )
+
+    def test_intermediate_values_finite(self):
+        """Every intermediate latent value must be finite for all solvers."""
+        mx.random.seed(0)
+        shape = (1, 2, 1, 2, 2)
+        noise = mx.random.normal(shape)
+
+        for name, sched in self._make_schedulers(15, shift=5.0).items():
+            latents = noise
+            for i in range(15):
+                vel = mx.random.normal(shape)
+                latents = sched.step(vel, sched.timesteps[i], latents)
+                mx.eval(latents)
+                assert np.isfinite(np.array(latents)).all(), (
+                    f"{name} produced non-finite values at step {i}"
+                )
+
+    def test_lambda_boundary_values(self):
+        """_lambda must return -inf at sigma=1.0 and +inf at sigma=0.0."""
+        from mlx_video.models.wan.scheduler import (
+            FlowDPMPP2MScheduler,
+            FlowUniPCScheduler,
+        )
+
+        for cls in (FlowDPMPP2MScheduler, FlowUniPCScheduler):
+            assert cls._lambda(1.0) == -math.inf, (
+                f"{cls.__name__}._lambda(1.0) should be -inf"
+            )
+            assert cls._lambda(0.0) == math.inf, (
+                f"{cls.__name__}._lambda(0.0) should be +inf"
+            )
+            # Interior values should be finite
+            lam = cls._lambda(0.5)
+            assert math.isfinite(lam) and lam == 0.0, (
+                f"{cls.__name__}._lambda(0.5) should be 0.0"
+            )
+
+    def test_lambda_monotonically_decreasing(self):
+        """_lambda(sigma) should decrease as sigma increases (more noise → lower SNR)."""
+        from mlx_video.models.wan.scheduler import FlowDPMPP2MScheduler
+
+        sigmas = [0.01, 0.1, 0.3, 0.5, 0.7, 0.9, 0.99]
+        lambdas = [FlowDPMPP2MScheduler._lambda(s) for s in sigmas]
+        for i in range(len(lambdas) - 1):
+            assert lambdas[i] > lambdas[i + 1], (
+                f"_lambda not decreasing: _lambda({sigmas[i]})={lambdas[i]} "
+                f"vs _lambda({sigmas[i+1]})={lambdas[i+1]}"
+            )
+
+    def test_step0_is_ddim_formula(self):
+        """At sigma=1.0, the DPM++/UniPC first step should reduce to the
+        DDIM formula: x_next = sigma_next * x + (1 - sigma_next) * x0."""
+        mx.random.seed(55)
+        shape = (1, 2, 1, 2, 2)
+        sample = mx.random.normal(shape)
+        vel = mx.random.normal(shape)
+
+        for steps, shift in [(10, 5.0), (20, 12.0)]:
+            scheds = self._make_schedulers(steps, shift=shift)
+            sigma_next = float(scheds["euler"].sigmas[1].item())
+            sigma_cur = float(scheds["euler"].sigmas[0].item())
+            assert abs(sigma_cur - 1.0) < 1e-6, "First sigma should be ~1.0"
+
+            x0 = sample - sigma_cur * vel
+            expected = sigma_next * sample + (1.0 - sigma_next) * x0
+            mx.eval(expected)
+
+            for name in ("dpm++", "unipc"):
+                result = scheds[name].step(vel, scheds[name].timesteps[0], sample)
+                mx.eval(result)
+                np.testing.assert_allclose(
+                    np.array(result), np.array(expected), atol=1e-5,
+                    err_msg=f"{name} step 0 doesn't match DDIM formula (shift={shift})",
+                )
+
+    @pytest.mark.parametrize("steps", [5, 10, 20, 50])
+    def test_coherent_across_step_counts(self, steps):
+        """All solvers should agree on step 0 regardless of total step count."""
+        mx.random.seed(77)
+        shape = (1, 2, 1, 2, 2)
+        noise = mx.random.normal(shape)
+        vel = mx.random.normal(shape)
+
+        scheds = self._make_schedulers(steps, shift=5.0)
+        results = {}
+        for name, sched in scheds.items():
+            r = sched.step(vel, sched.timesteps[0], noise)
+            mx.eval(r)
+            results[name] = np.array(r)
+
+        np.testing.assert_allclose(
+            results["dpm++"], results["euler"], atol=1e-5,
+        )
+        np.testing.assert_allclose(
+            results["unipc"], results["euler"], atol=1e-5,
+        )
+
+    def test_dpmpp_unipc_agree_on_step1(self):
+        """After warmup, DPM++ and UniPC step 1 should be similar
+        (both use 2nd-order corrections based on the same model outputs)."""
+        mx.random.seed(42)
+        shape = (1, 4, 1, 4, 4)
+        noise = mx.random.normal(shape)
+
+        scheds = self._make_schedulers(10, shift=5.0)
+        # Run step 0 with same velocity
+        vel0 = mx.random.normal(shape)
+        for sched in scheds.values():
+            sched.step(vel0, sched.timesteps[0], noise)
+
+        # Run step 1 from same sample with same velocity
+        sample1 = scheds["euler"].step(vel0, scheds["euler"].timesteps[0], noise)
+        mx.eval(sample1)
+        vel1 = mx.random.normal(shape)
+
+        r_dpm = scheds["dpm++"].step(vel1, scheds["dpm++"].timesteps[1], sample1)
+        r_unipc = scheds["unipc"].step(vel1, scheds["unipc"].timesteps[1], sample1)
+        mx.eval(r_dpm, r_unipc)
+
+        # They won't be identical (different correction formulas) but should
+        # be in the same ballpark (within 50% of each other's magnitude)
+        mean_dpm = float(mx.mean(mx.abs(r_dpm)).item())
+        mean_unipc = float(mx.mean(mx.abs(r_unipc)).item())
+        ratio = max(mean_dpm, mean_unipc) / max(min(mean_dpm, mean_unipc), 1e-10)
+        assert ratio < 2.0, (
+            f"DPM++ and UniPC step 1 differ too much: "
+            f"DPM++={mean_dpm:.4f}, UniPC={mean_unipc:.4f}"
+        )
+
+    def test_reset_makes_solvers_reproducible(self):
+        """After reset(), running the same loop should produce identical output."""
+        mx.random.seed(42)
+        shape = (1, 2, 1, 2, 2)
+        noise = mx.random.normal(shape)
+
+        from mlx_video.models.wan.scheduler import FlowDPMPP2MScheduler, FlowUniPCScheduler
+
+        for cls in (FlowDPMPP2MScheduler, FlowUniPCScheduler):
+            sched = cls()
+            sched.set_timesteps(5, shift=5.0)
+
+            # First run
+            latents = noise
+            for i in range(5):
+                vel = latents * 0.1
+                latents = sched.step(vel, sched.timesteps[i], latents)
+                mx.eval(latents)
+            result1 = np.array(latents)
+
+            # Reset and run again
+            sched.reset()
+            latents = noise
+            for i in range(5):
+                vel = latents * 0.1
+                latents = sched.step(vel, sched.timesteps[i], latents)
+                mx.eval(latents)
+            result2 = np.array(latents)
+
+            np.testing.assert_allclose(result1, result2, atol=1e-5,
+                err_msg=f"{cls.__name__} not reproducible after reset()")
+
+
+# ---------------------------------------------------------------------------
 # Wan2.2 VAE Component Tests
 # ---------------------------------------------------------------------------
 
