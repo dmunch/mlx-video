@@ -389,8 +389,22 @@ def generate_video(
     np.random.seed(seed)
     print(f"{Colors.DIM}  Seed: {seed}{Colors.RESET}")
 
-    # Compute target latent shape
+    # Align dimensions to patch_size * vae_stride (required for patchify)
     vae_stride = config.vae_stride
+    patch_size = config.patch_size
+    align_h = patch_size[1] * vae_stride[1]  # e.g. 2*16=32
+    align_w = patch_size[2] * vae_stride[2]
+    if height % align_h != 0 or width % align_w != 0:
+        old_h, old_w = height, width
+        height = (height // align_h) * align_h
+        width = (width // align_w) * align_w
+        if height == 0:
+            height = align_h
+        if width == 0:
+            width = align_w
+        print(f"{Colors.DIM}  Aligned {old_w}x{old_h} → {width}x{height} (must be divisible by {align_w}x{align_h}){Colors.RESET}")
+
+    # Compute target latent shape
     z_dim = config.vae_z_dim
     t_latent = (num_frames - 1) // vae_stride[0] + 1
     h_latent = height // vae_stride[1]
@@ -398,7 +412,6 @@ def generate_video(
     target_shape = (z_dim, t_latent, h_latent, w_latent)
 
     # Sequence length for transformer
-    patch_size = config.patch_size
     seq_len = math.ceil(
         (h_latent * w_latent) / (patch_size[1] * patch_size[2]) * t_latent
     )
