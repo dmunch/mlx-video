@@ -9,6 +9,20 @@ from pathlib import Path
 from huggingface_hub import snapshot_download
 from PIL import Image
 
+
+class Colors:
+    """ANSI color codes for terminal output."""
+
+    CYAN = "\033[96m"
+    BLUE = "\033[94m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    MAGENTA = "\033[95m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+
 def get_model_path(model_repo: str):
     """Get or download LTX-2 model path."""
     try:

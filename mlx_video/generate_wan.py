@@ -13,219 +13,20 @@ import mlx.nn as nn
 import numpy as np
 from tqdm import tqdm
 
+from mlx_video.models.wan.i2v_utils import build_i2v_mask, preprocess_image
+from mlx_video.models.wan.loading import (
+    _clean_text,
+    encode_text,
+    load_t5_encoder,
+    load_vae_decoder,
+    load_vae_encoder,
+    load_wan_model,
+)
+from mlx_video.postprocess import save_video
+from mlx_video.utils import Colors
 
-class Colors:
-    CYAN = "\033[96m"
-    BLUE = "\033[94m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    RED = "\033[91m"
-    MAGENTA = "\033[95m"
-    BOLD = "\033[1m"
-    DIM = "\033[2m"
-    RESET = "\033[0m"
-
-
-def load_wan_model(model_path: Path, config, quantization: dict | None = None):
-    """Load and initialize WanModel, with optional quantization support.
-
-    Args:
-        model_path: Path to model safetensors file
-        config: WanModelConfig
-        quantization: Optional dict with 'bits' and 'group_size' keys.
-                      If provided, creates QuantizedLinear stubs before loading.
-    """
-    from mlx_video.models.wan.model import WanModel
-
-    model = WanModel(config)
-
-    if quantization:
-        from mlx_video.convert_wan import _quantize_predicate
-
-        nn.quantize(
-            model,
-            group_size=quantization["group_size"],
-            bits=quantization["bits"],
-            class_predicate=lambda path, m: _quantize_predicate(path, m),
-        )
-
-    weights = mx.load(str(model_path))
-    model.load_weights(list(weights.items()), strict=False)
-    mx.eval(model.parameters())
-    return model
-
-
-def load_t5_encoder(model_path: Path, config):
-    """Load T5 text encoder.
-
-    Weights are upcast to float32 for maximum precision — the T5 encoder
-    only runs once per generation, so performance impact is negligible.
-    This matches the official which computes softmax in float32 explicitly.
-    """
-    from mlx_video.models.wan.text_encoder import T5Encoder
-
-    encoder = T5Encoder(
-        vocab_size=config.t5_vocab_size,
-        dim=config.t5_dim,
-        dim_attn=config.t5_dim_attn,
-        dim_ffn=config.t5_dim_ffn,
-        num_heads=config.t5_num_heads,
-        num_layers=config.t5_num_layers,
-        num_buckets=config.t5_num_buckets,
-        shared_pos=False,
-    )
-    weights = mx.load(str(model_path))
-    weights = {k: v.astype(mx.float32) for k, v in weights.items()}
-    encoder.load_weights(list(weights.items()))
-    mx.eval(encoder.parameters())
-    return encoder
-
-
-def load_vae_decoder(model_path: Path, config=None):
-    """Load VAE decoder (skips encoder weights with strict=False).
-
-    For Wan2.2 (vae_z_dim=48), uses Wan22VAEDecoder.
-    For Wan2.1 (vae_z_dim=16), uses WanVAE.
-    """
-    is_wan22 = config is not None and config.vae_z_dim == 48
-
-    if is_wan22:
-        from mlx_video.models.wan.vae22 import Wan22VAEDecoder
-        vae = Wan22VAEDecoder(z_dim=48)
-    else:
-        from mlx_video.models.wan.vae import WanVAE
-        vae = WanVAE(z_dim=16)
-
-    weights = mx.load(str(model_path))
-    # Upcast VAE weights to float32 for quality — official Wan2.2 runs VAE in float32
-    weights = {k: v.astype(mx.float32) for k, v in weights.items()}
-    vae.load_weights(list(weights.items()), strict=False)
-    mx.eval(vae.parameters())
-    return vae
-
-
-def load_vae_encoder(model_path: Path, config=None):
-    """Load VAE encoder for I2V image encoding.
-
-    Only supports Wan2.2 (vae_z_dim=48).
-    """
-    from mlx_video.models.wan.vae22 import Wan22VAEEncoder
-
-    encoder = Wan22VAEEncoder(z_dim=config.vae_z_dim)
-    weights = mx.load(str(model_path))
-    weights = {k: v.astype(mx.float32) for k, v in weights.items()}
-    encoder.load_weights(list(weights.items()), strict=False)
-    mx.eval(encoder.parameters())
-    return encoder
-
-
-def _clean_text(text: str) -> str:
-    """Clean text matching official Wan2.2 tokenizer preprocessing.
-
-    Applies ftfy.fix_text (fixes mojibake, normalizes fullwidth chars),
-    double HTML unescape, and whitespace normalization. Critical for
-    correct tokenization of the Chinese negative prompt.
-    """
-    import html
-    import re
-
-    try:
-        import ftfy
-        text = ftfy.fix_text(text)
-    except ImportError:
-        pass
-    text = html.unescape(html.unescape(text))
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def encode_text(
-    encoder,
-    tokenizer,
-    prompt: str,
-    text_len: int = 512,
-) -> mx.array:
-    """Encode text prompt using T5 encoder.
-
-    Args:
-        encoder: T5Encoder model
-        tokenizer: HuggingFace tokenizer
-        prompt: Text prompt
-        text_len: Maximum text length
-
-    Returns:
-        Text embeddings [L, dim]
-    """
-    prompt = _clean_text(prompt)
-    tokens = tokenizer(
-        prompt,
-        max_length=text_len,
-        padding="max_length",
-        truncation=True,
-        return_tensors="np",
-    )
-    ids = mx.array(tokens["input_ids"])
-    mask = mx.array(tokens["attention_mask"])
-
-    embeddings = encoder(ids, mask=mask)
-
-    # Return only non-padding tokens
-    seq_len = int(mask.sum().item())
-    return embeddings[0, :seq_len]
-
-
-def preprocess_image(image_path: str, width: int, height: int) -> mx.array:
-    """Load, resize, center-crop, and normalize an image for I2V.
-
-    Args:
-        image_path: Path to input image
-        width: Target width
-        height: Target height
-
-    Returns:
-        Image tensor [1, 1, H, W, 3] in [-1, 1] (channels-last, batch + temporal dims)
-    """
-    from PIL import Image
-
-    img = Image.open(image_path).convert("RGB")
-
-    # Resize so that the image covers the target size (LANCZOS)
-    scale = max(width / img.width, height / img.height)
-    img = img.resize((round(img.width * scale), round(img.height * scale)), Image.LANCZOS)
-
-    # Center crop
-    x1 = (img.width - width) // 2
-    y1 = (img.height - height) // 2
-    img = img.crop((x1, y1, x1 + width, y1 + height))
-
-    # To tensor: [H, W, 3] float32 in [-1, 1]
-    arr = np.array(img, dtype=np.float32) / 255.0
-    arr = arr * 2.0 - 1.0  # [0,1] → [-1,1]
-    return mx.array(arr[None, None])  # [1, 1, H, W, 3]
-
-
-def _build_i2v_mask(z_shape, patch_size):
-    """Build temporal mask for I2V: first frame = 0, rest = 1.
-
-    Args:
-        z_shape: Latent shape (C, T, H, W) in channels-first
-        patch_size: (pt, ph, pw) patch size
-
-    Returns:
-        mask: (C, T, H, W) float32 — 0 for first frame, 1 for rest
-        mask_tokens: (1, L) float32 — 0 for first-frame tokens, 1 for rest
-    """
-    C, T, H, W = z_shape
-    mask = mx.ones(z_shape)
-    # Zero out the first temporal position
-    mask = mx.concatenate([mx.zeros((C, 1, H, W)), mask[:, 1:]], axis=1)
-
-    # Token-level mask for per-token timesteps: subsample to patch grid
-    # mask shape [C, T, H, W] → take first channel, subsample by patch_size
-    pt, ph, pw = patch_size
-    mask_tokens = mask[0, ::pt, ::ph, ::pw]  # [T', H', W']
-    mask_tokens = mask_tokens.reshape(1, -1)  # [1, L]
-    return mask, mask_tokens
+# Backward-compat alias (tests and external code may use the old name)
+_build_i2v_mask = build_i2v_mask
 
 
 def generate_video(
@@ -459,7 +260,7 @@ def generate_video(
         z_img = z_img[0].transpose(3, 0, 1, 2)
 
         # Build I2V mask
-        i2v_mask, i2v_mask_tokens = _build_i2v_mask(target_shape, config.patch_size)
+        i2v_mask, i2v_mask_tokens = build_i2v_mask(target_shape, config.patch_size)
 
         del vae_enc, img_tensor
         gc.collect(); mx.clear_cache()
@@ -623,39 +424,6 @@ def generate_video(
     save_video(video, output_path, fps=config.sample_fps)
     print(f"\n{Colors.GREEN}✓ Video saved to {output_path}{Colors.RESET}")
     print(f"{Colors.DIM}  Total time: {time.time() - t1:.1f}s{Colors.RESET}")
-
-
-def save_video(frames: np.ndarray, output_path: str, fps: int = 16):
-    """Save video frames to MP4.
-
-    Args:
-        frames: Video frames [T, H, W, 3] uint8
-        output_path: Output file path
-        fps: Frames per second
-    """
-    try:
-        import imageio
-        writer = imageio.get_writer(output_path, fps=fps, codec="libx264", quality=8)
-        for frame in frames:
-            writer.append_data(frame)
-        writer.close()
-    except ImportError:
-        try:
-            import cv2
-            h, w = frames.shape[1], frames.shape[2]
-            fourcc = cv2.VideoWriter_fourcc(*"avc1")
-            writer = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
-            for frame in frames:
-                writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-            writer.release()
-        except (ImportError, Exception):
-            # Last resort: save as individual PNGs
-            from PIL import Image
-            out_dir = Path(output_path).parent / Path(output_path).stem
-            out_dir.mkdir(parents=True, exist_ok=True)
-            for i, frame in enumerate(frames):
-                Image.fromarray(frame).save(out_dir / f"frame_{i:04d}.png")
-            print(f"  (no video encoder available, saved {len(frames)} frames to {out_dir}/)")
 
 
 def main():
