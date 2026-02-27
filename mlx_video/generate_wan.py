@@ -223,6 +223,16 @@ def generate_video(
                     break
             del probe
 
+    # Auto-correct Wan2.2 VAE params from stale configs
+    if config.in_dim == 48 and config.vae_z_dim != 48:
+        print(f"{Colors.YELLOW}  Auto-correcting Wan2.2 VAE params (in_dim=48 but vae_z_dim={config.vae_z_dim}){Colors.RESET}")
+        config = WanModelConfig(**{
+            **{f.name: getattr(config, f.name) for f in config.__dataclass_fields__.values()},
+            "vae_z_dim": 48,
+            "vae_stride": (4, 16, 16),
+            "sample_fps": 24,
+        })
+
     # Apply defaults from config if not overridden
     if steps is None:
         steps = config.sample_steps
