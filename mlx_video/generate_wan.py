@@ -56,7 +56,12 @@ def load_wan_model(model_path: Path, config, quantization: dict | None = None):
 
 
 def load_t5_encoder(model_path: Path, config):
-    """Load T5 text encoder."""
+    """Load T5 text encoder.
+
+    Weights are upcast to float32 for maximum precision — the T5 encoder
+    only runs once per generation, so performance impact is negligible.
+    This matches the official which computes softmax in float32 explicitly.
+    """
     from mlx_video.models.wan.text_encoder import T5Encoder
 
     encoder = T5Encoder(
@@ -70,6 +75,7 @@ def load_t5_encoder(model_path: Path, config):
         shared_pos=False,
     )
     weights = mx.load(str(model_path))
+    weights = {k: v.astype(mx.float32) for k, v in weights.items()}
     encoder.load_weights(list(weights.items()))
     mx.eval(encoder.parameters())
     return encoder
