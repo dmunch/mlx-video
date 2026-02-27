@@ -86,4 +86,6 @@ class WanFFN(nn.Module):
         self.fc2 = nn.Linear(ffn_dim, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.fc2(self.act(self.fc1(x)))
+        # Cast to weight dtype for efficient matmul (bfloat16 matching official autocast)
+        x_w = x.astype(self.fc1.weight.dtype)
+        return self.fc2(self.act(self.fc1(x_w)))
