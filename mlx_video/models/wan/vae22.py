@@ -377,8 +377,10 @@ class Resample(nn.Module):
             mx.eval(x)
             T = x.shape[1]
 
-        if self.mode == "downsample3d":
+        if self.mode == "downsample3d" and T > 1:
             # Temporal downsample via strided CausalConv3d
+            # Skip for T=1 (single frame) — matches official chunked encoding
+            # where first chunk stores cache but doesn't apply time_conv
             x = self.time_conv(x)
             mx.eval(x)
             T = x.shape[1]
@@ -558,7 +560,7 @@ class Encoder3d(nn.Module):
         z_dim=96,
         dim_mult=(1, 2, 4, 4),
         num_res_blocks=2,
-        temperal_downsample=(True, True, False),
+        temperal_downsample=(False, True, True),
     ):
         super().__init__()
         # Channel dimensions: [160, 160, 320, 640, 640]
@@ -640,7 +642,7 @@ class Wan22VAEEncoder(nn.Module):
             z_dim=z_dim * 2,  # Encoder outputs z_dim*2, split into mu + log_var
             dim_mult=(1, 2, 4, 4),
             num_res_blocks=2,
-            temperal_downsample=(True, True, False),
+            temperal_downsample=(False, True, True),
         )
 
     def __call__(self, img):
