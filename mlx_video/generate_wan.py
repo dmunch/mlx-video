@@ -351,6 +351,19 @@ def generate_video(
         cross_kv = single_model.prepare_cross_kv(context_cfg)
         mx.eval(cross_kv)
 
+    # Precompute RoPE frequencies (grid sizes are constant across all steps)
+    f_grid = t_latent // patch_size[0]
+    h_grid = h_latent // patch_size[1]
+    w_grid = w_latent // patch_size[2]
+    cfg_grid_sizes = [(f_grid, h_grid, w_grid), (f_grid, h_grid, w_grid)]
+    if is_dual:
+        rope_cos_sin_low = low_noise_model.prepare_rope(cfg_grid_sizes)
+        rope_cos_sin_high = high_noise_model.prepare_rope(cfg_grid_sizes)
+        mx.eval(rope_cos_sin_low, rope_cos_sin_high)
+    else:
+        rope_cos_sin = ref_model.prepare_rope(cfg_grid_sizes)
+        mx.eval(rope_cos_sin)
+
     # Setup scheduler
     _schedulers = {
         "euler": FlowMatchEulerScheduler,
@@ -398,23 +411,29 @@ def generate_video(
                 _configure_teacache(single_model, steps)
             print(f"{Colors.DIM}  TeaCache: threshold={teacache_thresh}{Colors.RESET}")
 
-    for i, t in enumerate(tqdm(range(steps), desc="Diffusion")):
-        timestep_val = sched.timesteps[i].item()
+    # Pre-convert timesteps to Python list to avoid .item() sync each step
+    timestep_list = sched.timesteps.tolist()
 
-        # Select model, guide scale, and cached K/V
+    for i, t in enumerate(tqdm(range(steps), desc="Diffusion")):
+        timestep_val = timestep_list[i]
+
+        # Select model, guide scale, cached K/V, and precomputed RoPE
         if is_dual:
             if timestep_val >= boundary:
                 model = high_noise_model
                 gs = guide_scale[1]
                 kv = cross_kv_high
+                rcs = rope_cos_sin_high
             else:
                 model = low_noise_model
                 gs = guide_scale[0]
                 kv = cross_kv_low
+                rcs = rope_cos_sin_low
         else:
             model = single_model
             gs = guide_scale if isinstance(guide_scale, (int, float)) else guide_scale[0]
             kv = cross_kv
+            rcs = rope_cos_sin
 
         # Build per-token timesteps for TI2V-5B (first-frame patches get t=0)
         if is_i2v_mask_blend:
@@ -441,6 +460,7 @@ def generate_video(
             seq_len=seq_len,
             cross_kv_caches=kv,
             y=y_arg,
+            rope_cos_sin=rcs,
         )
         noise_pred_cond, noise_pred_uncond = preds[0], preds[1]
 

@@ -7,7 +7,7 @@ import numpy as np
 
 from .attention import WanLayerNorm
 from .config import WanModelConfig
-from .rope import rope_params
+from .rope import rope_params, rope_precompute_cos_sin
 from .transformer import WanAttentionBlock
 
 
@@ -80,7 +80,7 @@ class Head(nn.Module):
         proj_dim = math.prod(patch_size) * out_dim
         self.norm = WanLayerNorm(dim, eps)
         self.head = nn.Linear(dim, proj_dim)
-        self.modulation = mx.random.normal((1, 2, dim)) * (dim**-0.5)
+        self.modulation = (mx.random.normal((1, 2, dim)) * (dim**-0.5)).astype(mx.float32)
 
     def __call__(self, x: mx.array, e: mx.array) -> mx.array:
         """
@@ -91,8 +91,8 @@ class Head(nn.Module):
         if e.ndim == 2:
             e = e[:, None, :]  # [B, 1, dim]
         e_f32 = e.astype(mx.float32)
-        # modulation [1, 2, dim] broadcasts with e [B, 1/L, dim] via unsqueeze
-        mod = self.modulation.astype(mx.float32)[:, None, :, :] + e_f32[:, :, None, :]  # [B, L_e, 2, dim]
+        # modulation already float32; broadcasts with e [B, 1/L, dim] via unsqueeze
+        mod = self.modulation[:, None, :, :] + e_f32[:, :, None, :]  # [B, L_e, 2, dim]
         e0 = mod[:, :, 0, :]  # [B, L_e, dim] shift
         e1 = mod[:, :, 1, :]  # [B, L_e, dim] scale
         x_norm = self.norm(x).astype(mx.float32)
@@ -162,6 +162,12 @@ class WanModel(nn.Module):
         freqs_w = rope_params(1024, d_w)
         # Concatenate along the frequency dimension: [1024, d//2, 2]
         self.freqs = mx.concatenate([freqs_t, freqs_h, freqs_w], axis=1)
+
+        # Precompute sinusoidal inv_freq for time embedding
+        half = config.freq_dim // 2
+        self._inv_freq = mx.power(
+            10000.0, -mx.arange(half).astype(mx.float32) / half
+        )
 
         # TeaCache state (disabled by default)
         self.teacache = TeaCacheState()
@@ -260,6 +266,21 @@ class WanModel(nn.Module):
             kv_caches.append(block.cross_attn.prepare_kv(context))
         return kv_caches
 
+    def prepare_rope(self, grid_sizes: list) -> tuple:
+        """Pre-compute RoPE cos/sin for constant grid sizes.
+
+        Call once before the diffusion loop when grid sizes don't change
+        across steps. Eliminates per-step broadcast/concat overhead.
+
+        Args:
+            grid_sizes: List of (F, H, W) tuples per batch element
+
+        Returns:
+            (cos_f, sin_f) precomputed frequency tensors
+        """
+        w_dtype = self.patch_embedding_proj.weight.dtype
+        return rope_precompute_cos_sin(grid_sizes, self.freqs, dtype=w_dtype)
+
     def __call__(
         self,
         x_list: list,
@@ -268,6 +289,7 @@ class WanModel(nn.Module):
         seq_len: int,
         cross_kv_caches: list | None = None,
         y: list | None = None,
+        rope_cos_sin: tuple | None = None,
     ) -> list:
         """Forward pass.
 
@@ -281,6 +303,7 @@ class WanModel(nn.Module):
                              prepare_cross_kv(), one per block.
             y: Optional list of conditioning tensors for I2V [C_y, F, H, W].
                Channel-concatenated with x before patchify.
+            rope_cos_sin: Optional precomputed (cos, sin) from prepare_rope().
 
         Returns:
             List of denoised tensors [C, F, H, W]
@@ -314,13 +337,16 @@ class WanModel(nn.Module):
             axis=0,
         )  # [B, seq_len, dim]
 
-        # Time embedding
+        # Time embedding (use cached inv_freq to avoid recomputing each step)
         if t.ndim == 0:
             t = t[None]
 
+        pos = t.astype(mx.float32)
+        sinusoid = pos[..., None] * self._inv_freq
+        sin_emb = mx.concatenate([mx.cos(sinusoid), mx.sin(sinusoid)], axis=-1)
+
         if t.ndim == 1:
             # Standard T2V: scalar timestep per batch element [B]
-            sin_emb = sinusoidal_embedding_1d(self.freq_dim, t)  # [B, freq_dim]
             e = self.time_embedding_1(
                 self.time_embedding_act(self.time_embedding_0(sin_emb))
             )  # [B, dim]
@@ -330,7 +356,6 @@ class WanModel(nn.Module):
             e = e.astype(mx.float32)
         else:
             # I2V: per-token timesteps [B, L]
-            sin_emb = sinusoidal_embedding_1d(self.freq_dim, t)  # [B, L, freq_dim]
             e = self.time_embedding_1(
                 self.time_embedding_act(self.time_embedding_0(sin_emb))
             )  # [B, L, dim]
@@ -350,6 +375,14 @@ class WanModel(nn.Module):
         else:
             context_batch = self.embed_text(context)
 
+        # Pre-compute attention mask from seq_lens (constant across all blocks)
+        attn_mask = None
+        w_dtype = self.patch_embedding_proj.weight.dtype
+        if any(sl < seq_len for sl in seq_lens_list):
+            attn_mask = mx.zeros((batch_size, 1, 1, seq_len), dtype=w_dtype)
+            for i, sl in enumerate(seq_lens_list):
+                attn_mask[i, :, :, sl:] = -1e9
+
         kwargs = dict(
             e=e0,
             seq_lens=seq_lens_list,
@@ -357,6 +390,8 @@ class WanModel(nn.Module):
             freqs=self.freqs,
             context=context_batch,
             context_lens=None,
+            rope_cos_sin=rope_cos_sin,
+            attn_mask=attn_mask,
         )
 
         # Run transformer blocks (with optional TeaCache skip)
@@ -372,14 +407,14 @@ class WanModel(nn.Module):
                 rel_l1 = (
                     mx.abs(e0 - tc.previous_e0).mean()
                     / mx.abs(tc.previous_e0).mean()
-                ).item()
+                )
 
-                # Polynomial rescaling (Horner's method, np.poly1d convention)
+                # Polynomial rescaling in MLX (Horner's method)
                 rescaled = tc.coefficients[0]
                 for c in tc.coefficients[1:]:
                     rescaled = rescaled * rel_l1 + c
 
-                tc.accumulated_distance += rescaled
+                tc.accumulated_distance += rescaled.item()
 
                 if tc.accumulated_distance < tc.threshold:
                     should_skip = True
