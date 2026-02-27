@@ -50,7 +50,7 @@ class Head(nn.Module):
             e = e[:, None, :]  # [B, 1, dim]
         e_f32 = e.astype(mx.float32)
         # modulation [1, 2, dim] broadcasts with e [B, 1/L, dim] via unsqueeze
-        mod = self.modulation[:, None, :, :] + e_f32[:, :, None, :]  # [B, L_e, 2, dim]
+        mod = self.modulation.astype(mx.float32)[:, None, :, :] + e_f32[:, :, None, :]  # [B, L_e, 2, dim]
         e0 = mod[:, :, 0, :]  # [B, L_e, dim] shift
         e1 = mod[:, :, 1, :]  # [B, L_e, dim] scale
         x_norm = self.norm(x).astype(mx.float32)
@@ -269,23 +269,23 @@ class WanModel(nn.Module):
         if t.ndim == 1:
             # Standard T2V: scalar timestep per batch element [B]
             sin_emb = sinusoidal_embedding_1d(self.freq_dim, t)  # [B, freq_dim]
-            model_dtype = self.patch_embedding_proj.weight.dtype
             e = self.time_embedding_1(
                 self.time_embedding_act(self.time_embedding_0(sin_emb))
             )  # [B, dim]
             e0 = self.time_projection(self.time_projection_act(e))  # [B, dim*6]
-            e0 = e0.reshape(batch_size, 1, 6, self.dim).astype(model_dtype)
-            e = e.astype(model_dtype)
+            # Keep e and e0 in float32 — official asserts float32 for modulation
+            e0 = e0.reshape(batch_size, 1, 6, self.dim).astype(mx.float32)
+            e = e.astype(mx.float32)
         else:
             # I2V: per-token timesteps [B, L]
             sin_emb = sinusoidal_embedding_1d(self.freq_dim, t)  # [B, L, freq_dim]
-            model_dtype = self.patch_embedding_proj.weight.dtype
             e = self.time_embedding_1(
                 self.time_embedding_act(self.time_embedding_0(sin_emb))
             )  # [B, L, dim]
             e0 = self.time_projection(self.time_projection_act(e))  # [B, L, dim*6]
-            e0 = e0.reshape(batch_size, -1, 6, self.dim).astype(model_dtype)
-            e = e.astype(model_dtype)
+            # Keep e and e0 in float32 — official asserts float32 for modulation
+            e0 = e0.reshape(batch_size, -1, 6, self.dim).astype(mx.float32)
+            e = e.astype(mx.float32)
 
         # Text embedding: skip MLP if context is already embedded (mx.array)
         if isinstance(context, mx.array):
