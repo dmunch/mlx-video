@@ -154,22 +154,22 @@ class ResidualBlockLayers(nn.Module):
         super().__init__()
         # Indices match PyTorch nn.Sequential indices for weight key compat
         # Index 0: RMS_norm
-        self._layer_0 = RMS_norm(in_dim)
+        self.layer_0 = RMS_norm(in_dim)
         # Index 2: CausalConv3d
-        self._layer_2 = CausalConv3d(in_dim, out_dim, 3, padding=1)
+        self.layer_2 = CausalConv3d(in_dim, out_dim, 3, padding=1)
         # Index 3: RMS_norm
-        self._layer_3 = RMS_norm(out_dim)
+        self.layer_3 = RMS_norm(out_dim)
         # Index 6: CausalConv3d
-        self._layer_6 = CausalConv3d(out_dim, out_dim, 3, padding=1)
+        self.layer_6 = CausalConv3d(out_dim, out_dim, 3, padding=1)
 
     def __call__(self, x):
-        x = self._layer_0(x)
+        x = self.layer_0(x)
         x = nn.silu(x)
-        x = self._layer_2(x)
+        x = self.layer_2(x)
         mx.eval(x)  # Eval between convolutions to limit graph size
-        x = self._layer_3(x)
+        x = self.layer_3(x)
         x = nn.silu(x)
-        x = self._layer_6(x)
+        x = self.layer_6(x)
         return x
 
 
@@ -428,14 +428,14 @@ class Head22(nn.Module):
     def __init__(self, dim, out_channels=12):
         super().__init__()
         # Index 0: RMS_norm
-        self._layer_0 = RMS_norm(dim)
+        self.layer_0 = RMS_norm(dim)
         # Index 2: CausalConv3d
-        self._layer_2 = CausalConv3d(dim, out_channels, 3, padding=1)
+        self.layer_2 = CausalConv3d(dim, out_channels, 3, padding=1)
 
     def __call__(self, x):
-        x = self._layer_0(x)
+        x = self.layer_0(x)
         x = nn.silu(x)
-        x = self._layer_2(x)
+        x = self.layer_2(x)
         return x
 
 
@@ -526,16 +526,16 @@ def sanitize_wan22_vae_weights(weights: dict) -> dict:
         # ResidualBlockLayers: indices 0, 2, 3, 6 → _layer_0, _layer_2, _layer_3, _layer_6
         # Head22: indices 0, 2 → _layer_0, _layer_2
         for idx in ["0", "2", "3", "6"]:
-            # Match patterns like "residual.0.gamma" → "residual._layer_0.gamma"
-            # or "head.0.gamma" → "head._layer_0.gamma"
+            # Match patterns like "residual.0.gamma" → "residual.layer_0.gamma"
+            # or "head.0.gamma" → "head.layer_0.gamma"
             old_pattern = f".residual.{idx}."
-            new_pattern = f".residual._layer_{idx}."
+            new_pattern = f".residual.layer_{idx}."
             new_key = new_key.replace(old_pattern, new_pattern)
 
-        # Head layer mapping: head.0.gamma → head._layer_0.gamma, head.2.weight → head._layer_2.weight
+        # Head layer mapping: head.0.gamma → head.layer_0.gamma, head.2.weight → head.layer_2.weight
         for idx in ["0", "2"]:
             old_pattern = f".head.{idx}."
-            new_pattern = f".head._layer_{idx}."
+            new_pattern = f".head.layer_{idx}."
             new_key = new_key.replace(old_pattern, new_pattern)
 
         # Map Resample Conv2d: resample.1.weight → resample_weight, resample.1.bias → resample_bias
