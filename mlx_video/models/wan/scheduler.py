@@ -84,8 +84,16 @@ class FlowDPMPP2MScheduler:
 
     @staticmethod
     def _lambda(sigma: float) -> float:
-        """log-SNR: lambda(sigma) = log((1-sigma)/sigma)."""
-        return math.log((1.0 - sigma) / sigma) if 0 < sigma < 1 else 0.0
+        """log-SNR: lambda(sigma) = log((1-sigma)/sigma).
+
+        Returns -inf at sigma=1.0 (pure noise) and +inf at sigma=0.0 (clean),
+        matching torch.log behavior in the official code.
+        """
+        if sigma >= 1.0:
+            return -math.inf
+        if sigma <= 0.0:
+            return math.inf
+        return math.log((1.0 - sigma) / sigma)
 
     def step(
         self,
@@ -202,7 +210,16 @@ class FlowUniPCScheduler:
 
     @staticmethod
     def _lambda(sigma: float) -> float:
-        return math.log((1.0 - sigma) / sigma) if 0 < sigma < 1 else 0.0
+        """log-SNR: lambda(sigma) = log((1-sigma)/sigma).
+
+        Returns -inf at sigma=1.0 (pure noise) and +inf at sigma=0.0 (clean),
+        matching torch.log behavior in the official code.
+        """
+        if sigma >= 1.0:
+            return -math.inf
+        if sigma <= 0.0:
+            return math.inf
+        return math.log((1.0 - sigma) / sigma)
 
     def _convert_output(self, velocity: mx.array, sample: mx.array) -> mx.array:
         """Convert velocity prediction to x0: x0 = sample - sigma * v."""
