@@ -260,6 +260,8 @@ python -m mlx_video.generate_wan \
 
 Set `--teacache-thresh 0` (the default) to disable. Higher thresholds = more speedup but lower quality.
 
+> **Note**: TeaCache requires model-specific polynomial coefficients. Pre-profiled coefficients are included for T2V-14B and T2V-1.3B. For unsupported models (e.g. TI2V-5B), TeaCache is automatically disabled with a warning. See [docs/teacache.md](docs/teacache.md) for details on how TeaCache works, recommended thresholds, and how to profile coefficients for new models locally.
+
 ### Wan Model Specifications
 
 **Transformer (14B)**
