@@ -20,7 +20,7 @@ Supported models:
 
 - [**LTX-2**](https://huggingface.co/Lightricks/LTX-Video) — 19B parameter video generation model from Lightricks
 - [**Wan2.1**](https://github.com/Wan-Video/Wan2.1) — 1.3B / 14B parameter T2V models (single-model pipeline)
-- [**Wan2.2**](https://github.com/Wan-Video/Wan2.2) — 14B parameter T2V model (dual-model pipeline)
+- [**Wan2.2**](https://github.com/Wan-Video/Wan2.2) — T2V-14B, TI2V-5B, and I2V-14B models (dual-model pipeline)
 
 ## Features
 
@@ -82,13 +82,15 @@ python -m mlx_video.generate \
 
 Both [Wan2.1](https://github.com/Wan-Video/Wan2.1) and [Wan2.2](https://github.com/Wan-Video/Wan2.2) are text-to-video diffusion models built on a DiT (Diffusion Transformer) backbone with a T5 text encoder and 3D VAE. They share the same model architecture — the difference is in the inference pipeline:
 
-| | Wan2.1 | Wan2.2 |
-|---|--------|--------|
-| **Pipeline** | Single model | Dual model (high-noise + low-noise) |
-| **Sizes** | 1.3B, 14B | 14B |
-| **Steps** | 50 | 40 |
-| **Guidance** | 5.0 (fixed) | 3.0 / 4.0 (low/high noise) |
-| **Shift** | 5.0 | 12.0 |
+| | Wan2.1 | Wan2.2 T2V-14B | Wan2.2 I2V-14B |
+|---|--------|--------|--------|
+| **Task** | Text-to-Video | Text-to-Video | Image-to-Video |
+| **Pipeline** | Single model | Dual model | Dual model |
+| **Sizes** | 1.3B, 14B | 14B | 14B |
+| **Steps** | 50 | 40 | 40 |
+| **Guidance** | 5.0 (fixed) | 3.0 / 4.0 | 3.5 / 3.5 |
+| **Shift** | 5.0 | 12.0 | 5.0 |
+| **VAE** | Wan2.1 (z=16) | Wan2.1 (z=16) | Wan2.1 (z=16) + encoder |
 
 ### Step 1: Download Weights
 
@@ -117,9 +119,11 @@ Download the original PyTorch checkpoints:
 #   └── high_noise_model/  # safetensors
 ```
 
+**Wan2.2 I2V-14B** — same directory structure as Wan2.2 T2V. The conversion script auto-detects I2V-14B from the model's `config.json` (`model_type: "i2v"`, `in_dim: 36`).
+
 ### Step 2: Convert to MLX Format
 
-The conversion script auto-detects whether the checkpoint is Wan2.1 or Wan2.2 based on the directory structure (presence of `low_noise_model/` subdirectory).
+The conversion script auto-detects the model version based on the directory structure (presence of `low_noise_model/` subdirectory) and model type (`model_type` in source config.json for I2V vs T2V).
 
 ```bash
 # Auto-detect version
@@ -157,6 +161,7 @@ wan_mlx/
 ├── config.json                    # Model configuration
 ├── t5_encoder.safetensors         # T5 UMT5-XXL text encoder
 ├── vae.safetensors                # 3D VAE decoder
+├── vae_encoder.safetensors        # 3D VAE encoder (I2V-14B only)
 ├── model.safetensors              # (Wan2.1) Single transformer
 ├── low_noise_model.safetensors    # (Wan2.2) Low-noise transformer
 └── high_noise_model.safetensors   # (Wan2.2) High-noise transformer
@@ -195,12 +200,27 @@ python -m mlx_video.generate_wan \
 
 The pipeline auto-detects the model version from `config.json` and selects the right pipeline mode (single or dual model). You can also override any parameter via CLI flags.
 
+#### Image-to-Video (I2V-14B)
+
+```bash
+# Generate video from an input image
+python -m mlx_video.generate_wan \
+    --model-dir wan22_i2v_mlx \
+    --prompt "The camera slowly zooms in as the subject begins to move" \
+    --image start.png \
+    --num-frames 81 \
+    --output-path my_video.mp4
+```
+
+The I2V-14B model encodes the input image through the Wan2.1 VAE encoder and uses channel concatenation (`y` tensor with 4 mask + 16 image latent channels) to condition generation on the first frame.
+
 #### Generation CLI Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--model-dir` | (required) | Path to converted MLX model directory |
 | `--prompt` | (required) | Text description of the video |
+| `--image` | `None` | Input image path (for I2V models) |
 | `--negative-prompt` | `""` | Negative prompt for guidance |
 | `--width` | 1280 | Video width |
 | `--height` | 720 | Video height |
@@ -260,7 +280,7 @@ python -m mlx_video.generate_wan \
 
 Set `--teacache-thresh 0` (the default) to disable. Higher thresholds = more speedup but lower quality.
 
-> **Note**: TeaCache requires model-specific polynomial coefficients. Pre-profiled coefficients are included for T2V-14B and T2V-1.3B. For unsupported models (e.g. TI2V-5B), TeaCache is automatically disabled with a warning. See [docs/teacache.md](docs/teacache.md) for details on how TeaCache works, recommended thresholds, and how to profile coefficients for new models locally.
+> **Note**: TeaCache requires model-specific polynomial coefficients. Pre-profiled coefficients are included for T2V-14B and T2V-1.3B. For unsupported models (e.g. TI2V-5B, I2V-14B), TeaCache is automatically disabled with a warning. See [docs/teacache.md](docs/teacache.md) for details on how TeaCache works, recommended thresholds, and how to profile coefficients for new models locally.
 
 ### Wan Model Specifications
 

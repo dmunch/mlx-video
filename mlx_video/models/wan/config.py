@@ -111,6 +111,21 @@ class WanModelConfig(BaseModelConfig):
         return cls()
 
     @classmethod
+    def wan22_i2v_14b(cls) -> "WanModelConfig":
+        """Wan2.2 I2V 14B: dual model, image-to-video, 40 layers, dim=5120."""
+        return cls(
+            model_type="i2v",
+            in_dim=36,
+            out_dim=16,
+            dual_model=True,
+            boundary=0.900,
+            sample_shift=5.0,
+            sample_guide_scale=(3.5, 3.5),
+            # No profiled TeaCache coefficients for I2V yet
+            teacache_coefficients=None,
+        )
+
+    @classmethod
     def wan22_ti2v_5b(cls) -> "WanModelConfig":
         """Wan2.2 TI2V 5B: text+image to video, 30 layers, dim=3072."""
         return cls(

@@ -267,6 +267,7 @@ class WanModel(nn.Module):
         context: list | mx.array,
         seq_len: int,
         cross_kv_caches: list | None = None,
+        y: list | None = None,
     ) -> list:
         """Forward pass.
 
@@ -278,10 +279,16 @@ class WanModel(nn.Module):
             seq_len: Maximum sequence length for padding
             cross_kv_caches: Optional list of (k, v) tuples from
                              prepare_cross_kv(), one per block.
+            y: Optional list of conditioning tensors for I2V [C_y, F, H, W].
+               Channel-concatenated with x before patchify.
 
         Returns:
             List of denoised tensors [C, F, H, W]
         """
+        # I2V: channel-concatenate conditioning y with noise x
+        if y is not None:
+            x_list = [mx.concatenate([u, v], axis=0) for u, v in zip(x_list, y)]
+
         # Patchify each video
         patches = []
         grid_sizes = []

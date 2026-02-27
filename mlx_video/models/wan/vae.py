@@ -43,7 +43,9 @@ class CausalConv3d(nn.Module):
 
         self.kernel_size = kernel_size
         self.stride = stride
-        self._causal_pad_t = 2 * padding[0]
+        # Causal padding: match reference formula dilation*(k-1) + (1-stride)
+        # With dilation=1: k-stride (pads left only, no future context)
+        self._causal_pad_t = kernel_size[0] - stride[0]
         self._pad_h = padding[1]
         self._pad_w = padding[2]
 
@@ -180,21 +182,29 @@ class AttentionBlock(nn.Module):
 
 
 class Resample(nn.Module):
-    """Upsample block matching original Wan VAE structure.
+    """Resample block matching original Wan VAE structure.
 
-    Uses `resample` list with [None, Conv2d] to match original
-    nn.Sequential(Upsample, Conv2d) where index 1 has the conv params.
+    Supports both upsampling (decoder) and downsampling (encoder).
+    Uses list-based param storage to match original nn.Sequential key hierarchy.
     """
 
     def __init__(self, dim: int, mode: str):
         super().__init__()
-        assert mode in ("upsample2d", "upsample3d")
+        assert mode in ("upsample2d", "upsample3d", "downsample2d", "downsample3d")
         self.mode = mode
         self.dim = dim
-        # resample.0 = Upsample (no params), resample.1 = Conv2d
-        self.resample = [None, nn.Conv2d(dim, dim // 2, 3, padding=1)]
-        if mode == "upsample3d":
-            self.time_conv = CausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
+
+        if mode.startswith("upsample"):
+            # resample.0 = Upsample (no params), resample.1 = Conv2d
+            self.resample = [None, nn.Conv2d(dim, dim // 2, 3, padding=1)]
+            if mode == "upsample3d":
+                self.time_conv = CausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
+        else:
+            # resample.0 = ZeroPad2d (no params), resample.1 = Conv2d(stride=2)
+            self.resample = [None, nn.Conv2d(dim, dim, 3, stride=2)]
+            if mode == "downsample3d":
+                self.time_conv = CausalConv3d(
+                    dim, dim, (3, 1, 1), stride=(2, 1, 1), padding=(0, 0, 0))
 
     def __call__(self, x: mx.array) -> mx.array:
         """x: [B, C, T, H, W]"""
@@ -204,17 +214,29 @@ class Resample(nn.Module):
             # Temporal upsample via learned conv
             x_t = self.time_conv(x)  # [B, 2C, T, H, W]
             x_t = x_t.reshape(b, 2, c, t, h, w)
-            # Interleave along time: [B, C, 2T, H, W]
             x = mx.stack([x_t[:, 0], x_t[:, 1]], axis=3).reshape(b, c, t * 2, h, w)
             t = t * 2
 
-        # Per-frame spatial upsample: nearest 2x + Conv2d
-        x = x.transpose(0, 2, 3, 4, 1).reshape(b * t, h, w, c)  # [BT, H, W, C]
-        x = mx.repeat(x, 2, axis=1)
-        x = mx.repeat(x, 2, axis=2)
-        x = self.resample[1](x)  # Conv2d [BT, 2H, 2W, C//2]
-        c_out = x.shape[-1]
-        return x.reshape(b, t, h * 2, w * 2, c_out).transpose(0, 4, 1, 2, 3)
+        if self.mode.startswith("upsample"):
+            # Per-frame spatial upsample: nearest 2x + Conv2d
+            x = x.transpose(0, 2, 3, 4, 1).reshape(b * t, h, w, c)  # [BT, H, W, C]
+            x = mx.repeat(x, 2, axis=1)
+            x = mx.repeat(x, 2, axis=2)
+            x = self.resample[1](x)  # Conv2d [BT, 2H, 2W, C//2]
+            c_out = x.shape[-1]
+            return x.reshape(b, t, h * 2, w * 2, c_out).transpose(0, 4, 1, 2, 3)
+        else:
+            # Per-frame spatial downsample: ZeroPad(0,1,0,1) + Conv2d(stride=2)
+            x = x.transpose(0, 2, 3, 4, 1).reshape(b * t, h, w, c)  # [BT, H, W, C]
+            x = mx.pad(x, [(0, 0), (0, 1), (0, 1), (0, 0)])  # ZeroPad2d(0,1,0,1)
+            x = self.resample[1](x)  # Conv2d stride=2
+            c_out = x.shape[-1]
+            h_out, w_out = x.shape[1], x.shape[2]
+            x = x.reshape(b, t, h_out, w_out, c_out).transpose(0, 4, 1, 2, 3)
+
+            if self.mode == "downsample3d":
+                x = self.time_conv(x)
+            return x
 
 
 class Decoder3d(nn.Module):
@@ -284,10 +306,78 @@ class Decoder3d(nn.Module):
         return x
 
 
-class WanVAE(nn.Module):
-    """Wan2.1 VAE wrapper with per-channel normalization."""
+class Encoder3d(nn.Module):
+    """3D VAE Encoder matching Wan2.1 architecture.
 
-    def __init__(self, z_dim: int = 16):
+    Mirror of Decoder3d with downsampling instead of upsampling.
+    Uses flat lists to match original PyTorch nn.Sequential weight key hierarchy.
+    """
+
+    def __init__(
+        self,
+        dim: int = 96,
+        z_dim: int = 16,
+        dim_mult: list = None,
+        num_res_blocks: int = 2,
+        temporal_downsample: list = None,
+    ):
+        super().__init__()
+        if dim_mult is None:
+            dim_mult = [1, 2, 4, 4]
+        if temporal_downsample is None:
+            temporal_downsample = [True, True, False]
+
+        dims = [dim * u for u in [1] + dim_mult]
+
+        self.conv1 = CausalConv3d(3, dims[0], 3, padding=1)
+
+        # Flat downsample list matching original nn.Sequential indexing
+        downsamples = []
+        for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
+            for _ in range(num_res_blocks):
+                downsamples.append(ResidualBlock(in_dim, out_dim))
+                in_dim = out_dim
+            if i != len(dim_mult) - 1:
+                mode = "downsample3d" if temporal_downsample[i] else "downsample2d"
+                downsamples.append(Resample(out_dim, mode=mode))
+        self.downsamples = downsamples
+
+        # Middle: [ResBlock, AttentionBlock, ResBlock]
+        self.middle = [
+            ResidualBlock(dims[-1], dims[-1]),
+            AttentionBlock(dims[-1]),
+            ResidualBlock(dims[-1], dims[-1]),
+        ]
+
+        # Output head: [RMS_norm, SiLU (no params), CausalConv3d]
+        self.head = [
+            RMS_norm(dims[-1], images=False),
+            None,  # SiLU
+            CausalConv3d(dims[-1], z_dim, 3, padding=1),
+        ]
+
+    def __call__(self, x: mx.array) -> mx.array:
+        """x: [B, 3, T, H, W] -> [B, z_dim, T_lat, H_lat, W_lat]"""
+        x = self.conv1(x)
+
+        for layer in self.downsamples:
+            x = layer(x)
+
+        for layer in self.middle:
+            x = layer(x)
+
+        x = nn.silu(self.head[0](x))
+        x = self.head[2](x)
+        return x
+
+
+class WanVAE(nn.Module):
+    """Wan2.1 VAE wrapper with per-channel normalization.
+
+    Supports both encode (for I2V) and decode (for all models).
+    """
+
+    def __init__(self, z_dim: int = 16, encoder: bool = False):
         super().__init__()
         self.z_dim = z_dim
         self.mean = mx.array(VAE_MEAN)
@@ -296,6 +386,27 @@ class WanVAE(nn.Module):
 
         self.conv2 = CausalConv3d(z_dim, z_dim, 1)
         self.decoder = Decoder3d(dim=96, z_dim=z_dim)
+
+        if encoder:
+            self.encoder = Encoder3d(dim=96, z_dim=z_dim * 2)
+            self.conv1 = CausalConv3d(z_dim * 2, z_dim * 2, 1)
+
+    def encode(self, x: mx.array) -> mx.array:
+        """Encode video to normalized latent.
+
+        Args:
+            x: Video [B, 3, T, H, W] in [-1, 1]
+
+        Returns:
+            Normalized latent [B, z_dim, T_lat, H_lat, W_lat]
+        """
+        out = self.encoder(x)
+        mu, _ = mx.split(self.conv1(out), 2, axis=1)
+
+        # Normalize: (mu - mean) * inv_std
+        mean = self.mean.reshape(1, -1, 1, 1, 1)
+        inv_std = self.inv_std.reshape(1, -1, 1, 1, 1)
+        return (mu - mean) * inv_std
 
     def decode(self, z: mx.array) -> mx.array:
         """Decode latent to video.

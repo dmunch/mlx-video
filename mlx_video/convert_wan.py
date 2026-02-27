@@ -316,6 +316,14 @@ def convert_wan_checkpoint(
     def _detect_config():
         """Detect config from source config.json or transformer weight shapes."""
         if is_dual:
+            # Check source config.json for model_type (I2V vs T2V)
+            src_cfg_path = checkpoint_dir / "high_noise_model" / "config.json"
+            if src_cfg_path.exists():
+                with open(src_cfg_path) as f:
+                    src_config = json.load(f)
+                src_model_type = src_config.get("model_type", "t2v")
+                if src_model_type == "i2v" or src_config.get("in_dim") == 36:
+                    return WanModelConfig.wan22_i2v_14b()
             return WanModelConfig.wan22_t2v_14b()
 
         # Try reading source config.json first (most reliable)
