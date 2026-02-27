@@ -187,7 +187,7 @@ class FlowUniPCScheduler:
         solver_order: int = 2,
         lower_order_final: bool = True,
         disable_corrector: list | None = None,
-        use_corrector: bool = False,
+        use_corrector: bool = True,
     ):
         self.num_train_timesteps = num_train_timesteps
         self.solver_order = solver_order
