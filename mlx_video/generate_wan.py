@@ -261,10 +261,13 @@ def generate_video(
 
     version_str = f"Wan{config.model_version}"
     mode_str = "dual-model" if is_dual else "single-model"
-    # Resolve negative prompt: explicit user value > empty default
-    # The official Wan2.2 uses a Chinese negative prompt (config.sample_neg_prompt),
-    # but it can cause blurriness if T5 encoding differs. Use --negative-prompt to opt in.
-    neg_prompt_resolved = negative_prompt if negative_prompt is not None else ""
+    # Resolve negative prompt: explicit user value > config default
+    # The official Wan2.2 uses a Chinese negative prompt (config.sample_neg_prompt)
+    # that prevents oversaturation, artifacts, and comic look. We use it by default.
+    if negative_prompt is None:
+        neg_prompt_resolved = config.sample_neg_prompt
+    else:
+        neg_prompt_resolved = negative_prompt
     print(f"{Colors.CYAN}{'='*60}")
     print(f"  {version_str} Text-to-Video Generation (MLX, {mode_str})")
     print(f"{'='*60}{Colors.RESET}")
@@ -494,8 +497,10 @@ def main():
     parser = argparse.ArgumentParser(description="Wan Text-to-Video Generation (MLX)")
     parser.add_argument("--model-dir", type=str, required=True, help="Path to converted MLX model directory")
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt")
-    parser.add_argument("--negative-prompt", type=str, default="",
-                        help="Negative prompt for CFG (try official Chinese prompt from config for quality)")
+    parser.add_argument("--negative-prompt", type=str, default=None,
+                        help="Negative prompt for CFG (default: official Chinese prompt from config)")
+    parser.add_argument("--no-negative-prompt", action="store_true",
+                        help="Disable negative prompt (use empty string instead of config default)")
     parser.add_argument("--width", type=int, default=1280, help="Video width")
     parser.add_argument("--height", type=int, default=720, help="Video height")
     parser.add_argument("--num-frames", type=int, default=81, help="Number of frames (must be 4n+1)")
@@ -505,9 +510,9 @@ def main():
     parser.add_argument("--seed", type=int, default=-1, help="Random seed")
     parser.add_argument("--output-path", type=str, default="output.mp4", help="Output video path")
     parser.add_argument(
-        "--scheduler", type=str, default="dpm++",
+        "--scheduler", type=str, default="unipc",
         choices=["euler", "dpm++", "unipc"],
-        help="Diffusion solver: euler (1st order), dpm++ (2nd order, default), unipc (2nd order PC)",
+        help="Diffusion solver: euler (1st order), dpm++ (2nd order), unipc (2nd order PC, default/official)",
     )
     args = parser.parse_args()
 
@@ -517,10 +522,15 @@ def main():
         parts = [float(x) for x in args.guide_scale.split(",")]
         guide_scale = tuple(parts) if len(parts) > 1 else parts[0]
 
+    # Handle negative prompt: --no-negative-prompt forces empty, otherwise pass through
+    neg_prompt = args.negative_prompt
+    if args.no_negative_prompt:
+        neg_prompt = ""
+
     generate_video(
         model_dir=args.model_dir,
         prompt=args.prompt,
-        negative_prompt=args.negative_prompt or None,
+        negative_prompt=neg_prompt,
         width=args.width,
         height=args.height,
         num_frames=args.num_frames,
