@@ -1786,10 +1786,55 @@ class TestFlowUniPCScheduler:
             mx.eval(sample)
         assert np.isfinite(np.array(sample)).all()
 
+    def test_corrector_rhos_c_not_hardcoded(self):
+        """Corrector rhos_c should be computed via linalg.solve, not hardcoded 0.5."""
+        import math
+        # For 50-step schedule with shift=5.0, order 2 corrector at step 5:
+        # rhos_c[0] (history) should be ~0.07, NOT 0.5
+        # rhos_c[1] (D1_t) should be ~0.45, NOT 0.5
+        from mlx_video.models.wan.scheduler import _compute_sigmas
 
-# ---------------------------------------------------------------------------
-# Cross-Scheduler Coherence Tests
-# ---------------------------------------------------------------------------
+        sigmas = _compute_sigmas(50, shift=5.0)
+
+        def _lambda(sigma):
+            if sigma >= 1.0:
+                return -math.inf
+            if sigma <= 0.0:
+                return math.inf
+            return math.log(1 - sigma) - math.log(sigma)
+
+        for step_idx in [5, 10, 25, 45]:
+            sigma_s0 = sigmas[step_idx - 1]
+            sigma_t = sigmas[step_idx]
+            lambda_s0 = _lambda(sigma_s0)
+            lambda_t = _lambda(sigma_t)
+            h = lambda_t - lambda_s0
+            hh = -h
+
+            sigma_sk = sigmas[step_idx - 2]
+            lambda_sk = _lambda(sigma_sk)
+            rk = (lambda_sk - lambda_s0) / h
+            rks = np.array([rk, 1.0])
+
+            h_phi_1 = math.expm1(hh)
+            B_h = h_phi_1
+            h_phi_k = h_phi_1 / hh - 1.0
+            factorial_i = 1
+            R_rows, b_vals = [], []
+            for j in range(1, 3):
+                R_rows.append(rks ** (j - 1))
+                b_vals.append(h_phi_k * factorial_i / B_h)
+                factorial_i *= j + 1
+                h_phi_k = h_phi_k / hh - 1.0 / factorial_i
+            R = np.stack(R_rows)
+            b = np.array(b_vals)
+            rhos_c = np.linalg.solve(R, b)
+
+            # History weight should be small (~0.07-0.09), not 0.5
+            assert rhos_c[0] < 0.15, f"Step {step_idx}: rhos_c[0]={rhos_c[0]:.4f} too large"
+            assert rhos_c[0] > 0.0, f"Step {step_idx}: rhos_c[0]={rhos_c[0]:.4f} should be positive"
+            # D1_t weight should be ~0.42-0.45, not 0.5
+            assert 0.3 < rhos_c[1] < 0.5, f"Step {step_idx}: rhos_c[1]={rhos_c[1]:.4f} out of range"
 
 
 class TestSchedulerCoherence:

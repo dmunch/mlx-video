@@ -227,7 +227,11 @@ class FlowUniPCScheduler:
         return sample - sigma * velocity
 
     def _uni_p_bh2(self, x0: mx.array, sample: mx.array, order: int) -> mx.array:
-        """UniP predictor with B(h)=expm1(-h) basis (bh2 variant)."""
+        """UniP predictor with B(h)=expm1(-h) basis (bh2 variant).
+
+        Matches official multistep_uni_p_bh_update: computes rhos_p via
+        linalg.solve for order >= 3; order <= 2 uses analytic rhos_p=[0.5].
+        """
         i = self._step_index
         s = self._sigmas_float
 
@@ -240,17 +244,18 @@ class FlowUniPCScheduler:
         lambda_s0 = self._lambda(sigma_s0)
         lambda_t = self._lambda(sigma_t)
         h = lambda_t - lambda_s0
+        hh = -h  # negated for predict_x0
 
         alpha_t = 1.0 - sigma_t
-        h_phi_1 = math.expm1(-h)  # exp(-h) - 1
-        B_h = h_phi_1  # bh2: B(h) = expm1(-h)
+        h_phi_1 = math.expm1(hh)
+        B_h = h_phi_1
 
         m0 = self._model_outputs[-1]
         # Base prediction
         x_t = (sigma_t / sigma_s0) * sample - (alpha_t * h_phi_1) * m0
 
         if order >= 2 and m0 is not None:
-            # Compute correction from previous model outputs
+            rks = []
             D1s = []
             for k in range(1, order):
                 si_idx = i - k
@@ -260,14 +265,32 @@ class FlowUniPCScheduler:
                 sigma_sk = s[si_idx]
                 lambda_sk = self._lambda(sigma_sk)
                 rk = (lambda_sk - lambda_s0) / h
+                if math.isinf(rk):
+                    break
+                rks.append(rk)
                 D1s.append((mk - m0) / rk)
 
             if D1s:
-                # For order 2, rhos_p = [0.5] (analytic solution)
-                pred_res = 0.5 * D1s[0]
-                if len(D1s) > 1:
-                    # Higher order would use linalg.solve, but order=2 suffices
-                    pred_res = 0.5 * D1s[0]
+                effective_order = len(D1s) + 1
+                if effective_order <= 2:
+                    # Analytic solution for order 2
+                    rhos_p = [0.5]
+                else:
+                    rks_arr = np.array(rks, dtype=np.float64)
+                    h_phi_k = h_phi_1 / hh - 1.0
+                    factorial_i = 1
+                    R_rows = []
+                    b_vals = []
+                    for j in range(1, effective_order):
+                        R_rows.append(rks_arr ** (j - 1))
+                        b_vals.append(float(h_phi_k * factorial_i / B_h))
+                        factorial_i *= j + 1
+                        h_phi_k = h_phi_k / hh - 1.0 / factorial_i
+                    R = np.stack(R_rows)
+                    b = np.array(b_vals)
+                    rhos_p = np.linalg.solve(R, b).tolist()
+
+                pred_res = sum(r * d for r, d in zip(rhos_p, D1s))
                 x_t = x_t - (alpha_t * B_h) * pred_res
 
         return x_t
@@ -279,7 +302,11 @@ class FlowUniPCScheduler:
         this_sample: mx.array,
         order: int,
     ) -> mx.array:
-        """UniC corrector with B(h)=expm1(-h) basis (bh2 variant)."""
+        """UniC corrector with B(h)=expm1(-h) basis (bh2 variant).
+
+        Matches official multistep_uni_c_bh_update: computes rhos_c via
+        linalg.solve for order >= 2 (not hardcoded 0.5).
+        """
         i = self._step_index
         s = self._sigmas_float
 
@@ -292,33 +319,59 @@ class FlowUniPCScheduler:
         lambda_s0 = self._lambda(sigma_s0)
         lambda_t = self._lambda(sigma_t)
         h = lambda_t - lambda_s0
+        hh = -h  # negated for predict_x0
 
         alpha_t = 1.0 - sigma_t
-        h_phi_1 = math.expm1(-h)
+        h_phi_1 = math.expm1(hh)
         B_h = h_phi_1
 
         m0 = self._model_outputs[-1]
         # Re-derive base from last_sample
         x_t_ = (sigma_t / sigma_s0) * last_sample - (alpha_t * h_phi_1) * m0
 
-        # Corrector uses the difference between new model output and stored
         D1_t = model_x0 - m0
 
-        corr_res = mx.zeros_like(D1_t)
-        if order >= 2:
-            # Gather previous differences
-            for k in range(1, order):
-                si_idx = i - (k + 1)
-                if si_idx < 0 or self._model_outputs[-(k + 1)] is None:
-                    break
-                mk = self._model_outputs[-(k + 1)]
-                sigma_sk = s[si_idx]
-                lambda_sk = self._lambda(sigma_sk)
-                rk = (lambda_sk - lambda_s0) / h
-                corr_res = corr_res + 0.5 * (mk - m0) / rk
+        # Gather rks and D1s from history
+        rks = []
+        D1s = []
+        for k in range(1, order):
+            si_idx = i - (k + 1)
+            if si_idx < 0 or self._model_outputs[-(k + 1)] is None:
+                break
+            mk = self._model_outputs[-(k + 1)]
+            sigma_sk = s[si_idx]
+            lambda_sk = self._lambda(sigma_sk)
+            rk = (lambda_sk - lambda_s0) / h
+            if math.isinf(rk):
+                break  # History references sigma=1.0 boundary; reduce order
+            rks.append(rk)
+            D1s.append((mk - m0) / rk)
+        rks.append(1.0)
+        effective_order = len(rks)  # = len(D1s) + 1
 
-        # For order 1: rhos_c = [0.5], so correction is 0.5 * D1_t
-        x_t = x_t_ - (alpha_t * B_h) * (corr_res + 0.5 * D1_t)
+        # Compute rhos_c coefficients
+        if effective_order == 1:
+            rhos_c = [0.5]
+        else:
+            rks_arr = np.array(rks, dtype=np.float64)
+            h_phi_k = h_phi_1 / hh - 1.0
+            factorial_i = 1
+            R_rows = []
+            b_vals = []
+            for j in range(1, effective_order + 1):
+                R_rows.append(rks_arr ** (j - 1))
+                b_vals.append(float(h_phi_k * factorial_i / B_h))
+                factorial_i *= j + 1
+                h_phi_k = h_phi_k / hh - 1.0 / factorial_i
+            R = np.stack(R_rows)
+            b = np.array(b_vals)
+            rhos_c = np.linalg.solve(R, b).tolist()
+
+        # Apply correction
+        corr_res = mx.zeros_like(D1_t)
+        for k_idx, d1 in enumerate(D1s):
+            corr_res = corr_res + rhos_c[k_idx] * d1
+        x_t = x_t_ - (alpha_t * B_h) * (corr_res + rhos_c[-1] * D1_t)
         return x_t
 
     def step(
