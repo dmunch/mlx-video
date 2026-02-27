@@ -1717,7 +1717,7 @@ class TestFlowUniPCScheduler:
     def test_corrector_not_applied_first_step(self):
         """First step should skip the corrector (no history)."""
         from mlx_video.models.wan.scheduler import FlowUniPCScheduler
-        sched = FlowUniPCScheduler()
+        sched = FlowUniPCScheduler(use_corrector=True)
         sched.set_timesteps(10, shift=5.0)
         sample = mx.random.normal((1, 4, 1, 2, 2))
         vel = mx.random.normal(sample.shape)
@@ -1728,9 +1728,9 @@ class TestFlowUniPCScheduler:
         assert sched._last_sample is not None
 
     def test_corrector_applied_after_first_step(self):
-        """Steps after the first should use the corrector."""
+        """Steps after the first should use the corrector when enabled."""
         from mlx_video.models.wan.scheduler import FlowUniPCScheduler
-        sched = FlowUniPCScheduler()
+        sched = FlowUniPCScheduler(use_corrector=True)
         sched.set_timesteps(10, shift=5.0)
         sample = mx.random.normal((1, 2, 1, 4, 4))
         for i in range(3):
@@ -1765,7 +1765,7 @@ class TestFlowUniPCScheduler:
     def test_disable_corrector(self):
         """Disabling corrector on step 0 should still work without error."""
         from mlx_video.models.wan.scheduler import FlowUniPCScheduler
-        sched = FlowUniPCScheduler(disable_corrector=[0])
+        sched = FlowUniPCScheduler(use_corrector=True, disable_corrector=[0])
         sched.set_timesteps(5, shift=1.0)
         sample = mx.ones((1, 1, 1, 2, 2))
         for i in range(5):
@@ -1777,7 +1777,7 @@ class TestFlowUniPCScheduler:
     def test_solver_order_3(self):
         """Order 3 should work without error."""
         from mlx_video.models.wan.scheduler import FlowUniPCScheduler
-        sched = FlowUniPCScheduler(solver_order=3)
+        sched = FlowUniPCScheduler(solver_order=3, use_corrector=True)
         sched.set_timesteps(10, shift=5.0)
         sample = mx.random.normal((1, 2, 1, 2, 2))
         for i in range(10):

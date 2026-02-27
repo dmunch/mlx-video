@@ -498,9 +498,9 @@ def main():
     parser.add_argument("--seed", type=int, default=-1, help="Random seed")
     parser.add_argument("--output-path", type=str, default="output.mp4", help="Output video path")
     parser.add_argument(
-        "--scheduler", type=str, default="unipc",
+        "--scheduler", type=str, default="dpm++",
         choices=["euler", "dpm++", "unipc"],
-        help="Diffusion solver: euler (1st order), dpm++ (2nd order), unipc (2nd order, default)",
+        help="Diffusion solver: euler (1st order), dpm++ (2nd order, default), unipc (2nd order PC)",
     )
     args = parser.parse_args()
 

@@ -187,10 +187,12 @@ class FlowUniPCScheduler:
         solver_order: int = 2,
         lower_order_final: bool = True,
         disable_corrector: list | None = None,
+        use_corrector: bool = False,
     ):
         self.num_train_timesteps = num_train_timesteps
         self.solver_order = solver_order
         self.lower_order_final = lower_order_final
+        self._use_corrector = use_corrector
         self.disable_corrector = set(disable_corrector or [])
         self.timesteps = None
         self.sigmas = None
@@ -388,7 +390,8 @@ class FlowUniPCScheduler:
 
         # 1. Corrector: refine current sample if we have history
         use_corrector = (
-            i > 0
+            self._use_corrector
+            and i > 0
             and (i - 1) not in self.disable_corrector
             and self._last_sample is not None
         )
