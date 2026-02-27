@@ -260,11 +260,13 @@ def convert_wan_checkpoint(
     if model_version == "auto":
         if (checkpoint_dir / "low_noise_model").exists():
             model_version = "2.2"
+        elif (checkpoint_dir / "Wan2.2_VAE.pth").exists():
+            model_version = "2.2"
         else:
             model_version = "2.1"
         print(f"Auto-detected Wan{model_version} checkpoint")
 
-    is_dual = model_version == "2.2"
+    is_dual = (checkpoint_dir / "low_noise_model").exists()
 
     if is_dual:
         # Wan2.2: Convert dual transformer models
@@ -308,6 +310,74 @@ def convert_wan_checkpoint(
         else:
             print("  Warning: No transformer weights found!")
 
+    # Save config — detect model size from source config.json or transformer weights
+    from mlx_video.models.wan.config import WanModelConfig
+
+    def _detect_config():
+        """Detect config from source config.json or transformer weight shapes."""
+        if is_dual:
+            return WanModelConfig.wan22_t2v_14b()
+
+        # Try reading source config.json first (most reliable)
+        src_cfg_path = checkpoint_dir / "config.json"
+        src_config = None
+        if src_cfg_path.exists():
+            with open(src_cfg_path) as f:
+                src_config = json.load(f)
+
+        if src_config and "dim" in src_config:
+            src_dim = src_config.get("dim", 5120)
+            src_in_dim = src_config.get("in_dim", 16)
+            src_out_dim = src_config.get("out_dim", 16)
+            src_ffn_dim = src_config.get("ffn_dim", 13824)
+            src_num_heads = src_config.get("num_heads", 40)
+            src_num_layers = src_config.get("num_layers", 40)
+            src_model_type = src_config.get("model_type", "t2v")
+            src_text_len = src_config.get("text_len", 512)
+
+            print(f"  Source config: dim={src_dim}, layers={src_num_layers}, "
+                  f"heads={src_num_heads}, type={src_model_type}")
+
+            is_22 = model_version == "2.2"
+            return WanModelConfig(
+                model_type=src_model_type,
+                model_version=model_version,
+                dim=src_dim,
+                ffn_dim=src_ffn_dim,
+                in_dim=src_in_dim,
+                out_dim=src_out_dim,
+                num_heads=src_num_heads,
+                num_layers=src_num_layers,
+                text_len=src_text_len,
+                dual_model=False,
+                boundary=0.0,
+                sample_shift=5.0 if not is_22 else 12.0,
+                sample_steps=50 if not is_22 else 40,
+                sample_guide_scale=5.0,
+            )
+
+        # Fallback: detect from saved transformer weight shapes
+        saved_model = output_dir / "model.safetensors"
+        if saved_model.exists():
+            det_weights = mx.load(str(saved_model))
+            dim = None
+            for k, v in det_weights.items():
+                if "patch_embedding_proj.weight" in k:
+                    dim = v.shape[0]
+                    break
+            del det_weights
+            if dim is not None and dim <= 2048:
+                print(f"  Auto-detected 1.3B model (dim={dim})")
+                return WanModelConfig.wan21_t2v_1_3b()
+
+        return WanModelConfig.wan21_t2v_14b()
+
+    config = _detect_config()
+    config_path = output_dir / "config.json"
+    with open(config_path, "w") as f:
+        json.dump(config.to_dict(), f, indent=2)
+    print(f"  Saved config to {config_path}")
+
     # Convert T5 encoder
     t5_path = checkpoint_dir / "models_t5_umt5-xxl-enc-bf16.pth"
     if t5_path.exists():
@@ -319,8 +389,10 @@ def convert_wan_checkpoint(
         mx.save_safetensors(str(out_path), weights)
         print(f"  Saved {len(weights)} weight tensors to {out_path}")
 
-    # Convert VAE
+    # Convert VAE (check both naming conventions)
     vae_path = checkpoint_dir / "Wan2.1_VAE.pth"
+    if not vae_path.exists():
+        vae_path = checkpoint_dir / "Wan2.2_VAE.pth"
     if vae_path.exists():
         print("Converting VAE...")
         weights = load_torch_weights(str(vae_path))
@@ -329,41 +401,6 @@ def convert_wan_checkpoint(
         out_path = output_dir / "vae.safetensors"
         mx.save_safetensors(str(out_path), weights)
         print(f"  Saved {len(weights)} weight tensors to {out_path}")
-
-    # Save config — detect model size from transformer weights
-    from mlx_video.models.wan.config import WanModelConfig
-
-    def _detect_config(weights_dict, is_dual_model):
-        """Detect config from transformer weight shapes."""
-        dim = None
-        for k, v in weights_dict.items():
-            if "patch_embedding_proj.weight" in k:
-                dim = v.shape[0]
-                break
-        if is_dual_model:
-            return WanModelConfig.wan22_t2v_14b()
-        elif dim is not None and dim <= 2048:
-            print(f"  Auto-detected 1.3B model (dim={dim})")
-            return WanModelConfig.wan21_t2v_1_3b()
-        else:
-            return WanModelConfig.wan21_t2v_14b()
-
-    # Load back the saved transformer weights to detect size
-    if is_dual:
-        config = WanModelConfig.wan22_t2v_14b()
-    else:
-        saved_model = output_dir / "model.safetensors"
-        if saved_model.exists():
-            det_weights = mx.load(str(saved_model))
-            config = _detect_config(det_weights, False)
-            del det_weights
-        else:
-            config = WanModelConfig.wan21_t2v_14b()
-
-    config_path = output_dir / "config.json"
-    with open(config_path, "w") as f:
-        json.dump(config.to_dict(), f, indent=2)
-    print(f"  Saved config to {config_path}")
 
     # Quantize transformer weights if requested
     if quantize:
