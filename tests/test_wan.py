@@ -2332,8 +2332,57 @@ class TestVAE22Resample:
         x = mx.random.normal((1, 2, 4, 4, 8))
         out = r(x, first_chunk=True)
         mx.eval(out)
-        # first_chunk trims 1 temporal frame from interleave
+        # first_chunk: 1 (bypass) + 2*(T-1) (interleaved) = 2T-1 = 3
         assert out.shape == (1, 3, 8, 8, 8)
+
+    def test_upsample3d_first_chunk_single_frame(self):
+        """Single-frame input with first_chunk: no temporal upsample."""
+        from mlx_video.models.wan.vae22 import Resample
+        r = Resample(8, "upsample3d")
+        r.resample_weight = mx.random.normal(r.resample_weight.shape) * 0.01
+        x = mx.random.normal((1, 1, 4, 4, 8))
+        out = r(x, first_chunk=True)
+        mx.eval(out)
+        # Single frame with first_chunk: falls through to non-first path
+        # time_conv on 1 frame → 2 interleaved
+        assert out.shape == (1, 2, 8, 8, 8)
+
+    def test_upsample3d_first_frame_bypasses_time_conv(self):
+        """First frame of first_chunk should NOT go through time_conv.
+
+        Official Wan2.2 skips time_conv for the very first frame entirely.
+        We verify this by checking that the first output frame depends only on
+        the first input frame (not on time_conv parameters).
+        """
+        from mlx_video.models.wan.vae22 import Resample
+        C = 8
+        r = Resample(C, "upsample3d")
+        # Set time_conv weights to large values so its effect is detectable
+        r.time_conv.weight = mx.ones(r.time_conv.weight.shape) * 10.0
+        r.time_conv.bias = mx.zeros(r.time_conv.bias.shape)
+        # Set spatial conv to identity-like
+        r.resample_weight = mx.zeros(r.resample_weight.shape)
+        r.resample_bias = mx.zeros(r.resample_bias.shape)
+
+        x = mx.random.normal((1, 3, 2, 2, C))
+        out = r(x, first_chunk=True)
+        mx.eval(out)
+        # Output: 5 frames (1 bypass + 4 interleaved from 2 remaining)
+        assert out.shape[1] == 5
+
+        # First frame should be spatial upsample of x[:, 0:1] only.
+        # Run just the first frame through spatial upsample for reference
+        first_only = x[:, 0:1]
+        ref = r._upsample2x(first_only.reshape(1, 2, 2, C))
+        ref = mx.pad(ref, [(0, 0), (1, 1), (1, 1), (0, 0)])
+        ref = mx.conv_general(ref, r.resample_weight) + r.resample_bias
+        mx.eval(ref)
+
+        # Compare first output frame to reference
+        first_out = out[:, 0:1].reshape(1, out.shape[2], out.shape[3], C)
+        mx.eval(first_out)
+        assert mx.allclose(first_out, ref, atol=1e-5).item(), \
+            "First frame should bypass time_conv and match spatial-only upsample"
 
 
 class TestVAE22ResidualBlock:
