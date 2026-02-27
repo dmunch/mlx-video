@@ -270,13 +270,10 @@ def generate_video(
             img_chw = img_arr.transpose(2, 0, 1)  # [3, H, W]
 
             # Build video: first frame = image, rest = zeros -> [3, F, H, W]
-            # Pad temporally by 3 to match reference chunked encoding output
-            # (reference encodes 1+4+4+... chunks with caching; non-chunked needs padding)
-            t_lat = (num_frames - 1) // config.vae_stride[0] + 1
-            t_padded = 4 * t_lat
+            # Chunked encoding processes 1-frame + 4-frame chunks with temporal caching
             video = mx.concatenate([
                 img_chw[:, None, :, :],
-                mx.zeros((3, t_padded - 1, height, width)),
+                mx.zeros((3, num_frames - 1, height, width)),
             ], axis=1)
 
             # Encode through Wan2.1 VAE -> [1, z_dim, T_lat, H_lat, W_lat]

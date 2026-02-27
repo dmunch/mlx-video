@@ -53,12 +53,17 @@ class CausalConv3d(nn.Module):
         self.weight = mx.zeros((out_channels, kernel_size[0], kernel_size[1], kernel_size[2], in_channels))
         self.bias = mx.zeros((out_channels,))
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, cache_x: mx.array = None) -> mx.array:
         """x: [B, C, T, H, W] (channel-first)"""
         b, c, t, h, w = x.shape
 
-        if self._causal_pad_t > 0:
-            pad_t = mx.zeros((b, c, self._causal_pad_t, h, w), dtype=x.dtype)
+        causal_pad = self._causal_pad_t
+        if cache_x is not None and causal_pad > 0:
+            x = mx.concatenate([cache_x, x], axis=2)
+            causal_pad = max(0, causal_pad - cache_x.shape[2])
+
+        if causal_pad > 0:
+            pad_t = mx.zeros((b, c, causal_pad, h, w), dtype=x.dtype)
             x = mx.concatenate([pad_t, x], axis=2)
 
         if self._pad_h > 0 or self._pad_w > 0:
@@ -138,12 +143,35 @@ class ResidualBlock(nn.Module):
         ]
         self.shortcut = CausalConv3d(in_dim, out_dim, 1) if in_dim != out_dim else None
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, feat_cache=None, feat_idx=None) -> mx.array:
         h = x if self.shortcut is None else self.shortcut(x)
-        x = nn.silu(self.residual[0](x))
-        x = self.residual[2](x)
-        x = nn.silu(self.residual[3](x))
-        x = self.residual[6](x)
+
+        if feat_cache is not None:
+            # First conv: norm -> silu -> [cache] -> conv
+            x = nn.silu(self.residual[0](x))
+            idx = feat_idx[0]
+            cache_x = x[:, :, -CACHE_T:]
+            if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+                cache_x = mx.concatenate([feat_cache[idx][:, :, -1:], cache_x], axis=2)
+            x = self.residual[2](x, cache_x=feat_cache[idx])
+            feat_cache[idx] = cache_x
+            feat_idx[0] += 1
+
+            # Second conv: norm -> silu -> [cache] -> conv
+            x = nn.silu(self.residual[3](x))
+            idx = feat_idx[0]
+            cache_x = x[:, :, -CACHE_T:]
+            if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+                cache_x = mx.concatenate([feat_cache[idx][:, :, -1:], cache_x], axis=2)
+            x = self.residual[6](x, cache_x=feat_cache[idx])
+            feat_cache[idx] = cache_x
+            feat_idx[0] += 1
+        else:
+            x = nn.silu(self.residual[0](x))
+            x = self.residual[2](x)
+            x = nn.silu(self.residual[3](x))
+            x = self.residual[6](x)
+
         return x + h
 
 
@@ -206,7 +234,7 @@ class Resample(nn.Module):
                 self.time_conv = CausalConv3d(
                     dim, dim, (3, 1, 1), stride=(2, 1, 1), padding=(0, 0, 0))
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, feat_cache=None, feat_idx=None) -> mx.array:
         """x: [B, C, T, H, W]"""
         b, c, t, h, w = x.shape
 
@@ -235,7 +263,21 @@ class Resample(nn.Module):
             x = x.reshape(b, t, h_out, w_out, c_out).transpose(0, 4, 1, 2, 3)
 
             if self.mode == "downsample3d":
-                x = self.time_conv(x)
+                if feat_cache is not None:
+                    idx = feat_idx[0]
+                    if feat_cache[idx] is None:
+                        # First chunk: save x, skip time_conv
+                        feat_cache[idx] = x
+                        feat_idx[0] += 1
+                    else:
+                        # Subsequent chunks: use cached frame as temporal context
+                        cache_x = x[:, :, -1:]
+                        x = self.time_conv(
+                            x, cache_x=feat_cache[idx][:, :, -1:])
+                        feat_cache[idx] = cache_x
+                        feat_idx[0] += 1
+                else:
+                    x = self.time_conv(x)
             return x
 
 
@@ -356,18 +398,48 @@ class Encoder3d(nn.Module):
             CausalConv3d(dims[-1], z_dim, 3, padding=1),
         ]
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, feat_cache=None, feat_idx=None) -> mx.array:
         """x: [B, 3, T, H, W] -> [B, z_dim, T_lat, H_lat, W_lat]"""
-        x = self.conv1(x)
+        if feat_cache is not None:
+            # conv1 with caching
+            idx = feat_idx[0]
+            cache_x = x[:, :, -CACHE_T:]
+            if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+                cache_x = mx.concatenate(
+                    [feat_cache[idx][:, :, -1:], cache_x], axis=2)
+            x = self.conv1(x, cache_x=feat_cache[idx])
+            feat_cache[idx] = cache_x
+            feat_idx[0] += 1
+        else:
+            x = self.conv1(x)
 
         for layer in self.downsamples:
-            x = layer(x)
+            if feat_cache is not None and isinstance(layer, (ResidualBlock, Resample)):
+                x = layer(x, feat_cache=feat_cache, feat_idx=feat_idx)
+            else:
+                x = layer(x)
 
         for layer in self.middle:
-            x = layer(x)
+            if feat_cache is not None and isinstance(layer, ResidualBlock):
+                x = layer(x, feat_cache=feat_cache, feat_idx=feat_idx)
+            else:
+                x = layer(x)
 
-        x = nn.silu(self.head[0](x))
-        x = self.head[2](x)
+        if feat_cache is not None:
+            # Head: norm -> silu -> [cache] -> conv
+            x = nn.silu(self.head[0](x))
+            idx = feat_idx[0]
+            cache_x = x[:, :, -CACHE_T:]
+            if cache_x.shape[2] < CACHE_T and feat_cache[idx] is not None:
+                cache_x = mx.concatenate(
+                    [feat_cache[idx][:, :, -1:], cache_x], axis=2)
+            x = self.head[2](x, cache_x=feat_cache[idx])
+            feat_cache[idx] = cache_x
+            feat_idx[0] += 1
+        else:
+            x = nn.silu(self.head[0](x))
+            x = self.head[2](x)
+
         return x
 
 
@@ -392,7 +464,10 @@ class WanVAE(nn.Module):
             self.conv1 = CausalConv3d(z_dim * 2, z_dim * 2, 1)
 
     def encode(self, x: mx.array) -> mx.array:
-        """Encode video to normalized latent.
+        """Encode video to normalized latent using chunked encoding.
+
+        Uses chunked encoding with temporal caching to match reference behavior.
+        First frame encoded alone, then 4-frame chunks with cached context.
 
         Args:
             x: Video [B, 3, T, H, W] in [-1, 1]
@@ -400,13 +475,48 @@ class WanVAE(nn.Module):
         Returns:
             Normalized latent [B, z_dim, T_lat, H_lat, W_lat]
         """
-        out = self.encoder(x)
+        # Count cacheable CausalConv3d slots in encoder
+        num_slots = self._count_encoder_cache_slots()
+        feat_cache = [None] * num_slots
+
+        t = x.shape[2]
+        num_chunks = 1 + (t - 1) // 4
+
+        out = None
+        for i in range(num_chunks):
+            feat_idx = [0]
+            if i == 0:
+                chunk = x[:, :, :1]
+            else:
+                chunk = x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i]
+
+            chunk_out = self.encoder(chunk, feat_cache=feat_cache, feat_idx=feat_idx)
+
+            if out is None:
+                out = chunk_out
+            else:
+                out = mx.concatenate([out, chunk_out], axis=2)
+
         mu, _ = mx.split(self.conv1(out), 2, axis=1)
 
         # Normalize: (mu - mean) * inv_std
         mean = self.mean.reshape(1, -1, 1, 1, 1)
         inv_std = self.inv_std.reshape(1, -1, 1, 1, 1)
         return (mu - mean) * inv_std
+
+    def _count_encoder_cache_slots(self) -> int:
+        """Count CausalConv3d that participate in chunked encoding cache."""
+        count = 1  # encoder.conv1
+        for layer in self.encoder.downsamples:
+            if isinstance(layer, ResidualBlock):
+                count += 2  # two convs in residual path
+            elif isinstance(layer, Resample) and layer.mode == "downsample3d":
+                count += 1  # time_conv
+        for layer in self.encoder.middle:
+            if isinstance(layer, ResidualBlock):
+                count += 2
+        count += 1  # encoder.head CausalConv3d
+        return count
 
     def decode(self, z: mx.array) -> mx.array:
         """Decode latent to video.
