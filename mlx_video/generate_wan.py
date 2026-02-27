@@ -98,6 +98,26 @@ def load_vae_decoder(model_path: Path, config=None):
     return vae
 
 
+def _clean_text(text: str) -> str:
+    """Clean text matching official Wan2.2 tokenizer preprocessing.
+
+    Applies ftfy.fix_text (fixes mojibake, normalizes fullwidth chars),
+    double HTML unescape, and whitespace normalization. Critical for
+    correct tokenization of the Chinese negative prompt.
+    """
+    import html
+    import re
+
+    try:
+        import ftfy
+        text = ftfy.fix_text(text)
+    except ImportError:
+        pass
+    text = html.unescape(html.unescape(text))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def encode_text(
     encoder,
     tokenizer,
@@ -115,6 +135,7 @@ def encode_text(
     Returns:
         Text embeddings [L, dim]
     """
+    prompt = _clean_text(prompt)
     tokens = tokenizer(
         prompt,
         max_length=text_len,
@@ -264,6 +285,7 @@ def generate_video(
     # Resolve negative prompt: explicit user value > config default
     # The official Wan2.2 uses a Chinese negative prompt (config.sample_neg_prompt)
     # that prevents oversaturation, artifacts, and comic look. We use it by default.
+    # Text cleaning (_clean_text) normalizes fullwidth chars to match official tokenization.
     if negative_prompt is None:
         neg_prompt_resolved = config.sample_neg_prompt
     else:

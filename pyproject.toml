@@ -22,6 +22,7 @@ dependencies = [
     "mlx-vlm",
     "imageio>=2.37.2",
     "imageio-ffmpeg>=0.6.0",
+    "ftfy",
 ]
 license = {text="MIT"}
 authors = [
