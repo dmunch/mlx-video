@@ -339,6 +339,12 @@ def convert_wan_checkpoint(
                   f"heads={src_num_heads}, type={src_model_type}")
 
             is_22 = model_version == "2.2"
+
+            # Wan2.2 uses different VAE with z_dim=48 and stride (4,16,16)
+            vae_z = 48 if is_22 else 16
+            vae_s = (4, 16, 16) if is_22 else (4, 8, 8)
+            fps = 24 if is_22 else 16
+
             return WanModelConfig(
                 model_type=src_model_type,
                 model_version=model_version,
@@ -349,11 +355,14 @@ def convert_wan_checkpoint(
                 num_heads=src_num_heads,
                 num_layers=src_num_layers,
                 text_len=src_text_len,
+                vae_z_dim=vae_z,
+                vae_stride=vae_s,
                 dual_model=False,
                 boundary=0.0,
-                sample_shift=5.0 if not is_22 else 12.0,
-                sample_steps=50 if not is_22 else 40,
+                sample_shift=5.0,
+                sample_steps=50,
                 sample_guide_scale=5.0,
+                sample_fps=fps,
             )
 
         # Fallback: detect from saved transformer weight shapes
@@ -391,12 +400,18 @@ def convert_wan_checkpoint(
 
     # Convert VAE (check both naming conventions)
     vae_path = checkpoint_dir / "Wan2.1_VAE.pth"
+    is_wan22_vae = False
     if not vae_path.exists():
         vae_path = checkpoint_dir / "Wan2.2_VAE.pth"
+        is_wan22_vae = True
     if vae_path.exists():
-        print("Converting VAE...")
+        print(f"Converting VAE ({'Wan2.2' if is_wan22_vae else 'Wan2.1'})...")
         weights = load_torch_weights(str(vae_path))
-        weights = sanitize_wan_vae_weights(weights)
+        if is_wan22_vae:
+            from mlx_video.models.wan.vae22 import sanitize_wan22_vae_weights
+            weights = sanitize_wan22_vae_weights(weights)
+        else:
+            weights = sanitize_wan_vae_weights(weights)
         weights = {k: v.astype(target_dtype) for k, v in weights.items()}
         out_path = output_dir / "vae.safetensors"
         mx.save_safetensors(str(out_path), weights)

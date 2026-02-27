@@ -1,6 +1,7 @@
 """Wan2.2 Text-to-Video generation pipeline for MLX."""
 
 import argparse
+import gc
 import math
 import random
 import sys
@@ -74,11 +75,21 @@ def load_t5_encoder(model_path: Path, config):
     return encoder
 
 
-def load_vae_decoder(model_path: Path):
-    """Load VAE decoder (skips encoder weights with strict=False)."""
-    from mlx_video.models.wan.vae import WanVAE
+def load_vae_decoder(model_path: Path, config=None):
+    """Load VAE decoder (skips encoder weights with strict=False).
 
-    vae = WanVAE(z_dim=16)
+    For Wan2.2 (vae_z_dim=48), uses Wan22VAEDecoder.
+    For Wan2.1 (vae_z_dim=16), uses WanVAE.
+    """
+    is_wan22 = config is not None and config.vae_z_dim == 48
+
+    if is_wan22:
+        from mlx_video.models.wan.vae22 import Wan22VAEDecoder
+        vae = Wan22VAEDecoder(z_dim=48)
+    else:
+        from mlx_video.models.wan.vae import WanVAE
+        vae = WanVAE(z_dim=16)
+
     weights = mx.load(str(model_path))
     vae.load_weights(list(weights.items()), strict=False)
     mx.eval(vae.parameters())
@@ -285,7 +296,7 @@ def generate_video(
 
     # Free T5 from memory
     del t5_encoder
-    mx.metal.clear_cache() if hasattr(mx, "metal") else None
+    gc.collect(); mx.clear_cache()
     print(f"{Colors.DIM}  T5 encoding: {time.time() - t1:.1f}s{Colors.RESET}")
 
     # Load transformer models
@@ -374,28 +385,44 @@ def generate_video(
 
     print(f"{Colors.DIM}  Denoising: {time.time() - t3:.1f}s{Colors.RESET}")
 
-    # Free transformer models
+    # Free transformer models and text embeddings
     if is_dual:
-        del low_noise_model, high_noise_model
+        del low_noise_model, high_noise_model, cross_kv_low, cross_kv_high
     else:
-        del single_model
-    mx.metal.clear_cache() if hasattr(mx, "metal") else None
+        del single_model, cross_kv
+    del model, kv, context, context_null, context_cfg
+    gc.collect(); mx.clear_cache()
 
     # Load VAE and decode
     print(f"\n{Colors.BLUE}Decoding with VAE...{Colors.RESET}")
     t4 = time.time()
     vae_path = model_dir / "vae.safetensors"
-    vae = load_vae_decoder(vae_path)
+    vae = load_vae_decoder(vae_path, config)
 
-    video = vae.decode(latents[None])  # [1, 3, T, H, W]
-    mx.eval(video)
-    print(f"{Colors.DIM}  VAE decode: {time.time() - t4:.1f}s{Colors.RESET}")
+    is_wan22_vae = config.vae_z_dim == 48
 
-    # Post-process and save
-    video = np.array(video[0])  # [3, T, H, W]
-    video = (video + 1.0) / 2.0  # [-1,1] -> [0,1]
-    video = np.clip(video * 255.0, 0, 255).astype(np.uint8)
-    video = video.transpose(1, 2, 3, 0)  # [T, H, W, 3]
+    if is_wan22_vae:
+        from mlx_video.models.wan.vae22 import denormalize_latents
+
+        # latents: [C, T, H, W] → [1, T, H, W, C] (channels-last for Wan2.2 VAE)
+        z = latents.transpose(1, 2, 3, 0)[None]  # [1, T, H, W, C]
+        z = denormalize_latents(z)
+        video = vae(z)  # [1, T', H', W', 3]
+        mx.eval(video)
+        print(f"{Colors.DIM}  VAE decode: {time.time() - t4:.1f}s{Colors.RESET}")
+
+        video = np.array(video[0])  # [T', H', W', 3]
+        video = (video + 1.0) / 2.0
+        video = np.clip(video * 255.0, 0, 255).astype(np.uint8)
+    else:
+        video = vae.decode(latents[None])  # [1, 3, T, H, W]
+        mx.eval(video)
+        print(f"{Colors.DIM}  VAE decode: {time.time() - t4:.1f}s{Colors.RESET}")
+
+        video = np.array(video[0])  # [3, T, H, W]
+        video = (video + 1.0) / 2.0
+        video = np.clip(video * 255.0, 0, 255).astype(np.uint8)
+        video = video.transpose(1, 2, 3, 0)  # [T, H, W, 3]
 
     save_video(video, output_path, fps=config.sample_fps)
     print(f"\n{Colors.GREEN}✓ Video saved to {output_path}{Colors.RESET}")
