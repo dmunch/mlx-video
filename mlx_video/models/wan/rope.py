@@ -43,21 +43,40 @@ def rope_apply(
 
     if precomputed_cos_sin is not None:
         cos_f, sin_f = precomputed_cos_sin
-        # Fast path: rotation with precomputed frequencies
-        outputs = []
-        for i in range(b):
-            f, h, w = grid_sizes[i]
-            seq_len = f * h * w
-            x_i = x[i, :seq_len].reshape(seq_len, n, half_d, 2)
-            x_real = x_i[..., 0]
-            x_imag = x_i[..., 1]
+        # Check if all batch elements have the same grid (common for CFG B=2)
+        f0, h0, w0 = grid_sizes[0]
+        seq_len = f0 * h0 * w0
+        all_same_grid = all(
+            grid_sizes[i] == grid_sizes[0] for i in range(1, b)
+        ) if b > 1 else True
+
+        if all_same_grid:
+            # Vectorized path: apply RoPE to all batch elements at once
+            x_seq = x[:, :seq_len].reshape(b, seq_len, n, half_d, 2)
+            x_real = x_seq[..., 0]
+            x_imag = x_seq[..., 1]
             out_real = x_real * cos_f - x_imag * sin_f
             out_imag = x_real * sin_f + x_imag * cos_f
-            x_rotated = mx.stack([out_real, out_imag], axis=-1).reshape(seq_len, n, d)
+            x_rotated = mx.stack([out_real, out_imag], axis=-1).reshape(b, seq_len, n, d)
             if seq_len < s:
-                x_rotated = mx.concatenate([x_rotated, x[i, seq_len:]], axis=0)
-            outputs.append(x_rotated)
-        return mx.stack(outputs)
+                x_rotated = mx.concatenate([x_rotated, x[:, seq_len:]], axis=1)
+            return x_rotated
+        else:
+            # Per-element path for mixed grid sizes
+            outputs = []
+            for i in range(b):
+                f, h, w = grid_sizes[i]
+                sl = f * h * w
+                x_i = x[i, :sl].reshape(sl, n, half_d, 2)
+                x_real = x_i[..., 0]
+                x_imag = x_i[..., 1]
+                out_real = x_real * cos_f - x_imag * sin_f
+                out_imag = x_real * sin_f + x_imag * cos_f
+                x_rotated = mx.stack([out_real, out_imag], axis=-1).reshape(sl, n, d)
+                if sl < s:
+                    x_rotated = mx.concatenate([x_rotated, x[i, sl:]], axis=0)
+                outputs.append(x_rotated)
+            return mx.stack(outputs)
 
     # Cast freqs to input dtype to prevent float32 promotion cascade
     if freqs.dtype != x.dtype:

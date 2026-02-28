@@ -90,14 +90,13 @@ class Head(nn.Module):
         """
         if e.ndim == 2:
             e = e[:, None, :]  # [B, 1, dim]
-        e_f32 = e.astype(mx.float32)
-        # modulation already float32; broadcasts with e [B, 1/L, dim] via unsqueeze
-        mod = self.modulation[:, None, :, :] + e_f32[:, :, None, :]  # [B, L_e, 2, dim]
+        # modulation already float32; e already float32 from model forward
+        mod = self.modulation[:, None, :, :] + e[:, :, None, :]  # [B, L_e, 2, dim]
         e0 = mod[:, :, 0, :]  # [B, L_e, dim] shift
         e1 = mod[:, :, 1, :]  # [B, L_e, dim] scale
-        x_norm = self.norm(x).astype(mx.float32)
-        x_mod = x_norm * (1 + e1) + e0  # broadcasts over L if L_e==1
-        return self.head(x_mod.astype(x.dtype))
+        x_norm = self.norm(x)
+        x_mod = x_norm * (1 + e1) + e0  # type promotion handles bf16→f32
+        return self.head(x_mod.astype(self.head.weight.dtype))
 
 
 class WanModel(nn.Module):
@@ -300,34 +299,52 @@ class WanModel(nn.Module):
         Returns:
             List of denoised tensors [C, F, H, W]
         """
+        # Detect identical inputs (CFG B=2) to avoid duplicate patchify work.
+        # Check BEFORE I2V concat since concat creates new array objects.
+        batch_size = len(x_list)
+        all_same = batch_size > 1 and all(
+            x_list[i] is x_list[0] for i in range(1, batch_size)
+        )
+        if all_same and y is not None:
+            all_same = all(y[i] is y[0] for i in range(1, len(y)))
+
         # I2V: channel-concatenate conditioning y with noise x
         if y is not None:
             x_list = [mx.concatenate([u, v], axis=0) for u, v in zip(x_list, y)]
 
-        # Patchify each video
-        patches = []
-        grid_sizes = []
-        seq_lens_list = []
-        for vid in x_list:
-            p, gs = self._patchify(vid)  # [1, L, dim]
-            patches.append(p)
-            grid_sizes.append(gs)
-            seq_lens_list.append(p.shape[1])
-
-        # Pad and batch
-        batch_size = len(patches)
-        x = mx.concatenate(
-            [
-                mx.concatenate(
+        if all_same:
+            # Patchify once and broadcast — saves a Linear projection per step
+            p, gs = self._patchify(x_list[0])  # [1, L, dim]
+            grid_sizes = [gs] * batch_size
+            seq_lens_list = [p.shape[1]] * batch_size
+            # Pad and broadcast
+            if p.shape[1] < seq_len:
+                p = mx.concatenate(
                     [p, mx.zeros((1, seq_len - p.shape[1], self.dim), dtype=p.dtype)],
                     axis=1,
                 )
-                if p.shape[1] < seq_len
-                else p
-                for p in patches
-            ],
-            axis=0,
-        )  # [B, seq_len, dim]
+            x = mx.broadcast_to(p, (batch_size,) + p.shape[1:])
+        else:
+            patches = []
+            grid_sizes = []
+            seq_lens_list = []
+            for vid in x_list:
+                p, gs = self._patchify(vid)  # [1, L, dim]
+                patches.append(p)
+                grid_sizes.append(gs)
+                seq_lens_list.append(p.shape[1])
+            x = mx.concatenate(
+                [
+                    mx.concatenate(
+                        [p, mx.zeros((1, seq_len - p.shape[1], self.dim), dtype=p.dtype)],
+                        axis=1,
+                    )
+                    if p.shape[1] < seq_len
+                    else p
+                    for p in patches
+                ],
+                axis=0,
+            )  # [B, seq_len, dim]
 
         # Time embedding (use cached inv_freq to avoid recomputing each step)
         if t.ndim == 0:
