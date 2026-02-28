@@ -421,7 +421,7 @@ def convert_wan_checkpoint(
         weights = load_torch_weights(str(vae_path))
         if is_wan22_vae:
             from mlx_video.models.wan.vae22 import sanitize_wan22_vae_weights
-            include_encoder = config.model_type == "ti2v"
+            include_encoder = config.model_type in ("ti2v", "i2v")
             weights = sanitize_wan22_vae_weights(weights, include_encoder=include_encoder)
         else:
             weights = sanitize_wan_vae_weights(weights)

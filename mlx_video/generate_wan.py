@@ -331,18 +331,22 @@ def generate_video(
     print(f"{Colors.DIM}  Models loaded: {time.time() - t2:.1f}s{Colors.RESET}")
 
     # Precompute text embeddings once (avoids redundant MLP in every step)
-    ref_model = single_model if not is_dual else low_noise_model
-    context_emb = ref_model.embed_text([context, context_null])
-    mx.eval(context_emb)
-    context_cond = context_emb[0:1]   # [1, text_len, dim]
-    context_uncond = context_emb[1:2]  # [1, text_len, dim]
-    # Stack for batched CFG: [2, text_len, dim]
-    context_cfg = mx.concatenate([context_cond, context_uncond], axis=0)
+    # Each model has its own text_embedding weights, so dual models need separate embeddings
+    if is_dual:
+        context_emb_low = low_noise_model.embed_text([context, context_null])
+        context_emb_high = high_noise_model.embed_text([context, context_null])
+        mx.eval(context_emb_low, context_emb_high)
+        context_cfg_low = mx.concatenate([context_emb_low[0:1], context_emb_low[1:2]], axis=0)
+        context_cfg_high = mx.concatenate([context_emb_high[0:1], context_emb_high[1:2]], axis=0)
+    else:
+        context_emb = single_model.embed_text([context, context_null])
+        mx.eval(context_emb)
+        context_cfg = mx.concatenate([context_emb[0:1], context_emb[1:2]], axis=0)
 
     # Precompute cross-attention K/V caches (constant across all steps)
     if is_dual:
-        cross_kv_low = low_noise_model.prepare_cross_kv(context_cfg)
-        cross_kv_high = high_noise_model.prepare_cross_kv(context_cfg)
+        cross_kv_low = low_noise_model.prepare_cross_kv(context_cfg_low)
+        cross_kv_high = high_noise_model.prepare_cross_kv(context_cfg_high)
         mx.eval(cross_kv_low, cross_kv_high)
     else:
         cross_kv = single_model.prepare_cross_kv(context_cfg)
@@ -450,10 +454,13 @@ def generate_video(
         y_arg = [y_i2v, y_i2v] if is_i2v_channel_concat else None
 
         # CFG: batch cond + uncond into single B=2 forward pass
+        ctx = context_cfg if not is_dual else (
+            context_cfg_high if timestep_val >= boundary else context_cfg_low
+        )
         preds = model(
             [latents, latents],
             t=t_batch,
-            context=context_cfg,
+            context=ctx,
             seq_len=seq_len,
             cross_kv_caches=kv,
             y=y_arg,
