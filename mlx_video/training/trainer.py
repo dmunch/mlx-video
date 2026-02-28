@@ -383,7 +383,7 @@ def train_simultaneous(
         boundary: Sigma boundary between experts (default 0.875).
     """
     from mlx_video.training.plotting import LossHistory, plot_loss
-    from mlx_video.training.save import save_lora_weights
+    from mlx_video.training.save import save_dual_checkpoint, save_lora_weights
 
     num_epochs = config.training.num_epochs
     batch_size = config.training.batch_size
@@ -543,6 +543,19 @@ def train_simultaneous(
             low_path = f"{output_dir}/lora_low_noise_epoch_{epoch + 1}.safetensors"
             save_lora_weights(high_model, high_path, config)
             save_lora_weights(low_model, low_path, config)
+            # Save resume checkpoint with optimizer state
+            ckpt_zip = f"{output_dir}/checkpoint_epoch_{epoch + 1}.zip"
+            save_dual_checkpoint(
+                high_model,
+                low_model,
+                high_optimizer,
+                low_optimizer,
+                config,
+                epoch=epoch + 1,
+                global_step=global_step,
+                loss_history_data=list(zip(loss_history.steps, loss_history.losses)),
+                output_path=ckpt_zip,
+            )
             print(f"  {Colors.GREEN}✓ Checkpoint: {high_path}, {low_path}{Colors.RESET}")
 
         # Loss plot
