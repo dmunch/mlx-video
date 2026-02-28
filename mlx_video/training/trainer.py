@@ -131,6 +131,61 @@ def compute_loss(
     return error.mean()
 
 
+def compute_batch_loss(
+    model: nn.Module,
+    items: list[EncodedItem],
+    sigmas: list[float],
+    noises: list[mx.array],
+    text_len: int,
+    shift: float,
+) -> mx.array:
+    """Compute flow matching loss for a batch with a single forward pass.
+
+    Batches all items into one model call for better GPU utilization.
+    """
+    batch_size = len(items)
+
+    # Build batched inputs
+    noisy_list = []
+    timesteps = []
+    contexts = []
+    targets = []
+
+    for item, sigma, noise in zip(items, sigmas, noises):
+        clean = item.clean_latents
+        sigma_shifted = _apply_shift(sigma, shift)
+        noisy = (1.0 - sigma_shifted) * clean + sigma_shifted * noise
+        noisy_list.append(noisy)
+        timesteps.append(sigma_shifted * 1000.0)
+        contexts.append(item.text_embedding)
+        targets.append(noise - clean)
+
+    t_batch = mx.array(timesteps)
+
+    # Compute seq_len from first item (all same resolution)
+    _, _, h_lat, w_lat = items[0].clean_latents.shape
+    patch_size = model.config.patch_size
+    f_grid = 1 // patch_size[0]
+    h_grid = h_lat // patch_size[1]
+    w_grid = w_lat // patch_size[2]
+    seq_len = f_grid * h_grid * w_grid
+
+    # Single batched forward pass
+    predicted_list = model(
+        noisy_list,
+        t=t_batch,
+        context=contexts,
+        seq_len=seq_len,
+    )
+
+    # Compute per-sample MSE, then average
+    losses = []
+    for pred, target in zip(predicted_list, targets):
+        error = (pred - target).square()
+        losses.append(error.mean())
+    return mx.mean(mx.stack(losses))
+
+
 def train(
     model: nn.Module,
     encoded_data: list[EncodedItem],
@@ -179,13 +234,9 @@ def train(
     rng = random.Random(config.seed)
     mx.random.seed(config.seed)
 
-    # Define loss function for value_and_grad
+    # Define loss function for value_and_grad (batched forward pass)
     def loss_fn(model, items_batch, sigmas, noises):
-        losses = []
-        for item, sigma, noise in zip(items_batch, sigmas, noises):
-            loss = compute_loss(model, item, sigma, noise, text_len, shift)
-            losses.append(loss)
-        return mx.mean(mx.stack(losses))
+        return compute_batch_loss(model, items_batch, sigmas, noises, text_len, shift)
 
     loss_and_grad = nn.value_and_grad(model, loss_fn)
 
@@ -418,20 +469,12 @@ def train_simultaneous(
     rng = random.Random(config.seed)
     mx.random.seed(config.seed)
 
-    # Loss functions for each expert
+    # Loss functions for each expert (batched forward pass)
     def high_loss_fn(model, items_batch, sigmas, noises):
-        losses = []
-        for item, sigma, noise in zip(items_batch, sigmas, noises):
-            loss = compute_loss(model, item, sigma, noise, text_len, shift)
-            losses.append(loss)
-        return mx.mean(mx.stack(losses))
+        return compute_batch_loss(model, items_batch, sigmas, noises, text_len, shift)
 
     def low_loss_fn(model, items_batch, sigmas, noises):
-        losses = []
-        for item, sigma, noise in zip(items_batch, sigmas, noises):
-            loss = compute_loss(model, item, sigma, noise, text_len, shift)
-            losses.append(loss)
-        return mx.mean(mx.stack(losses))
+        return compute_batch_loss(model, items_batch, sigmas, noises, text_len, shift)
 
     high_loss_and_grad = nn.value_and_grad(high_model, high_loss_fn)
     low_loss_and_grad = nn.value_and_grad(low_model, low_loss_fn)
