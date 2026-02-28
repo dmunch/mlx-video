@@ -442,7 +442,7 @@ def train_simultaneous(
     print(f"  Total steps: {total_steps}")
     print(f"  Batch size: {batch_size}, LR: {lr}")
     print(f"  Timestep sampling: {sampling}")
-    print(f"  Expert boundary: σ={boundary:.3f}")
+    print(f"  Expert boundary: σ={boundary:.3f} (alternating each step)")
     print(f"  Shift: {shift}")
     print(f"  Optimizer: {config.training.optimizer}")
     print(f"{Colors.RESET}")
@@ -470,22 +470,24 @@ def train_simultaneous(
 
             items_batch = [encoded_data[i] for i in batch_indices]
 
-            # Sample sigma from full range, then route to correct expert
-            sigmas = [_sample_timestep(1000, sampling, rng) for _ in range(batch_size)]
             noises = [
                 mx.random.normal(shape=items_batch[i].clean_latents.shape)
                 for i in range(batch_size)
             ]
 
-            # Route based on sigma — use mean sigma for the batch
-            mean_sigma = sum(sigmas) / len(sigmas)
-            if mean_sigma >= boundary:
+            # Alternate experts each step (like AI Toolkit switch_boundary_every=1)
+            # Each expert samples sigma from its own range
+            if global_step % 2 == 0:
+                # High noise expert: σ ∈ [boundary, 1.0]
+                sigmas = [_sample_timestep(1000, sampling, rng, boundary, 1.0) for _ in range(batch_size)]
                 loss, grads = high_loss_and_grad(high_model, items_batch, sigmas, noises)
                 high_optimizer.update(high_model, grads)
                 mx.eval(high_model.parameters(), high_optimizer.state)
                 high_steps += 1
                 expert_tag = "H"
             else:
+                # Low noise expert: σ ∈ [0.0, boundary)
+                sigmas = [_sample_timestep(1000, sampling, rng, 0.0, boundary) for _ in range(batch_size)]
                 loss, grads = low_loss_and_grad(low_model, items_batch, sigmas, noises)
                 low_optimizer.update(low_model, grads)
                 mx.eval(low_model.parameters(), low_optimizer.state)
