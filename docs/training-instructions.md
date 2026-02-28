@@ -83,6 +83,50 @@ For LoRA training, the timestep sampling strategy determines which noise levels 
 
 ---
 
+## Expert Routing Strategies
+
+When training both experts simultaneously, the `expert_routing` config controls how training steps are distributed between the high-noise and low-noise models.
+
+### Why this matters
+
+The 0.875 boundary is baked into Wan2.2's architecture — it's where the model switches experts during inference. But during training, we choose how to split the training budget. This matters because:
+
+- The **high-noise range** [0.875, 1.0] is narrow (12.5% of σ space) but controls structure, composition, and motion
+- The **low-noise range** [0.0, 0.875) is wide (87.5% of σ space) and controls fine details, textures, and character identity
+
+### Available strategies
+
+| Strategy | Config | H/L Split | Best for |
+|----------|--------|-----------|----------|
+| **Alternating** | `"alternating"` | 50/50 | Balanced motion + identity (recommended) |
+| **Proportional** | `"proportional"` | ~12.5% / ~87.5% | Maximum identity focus, less motion training |
+
+**Alternating** (default): Switches between experts every `switch_every` steps. Each expert samples σ only from its own range. This matches AI Toolkit's `switch_boundary_every` approach and ensures the high-noise expert gets sufficient training for good motion and composition.
+
+```json
+"training": {
+  "expert_routing": "alternating",
+  "switch_every": 1
+}
+```
+
+**Proportional**: Samples σ uniformly from [0, 1] and routes to whichever expert owns that σ range. The high-noise expert naturally gets ~12.5% of steps. This mirrors the natural sigma distribution and focuses most training on identity/details, but the high-noise expert may be undertrained for motion.
+
+```json
+"training": {
+  "expert_routing": "proportional"
+}
+```
+
+### Guidance
+
+- **Start with `alternating`** (default) — it's what AI Toolkit uses and ensures both experts learn well
+- Try `switch_every: 10` if you notice training instability (gives each expert a longer run before switching)
+- Try `proportional` if your character looks right but you want even sharper identity at the cost of slightly less motion quality
+- For character LoRAs, `alternating` + `timestep_sampling: balanced` is the safest combination
+
+---
+
 ## Example Configs
 
 ### Character LoRA (10 images, 128GB Mac)

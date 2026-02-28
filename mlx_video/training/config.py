@@ -23,6 +23,8 @@ class TrainingLoopConfig:
     timestep_sampling: str = "balanced"  # balanced, low_bias, high_bias
     experts: str = "both"  # "both", "low", "high"
     expert_mode: str = "simultaneous"  # "simultaneous", "sequential"
+    expert_routing: str = "alternating"  # "alternating", "proportional"
+    switch_every: int = 1  # steps per expert before switching (alternating only)
 
 
 @dataclass
@@ -228,6 +230,18 @@ def _validate(config: TrainingConfig, data_dir: Path) -> None:
         raise ValueError(
             f"expert_mode must be one of {valid_expert_modes}, "
             f"got '{config.training.expert_mode}'"
+        )
+
+    valid_routings = {"alternating", "proportional"}
+    if config.training.expert_routing not in valid_routings:
+        raise ValueError(
+            f"expert_routing must be one of {valid_routings}, "
+            f"got '{config.training.expert_routing}'"
+        )
+
+    if config.training.switch_every < 1:
+        raise ValueError(
+            f"switch_every must be >= 1, got {config.training.switch_every}"
         )
 
     if config.lora.rank <= 0:

@@ -367,11 +367,13 @@ def train_simultaneous(
     config: TrainingConfig,
     boundary: float = 0.875,
 ) -> None:
-    """Train both experts simultaneously, routing each step by sigma.
+    """Train both experts simultaneously, routing each step to an expert.
 
-    Each step: sample sigma → if sigma >= boundary, train high_model, else train low_model.
-    This matches AI Toolkit's switch_boundary_every=1 approach where each expert
-    gets approximately half the training steps.
+    Supports two routing strategies:
+      - alternating: Switch expert every N steps, sample σ from that expert's range.
+        Each expert gets ~50% of steps. Matches AI Toolkit's switch_boundary_every.
+      - proportional: Sample σ from [0,1], route by boundary. High gets ~12.5%,
+        Low gets ~87.5%. Matches the natural sigma distribution.
 
     Args:
         high_model: High-noise expert with LoRA injected.
@@ -387,6 +389,8 @@ def train_simultaneous(
     batch_size = config.training.batch_size
     lr = config.training.learning_rate
     sampling = config.training.timestep_sampling
+    routing = config.training.expert_routing
+    switch_every = config.training.switch_every
     log_freq = config.monitoring.log_frequency
     plot_freq = config.monitoring.plot_frequency
     preview_freq = config.monitoring.generate_image_frequency
@@ -445,9 +449,15 @@ def train_simultaneous(
     print(f"  Expert boundary: σ={boundary:.3f} (alternating each step)")
     print(f"  Shift: {shift}")
     print(f"  Optimizer: {config.training.optimizer}")
+    routing_desc = f"alternating (switch every {switch_every})" if routing == "alternating" else "proportional (σ-based)"
+    print(f"  Expert routing: {routing_desc}")
     print(f"{Colors.RESET}")
 
     t_start = time.time()
+
+    # Track which expert is active (for alternating mode)
+    current_expert = "high"  # start with high
+    steps_on_current = 0
 
     for epoch in range(num_epochs):
         indices = list(range(len(encoded_data)))
@@ -475,10 +485,19 @@ def train_simultaneous(
                 for i in range(batch_size)
             ]
 
-            # Alternate experts each step (like AI Toolkit switch_boundary_every=1)
-            # Each expert samples sigma from its own range
-            if global_step % 2 == 0:
-                # High noise expert: σ ∈ [boundary, 1.0]
+            # Determine which expert trains this step
+            if routing == "alternating":
+                use_high = current_expert == "high"
+                steps_on_current += 1
+                if steps_on_current >= switch_every:
+                    current_expert = "low" if current_expert == "high" else "high"
+                    steps_on_current = 0
+            else:
+                # Proportional: sample σ from full [0,1], route by boundary
+                probe_sigma = _sample_timestep(1000, sampling, rng)
+                use_high = probe_sigma >= boundary
+
+            if use_high:
                 sigmas = [_sample_timestep(1000, sampling, rng, boundary, 1.0) for _ in range(batch_size)]
                 loss, grads = high_loss_and_grad(high_model, items_batch, sigmas, noises)
                 high_optimizer.update(high_model, grads)
@@ -486,7 +505,6 @@ def train_simultaneous(
                 high_steps += 1
                 expert_tag = "H"
             else:
-                # Low noise expert: σ ∈ [0.0, boundary)
                 sigmas = [_sample_timestep(1000, sampling, rng, 0.0, boundary) for _ in range(batch_size)]
                 loss, grads = low_loss_and_grad(low_model, items_batch, sigmas, noises)
                 low_optimizer.update(low_model, grads)

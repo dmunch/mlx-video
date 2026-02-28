@@ -391,6 +391,8 @@ python -m mlx_video.train_wan --config train.json --resume ./training_output/che
 | `training.timestep_sampling` | `"balanced"` | Timestep bias: `balanced`, `low_bias`, or `high_bias` |
 | `training.experts` | `"both"` | Which experts to train: `both`, `low`, or `high` |
 | `training.expert_mode` | `"simultaneous"` | `simultaneous` (both in memory) or `sequential` (one at a time) |
+| `training.expert_routing` | `"alternating"` | `alternating` (50/50 split) or `proportional` (σ-based, ~12%/88%) |
+| `training.switch_every` | `1` | Steps per expert before switching (alternating routing only) |
 | `lora.rank` | `32` | LoRA rank (lower = smaller file, higher = more capacity) |
 | `lora.alpha` | `32` | LoRA scaling factor |
 | `lora.targets` | all attn + ffn | Which layers to apply LoRA to |
