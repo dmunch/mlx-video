@@ -391,8 +391,8 @@ Lightning uses few-step inference without CFG, so previews should match:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `preview_steps` | `50` | Denoising steps for preview images |
-| `preview_guide_scale` | `7.5` | CFG scale (1.0 disables CFG) |
+| `preview_steps` | `20` | Denoising steps for preview images |
+| `preview_guide_scale` | `1.0` | CFG scale (1.0 disables CFG) |
 
 ### Inference with stacked LoRAs
 

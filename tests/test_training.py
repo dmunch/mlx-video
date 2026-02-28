@@ -630,8 +630,8 @@ class TestPreviewSignature:
 
         sig = inspect.signature(generate_preview)
         assert "guide_scale" in sig.parameters
-        assert sig.parameters["guide_scale"].default == 7.5
-        assert sig.parameters["steps"].default == 50
+        assert sig.parameters["guide_scale"].default == 1.0
+        assert sig.parameters["steps"].default == 20
 
     def test_generate_preview_returns_none_on_error(self):
         """Test that generate_preview catches errors and returns None."""
@@ -817,8 +817,8 @@ class TestPreviewConfigFields:
 
         config_path = self._make_config_json(tmp_path)
         config = TrainingConfig.from_json(str(config_path))
-        assert config.monitoring.preview_steps == 50
-        assert config.monitoring.preview_guide_scale == 7.5
+        assert config.monitoring.preview_steps == 20
+        assert config.monitoring.preview_guide_scale == 1.0
 
     def test_shift_override(self, tmp_path):
         """Test training.shift override from config."""

@@ -23,8 +23,8 @@ def generate_preview(
     encoded_data: list[EncodedItem],
     epoch: int,
     output_dir: str,
-    steps: int = 50,
-    guide_scale: float = 7.5,
+    steps: int = 20,
+    guide_scale: float = 1.0,
 ) -> str | None:
     """Generate a single-frame preview image using the current model state.
 

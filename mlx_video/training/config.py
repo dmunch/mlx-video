@@ -81,8 +81,8 @@ class MonitoringConfig:
     generate_image_frequency: int = 0  # 0 = disabled
     preview_width: int = 512
     preview_height: int = 512
-    preview_steps: int = 50
-    preview_guide_scale: float = 7.5
+    preview_steps: int = 20
+    preview_guide_scale: float = 1.0
 
 
 @dataclass
