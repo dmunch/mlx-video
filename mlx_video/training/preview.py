@@ -23,12 +23,13 @@ def generate_preview(
     encoded_data: list[EncodedItem],
     epoch: int,
     output_dir: str,
-    steps: int = 20,
+    steps: int = 50,
+    guide_scale: float = 7.5,
 ) -> str | None:
     """Generate a single-frame preview image using the current model state.
 
-    Runs a short denoising loop, loads the VAE decoder temporarily to
-    decode the result, saves as PNG, then frees the VAE.
+    Runs a denoising loop with CFG guidance, loads the VAE decoder temporarily
+    to decode the result, saves as PNG, then frees the VAE.
 
     Args:
         model: WanModel with trained LoRA layers.
@@ -36,14 +37,15 @@ def generate_preview(
         encoded_data: Pre-encoded training data (uses first item's text embedding).
         epoch: Current epoch number (for filename).
         output_dir: Base output directory.
-        steps: Number of denoising steps.
+        steps: Number of denoising steps (default 50, matches inference quality).
+        guide_scale: CFG guidance scale (default 7.5, 1.0 to disable CFG).
 
     Returns:
         Path to the saved preview image, or None on failure.
     """
     try:
         return _generate_preview_impl(
-            model, config, encoded_data, epoch, output_dir, steps
+            model, config, encoded_data, epoch, output_dir, steps, guide_scale
         )
     except Exception as e:
         print(f"  {Colors.DIM}⚠ Preview generation failed: {e}{Colors.RESET}")
@@ -57,6 +59,7 @@ def _generate_preview_impl(
     epoch: int,
     output_dir: str,
     steps: int,
+    guide_scale: float,
 ) -> str:
     from mlx_video.models.wan.config import WanModelConfig
     from mlx_video.models.wan.loading import load_vae_decoder
@@ -85,11 +88,21 @@ def _generate_preview_impl(
 
     # Use first training sample's text embedding as context
     text_emb = encoded_data[0].text_embedding
-    context_embedded = model.embed_text([text_emb])  # [1, text_len, dim]
 
-    # Pre-compute cross-attention K/V caches and RoPE
-    cross_kv = model.prepare_cross_kv(context_embedded)
-    rope_cos_sin = model.prepare_rope([(f_grid, h_grid, w_grid)])
+    # CFG: embed both cond (real prompt) and uncond (zeros) through model's text MLP
+    use_cfg = guide_scale > 1.0
+    if use_cfg:
+        null_emb = mx.zeros_like(text_emb)
+        context_embedded = model.embed_text([text_emb, null_emb])  # [2, text_len, dim]
+        cross_kv = model.prepare_cross_kv(context_embedded)
+    else:
+        context_embedded = model.embed_text([text_emb])  # [1, text_len, dim]
+        cross_kv = model.prepare_cross_kv(context_embedded)
+
+    if use_cfg:
+        rope_cos_sin = model.prepare_rope([(f_grid, h_grid, w_grid)] * 2)
+    else:
+        rope_cos_sin = model.prepare_rope([(f_grid, h_grid, w_grid)])
 
     # Setup scheduler
     sched = FlowMatchEulerScheduler(
@@ -102,16 +115,30 @@ def _generate_preview_impl(
 
     # Denoising loop
     for i, timestep_val in enumerate(sched.timesteps):
-        t_batch = mx.array([timestep_val])
-        preds = model(
-            [latents],
-            t=t_batch,
-            context=context_embedded,
-            seq_len=seq_len,
-            cross_kv_caches=cross_kv,
-            rope_cos_sin=rope_cos_sin,
-        )
-        noise_pred = preds[0]
+        if use_cfg:
+            t_batch = mx.array([timestep_val, timestep_val])
+            preds = model(
+                [latents, latents],
+                t=t_batch,
+                context=context_embedded,
+                seq_len=seq_len,
+                cross_kv_caches=cross_kv,
+                rope_cos_sin=rope_cos_sin,
+            )
+            noise_pred_cond, noise_pred_uncond = preds[0], preds[1]
+            noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
+        else:
+            t_batch = mx.array([timestep_val])
+            preds = model(
+                [latents],
+                t=t_batch,
+                context=context_embedded,
+                seq_len=seq_len,
+                cross_kv_caches=cross_kv,
+                rope_cos_sin=rope_cos_sin,
+            )
+            noise_pred = preds[0]
+
         latents = sched.step(noise_pred[None], timestep_val, latents[None]).squeeze(0)
         mx.eval(latents)
 
