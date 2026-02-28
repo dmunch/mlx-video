@@ -282,3 +282,92 @@ The checkpoint contains:
 - Config snapshot
 
 Training resumes from the saved epoch with the optimizer state intact, so the learning rate warmup and momentum are preserved.
+
+---
+
+## Base LoRA (Lightning-Compatible Training)
+
+To train a character LoRA that works well with [Wan2.2-Lightning](https://huggingface.co/lightx2v/Wan2.2-Lightning) or other existing LoRAs, use `base_loras` to merge them into the base weights before training.
+
+### Why train with a base LoRA?
+
+If your final inference pipeline applies Lightning for speed, training *without* it means your LoRA learned velocity targets relative to the base model. But at inference time, Lightning changes the velocity field — your LoRA corrections may not align, causing artifacts or reduced quality.
+
+By merging Lightning into the weights during training, your LoRA learns the residual on top of Lightning's velocity field. The result is a character LoRA that cooperates naturally with Lightning at inference time.
+
+### Configuration
+
+```json
+{
+  "model_dir": "/path/to/wan22_mlx",
+  "data": "./my_character/",
+  "trigger_word": "ohwx",
+  "base_loras": [
+    {
+      "path": "/path/to/Wan2.2-Lightning.safetensors",
+      "expert": "both",
+      "strength": 1.0
+    }
+  ],
+  "training": {
+    "shift": 3.0,
+    "num_epochs": 40,
+    "learning_rate": 1e-4
+  },
+  "monitoring": {
+    "preview_steps": 8,
+    "preview_guide_scale": 1.0,
+    "generate_image_frequency": 10
+  }
+}
+```
+
+### `base_loras` fields
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `path` | (required) | Path to the `.safetensors` LoRA file |
+| `expert` | `"both"` | Which expert(s) to apply it to: `"both"`, `"high"`, `"low"` |
+| `strength` | `1.0` | Merge strength (1.0 = full, 0.5 = half) |
+
+Multiple base LoRAs can be stacked — they're merged additively in order.
+
+### `training.shift` override
+
+The flow matching shift parameter controls the sigma schedule. Base Wan2.2 uses `shift=12.0`, but distilled models like Lightning use a lower shift (typically 3.0–5.0). When training on top of Lightning, override the shift to match:
+
+```json
+"training": {
+  "shift": 3.0
+}
+```
+
+If omitted, the model's default shift is used.
+
+### Preview settings for Lightning
+
+Lightning uses few-step inference without CFG, so previews should match:
+
+```json
+"monitoring": {
+  "preview_steps": 8,
+  "preview_guide_scale": 1.0
+}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `preview_steps` | `50` | Denoising steps for preview images |
+| `preview_guide_scale` | `7.5` | CFG scale (1.0 disables CFG) |
+
+### Inference with stacked LoRAs
+
+At inference time, apply both the base LoRA and your trained LoRA:
+
+```bash
+python -m mlx_video.generate_wan \
+  --lora /path/to/Wan2.2-Lightning.safetensors \
+  --lora /path/to/my_character_lora.safetensors \
+  --prompt "A video of ohwx walking" \
+  --steps 4 --guide-scale 1.0
+```

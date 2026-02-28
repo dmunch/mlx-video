@@ -18,8 +18,36 @@ from mlx_video.utils import Colors
 EXPERT_BOUNDARY = 0.875
 
 
-def _load_model(model_dir: Path, weight_file: str):
-    """Load a WanModel from model_dir with the specified weight file."""
+def _resolve_base_loras(config, expert: str) -> list[tuple[str, float]] | None:
+    """Resolve base_loras config entries for a specific expert.
+
+    Args:
+        config: TrainingConfig with base_loras list.
+        expert: "high", "low", or "single" (for non-dual models).
+
+    Returns:
+        List of (path, strength) tuples, or None if empty.
+    """
+    if not config.base_loras:
+        return None
+    result = []
+    for entry in config.base_loras:
+        if entry.expert == "both" or entry.expert == expert:
+            result.append((entry.path, entry.strength))
+        elif expert == "single" and entry.expert == "both":
+            result.append((entry.path, entry.strength))
+    return result or None
+
+
+def _load_model(model_dir: Path, weight_file: str, base_loras=None):
+    """Load a WanModel from model_dir with the specified weight file.
+
+    Args:
+        model_dir: Path to model directory.
+        weight_file: Name of the weights safetensors file.
+        base_loras: Optional list of (lora_path, strength) tuples to merge
+                    into base weights before returning.
+    """
     from mlx_video.models.wan.config import WanModelConfig
     from mlx_video.models.wan.model import WanModel
 
@@ -49,6 +77,13 @@ def _load_model(model_dir: Path, weight_file: str):
         raise FileNotFoundError(f"Weight file not found: {weight_path}")
 
     weights = mx.load(str(weight_path))
+
+    # Merge base LoRAs into weights before loading into model
+    if base_loras:
+        from mlx_video.convert_wan import load_and_apply_loras
+
+        weights = load_and_apply_loras(dict(weights), base_loras)
+
     model.load_weights(list(weights.items()), strict=False)
     mx.eval(model.parameters())
     del weights
@@ -88,7 +123,10 @@ def _train_single_expert(
 
     print(f"\n{Colors.BLUE}Loading {expert_label} model ({weight_file})...{Colors.RESET}")
     t0 = time.time()
-    model = _load_model(model_dir, weight_file)
+    # Determine expert type from label for base LoRA filtering
+    expert_type = "high" if "high" in expert_label else "low"
+    base_loras = _resolve_base_loras(config, expert_type)
+    model = _load_model(model_dir, weight_file, base_loras=base_loras)
     print(f"{Colors.DIM}  Model loaded: {time.time() - t0:.1f}s{Colors.RESET}")
 
     _setup_lora(model, config.lora)
@@ -153,6 +191,11 @@ def main():
     print(f"  Resolution: {config.resolution}")
     print(f"  LoRA rank: {config.lora.rank}, alpha: {config.lora.alpha}")
     print(f"  Experts: {experts}, mode: {expert_mode}")
+    if config.base_loras:
+        for bl in config.base_loras:
+            print(f"  Base LoRA: {Path(bl.path).name} (expert={bl.expert}, strength={bl.strength})")
+    if config.training.shift is not None:
+        print(f"  Shift override: {config.training.shift}")
     if config.trigger_word:
         print(f"  Trigger word: {config.trigger_word}")
     print(f"{Colors.RESET}")
@@ -220,8 +263,10 @@ def main():
 
             print(f"\n{Colors.BLUE}Loading both expert models...{Colors.RESET}")
             t0 = time.time()
-            high_model = _load_model(model_dir, "high_noise_model.safetensors")
-            low_model = _load_model(model_dir, "low_noise_model.safetensors")
+            high_base_loras = _resolve_base_loras(config, "high")
+            low_base_loras = _resolve_base_loras(config, "low")
+            high_model = _load_model(model_dir, "high_noise_model.safetensors", base_loras=high_base_loras)
+            low_model = _load_model(model_dir, "low_noise_model.safetensors", base_loras=low_base_loras)
             print(f"{Colors.DIM}  Both models loaded: {time.time() - t0:.1f}s{Colors.RESET}")
 
             _setup_lora(high_model, config.lora)
@@ -278,7 +323,8 @@ def main():
 
         print(f"\n{Colors.BLUE}Loading model ({weight_file})...{Colors.RESET}")
         t0 = time.time()
-        model = _load_model(model_dir, weight_file)
+        single_base_loras = _resolve_base_loras(config, "single")
+        model = _load_model(model_dir, weight_file, base_loras=single_base_loras)
         print(f"{Colors.DIM}  Model loaded: {time.time() - t0:.1f}s{Colors.RESET}")
 
         _setup_lora(model, config.lora)

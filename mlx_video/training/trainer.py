@@ -163,9 +163,11 @@ def train(
     log_freq = config.monitoring.log_frequency
     plot_freq = config.monitoring.plot_frequency
     preview_freq = config.monitoring.generate_image_frequency
+    preview_steps = config.monitoring.preview_steps
+    preview_guide_scale = config.monitoring.preview_guide_scale
     save_freq = config.checkpoint.save_frequency
     output_dir = config.checkpoint.output_dir
-    shift = getattr(model.config, "sample_shift", 12.0)
+    shift = config.training.shift or getattr(model.config, "sample_shift", 12.0)
     text_len = model.config.text_len
 
     # Setup optimizer
@@ -247,7 +249,10 @@ def train(
         if preview_freq > 0:
             from mlx_video.training.preview import generate_preview
 
-            preview_path = generate_preview(model, config, encoded_data, 0, output_dir)
+            preview_path = generate_preview(
+                model, config, encoded_data, 0, output_dir,
+                steps=preview_steps, guide_scale=preview_guide_scale,
+            )
             if preview_path:
                 print(f"  {Colors.GREEN}✓ Baseline preview: {preview_path}{Colors.RESET}")
 
@@ -339,7 +344,8 @@ def train(
             from mlx_video.training.preview import generate_preview
 
             preview_path = generate_preview(
-                model, config, encoded_data, epoch + 1, output_dir
+                model, config, encoded_data, epoch + 1, output_dir,
+                steps=preview_steps, guide_scale=preview_guide_scale,
             )
             if preview_path:
                 print(f"  {Colors.GREEN}✓ Preview saved: {preview_path}{Colors.RESET}")
@@ -394,9 +400,11 @@ def train_simultaneous(
     log_freq = config.monitoring.log_frequency
     plot_freq = config.monitoring.plot_frequency
     preview_freq = config.monitoring.generate_image_frequency
+    preview_steps = config.monitoring.preview_steps
+    preview_guide_scale = config.monitoring.preview_guide_scale
     save_freq = config.checkpoint.save_frequency
     output_dir = config.checkpoint.output_dir
-    shift = getattr(high_model.config, "sample_shift", 12.0)
+    shift = config.training.shift or getattr(high_model.config, "sample_shift", 12.0)
     text_len = high_model.config.text_len
 
     # Separate optimizers for each expert
@@ -567,7 +575,8 @@ def train_simultaneous(
             from mlx_video.training.preview import generate_preview
 
             preview_path = generate_preview(
-                low_model, config, encoded_data, epoch + 1, output_dir
+                low_model, config, encoded_data, epoch + 1, output_dir,
+                steps=preview_steps, guide_scale=preview_guide_scale,
             )
             if preview_path:
                 print(f"  {Colors.GREEN}✓ Preview saved: {preview_path}{Colors.RESET}")

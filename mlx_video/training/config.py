@@ -15,12 +15,22 @@ class DataSpec:
 
 
 @dataclass
+class BaseLoRAEntry:
+    """A base LoRA to merge into model weights before training."""
+
+    path: str
+    expert: str = "both"  # "both", "high", "low"
+    strength: float = 1.0
+
+
+@dataclass
 class TrainingLoopConfig:
     num_epochs: int = 50
     batch_size: int = 1
     learning_rate: float = 1e-4
     optimizer: str = "AdamW"
     timestep_sampling: str = "balanced"  # balanced, low_bias, high_bias
+    shift: Optional[float] = None  # override model default (e.g. 12.0)
     experts: str = "both"  # "both", "low", "high"
     expert_mode: str = "simultaneous"  # "simultaneous", "sequential"
     expert_routing: str = "alternating"  # "alternating", "proportional"
@@ -70,6 +80,8 @@ class MonitoringConfig:
     generate_image_frequency: int = 0  # 0 = disabled
     preview_width: int = 512
     preview_height: int = 512
+    preview_steps: int = 50
+    preview_guide_scale: float = 7.5
 
 
 @dataclass
@@ -81,6 +93,7 @@ class TrainingConfig:
     seed: int = 42
     resolution: int = 512
     trigger_word: Optional[str] = None
+    base_loras: list[BaseLoRAEntry] = field(default_factory=list)
     training: TrainingLoopConfig = field(default_factory=TrainingLoopConfig)
     lora: LoRAConfig = field(default_factory=LoRAConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
@@ -109,12 +122,17 @@ class TrainingConfig:
         checkpoint = CheckpointConfig(**raw.get("checkpoint", {}))
         monitoring = MonitoringConfig(**raw.get("monitoring", {}))
 
+        base_loras = [
+            BaseLoRAEntry(**entry) for entry in raw.get("base_loras", [])
+        ]
+
         config = TrainingConfig(
             model_dir=raw["model_dir"],
             data=raw["data"],
             seed=raw.get("seed", 42),
             resolution=raw.get("resolution", 512),
             trigger_word=raw.get("trigger_word"),
+            base_loras=base_loras,
             training=training,
             lora=lora,
             checkpoint=checkpoint,
@@ -243,6 +261,19 @@ def _validate(config: TrainingConfig, data_dir: Path) -> None:
         raise ValueError(
             f"switch_every must be >= 1, got {config.training.switch_every}"
         )
+
+    valid_base_lora_experts = {"both", "high", "low"}
+    for i, bl in enumerate(config.base_loras):
+        if bl.expert not in valid_base_lora_experts:
+            raise ValueError(
+                f"base_loras[{i}].expert must be one of {valid_base_lora_experts}, "
+                f"got '{bl.expert}'"
+            )
+        bl_path = Path(bl.path)
+        if not bl_path.is_absolute():
+            bl_path = Path(config.model_dir).parent / bl_path
+        if not bl_path.exists():
+            raise ValueError(f"base_loras[{i}].path not found: {bl.path}")
 
     if config.lora.rank <= 0:
         raise ValueError(f"LoRA rank must be > 0, got {config.lora.rank}")

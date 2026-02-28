@@ -642,3 +642,153 @@ class TestPreviewSignature:
             model=None, config=None, encoded_data=[], epoch=0, output_dir="/tmp"
         )
         assert result is None
+
+
+class TestBaseLoRAConfig:
+    """Test base_loras config parsing and validation."""
+
+    def _make_config_json(self, tmp_path, overrides=None):
+        """Create a minimal valid config JSON for testing."""
+        from PIL import Image
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        img = Image.new("RGB", (64, 64))
+        img.save(data_dir / "img0.png")
+        (data_dir / "img0.txt").write_text("a photo")
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"dim": 5120}))
+
+        raw = {
+            "model_dir": str(model_dir),
+            "data": str(data_dir),
+        }
+        if overrides:
+            raw.update(overrides)
+
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(raw))
+        return config_path
+
+    def test_base_loras_parsed(self, tmp_path):
+        """Test base_loras array is parsed into BaseLoRAEntry objects."""
+        from mlx_video.training.config import TrainingConfig
+
+        # Create a fake LoRA file for validation
+        lora_path = tmp_path / "lightning.safetensors"
+        lora_path.write_bytes(b"fake")
+
+        config_path = self._make_config_json(
+            tmp_path,
+            {
+                "base_loras": [
+                    {"path": str(lora_path), "expert": "both", "strength": 0.8},
+                    {"path": str(lora_path), "expert": "low", "strength": 1.0},
+                ]
+            },
+        )
+        config = TrainingConfig.from_json(str(config_path))
+        assert len(config.base_loras) == 2
+        assert config.base_loras[0].expert == "both"
+        assert config.base_loras[0].strength == 0.8
+        assert config.base_loras[1].expert == "low"
+
+    def test_base_loras_empty_default(self, tmp_path):
+        """Test base_loras defaults to empty list."""
+        from mlx_video.training.config import TrainingConfig
+
+        config_path = self._make_config_json(tmp_path)
+        config = TrainingConfig.from_json(str(config_path))
+        assert config.base_loras == []
+
+    def test_base_loras_invalid_expert_rejected(self, tmp_path):
+        """Test invalid expert value is rejected."""
+        from mlx_video.training.config import TrainingConfig
+
+        lora_path = tmp_path / "lora.safetensors"
+        lora_path.write_bytes(b"fake")
+
+        config_path = self._make_config_json(
+            tmp_path,
+            {"base_loras": [{"path": str(lora_path), "expert": "invalid"}]},
+        )
+        with pytest.raises(ValueError, match="base_loras.*expert"):
+            TrainingConfig.from_json(str(config_path))
+
+    def test_base_loras_missing_file_rejected(self, tmp_path):
+        """Test nonexistent LoRA path is rejected."""
+        from mlx_video.training.config import TrainingConfig
+
+        config_path = self._make_config_json(
+            tmp_path,
+            {"base_loras": [{"path": "/nonexistent/lora.safetensors"}]},
+        )
+        with pytest.raises(ValueError, match="base_loras.*not found"):
+            TrainingConfig.from_json(str(config_path))
+
+
+class TestPreviewConfigFields:
+    """Test preview config fields and shift override."""
+
+    def _make_config_json(self, tmp_path, overrides=None):
+        from PIL import Image
+
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        img = Image.new("RGB", (64, 64))
+        img.save(data_dir / "img0.png")
+        (data_dir / "img0.txt").write_text("a photo")
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text(json.dumps({"dim": 5120}))
+
+        raw = {"model_dir": str(model_dir), "data": str(data_dir)}
+        if overrides:
+            raw.update(overrides)
+
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps(raw))
+        return config_path
+
+    def test_preview_steps_and_guide_scale(self, tmp_path):
+        """Test custom preview_steps and preview_guide_scale from config."""
+        from mlx_video.training.config import TrainingConfig
+
+        config_path = self._make_config_json(
+            tmp_path,
+            {"monitoring": {"preview_steps": 8, "preview_guide_scale": 1.0}},
+        )
+        config = TrainingConfig.from_json(str(config_path))
+        assert config.monitoring.preview_steps == 8
+        assert config.monitoring.preview_guide_scale == 1.0
+
+    def test_preview_defaults(self, tmp_path):
+        """Test preview config has sensible defaults."""
+        from mlx_video.training.config import TrainingConfig
+
+        config_path = self._make_config_json(tmp_path)
+        config = TrainingConfig.from_json(str(config_path))
+        assert config.monitoring.preview_steps == 50
+        assert config.monitoring.preview_guide_scale == 7.5
+
+    def test_shift_override(self, tmp_path):
+        """Test training.shift override from config."""
+        from mlx_video.training.config import TrainingConfig
+
+        config_path = self._make_config_json(
+            tmp_path,
+            {"training": {"shift": 3.0}},
+        )
+        config = TrainingConfig.from_json(str(config_path))
+        assert config.training.shift == 3.0
+
+    def test_shift_default_none(self, tmp_path):
+        """Test training.shift defaults to None (use model default)."""
+        from mlx_video.training.config import TrainingConfig
+
+        config_path = self._make_config_json(tmp_path)
+        config = TrainingConfig.from_json(str(config_path))
+        assert config.training.shift is None
