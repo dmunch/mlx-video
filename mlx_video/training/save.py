@@ -1,6 +1,9 @@
 """Save LoRA weights in diffusers-compatible safetensors format."""
 
+from __future__ import annotations
+
 import json
+import zipfile
 from pathlib import Path
 
 import mlx.core as mx
@@ -77,3 +80,155 @@ def save_lora_weights(
 
     n_params = sum(v.size for v in lora_weights.values())
     print(f"  Saved {len(lora_weights)} tensors ({n_params:,} params) to {output_path}")
+
+
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    config: TrainingConfig,
+    epoch: int,
+    global_step: int,
+    loss_history_data: list,
+    output_path: str,
+    expert_label: str = "",
+) -> None:
+    """Save a training checkpoint as a zip file.
+
+    Contains:
+      - lora_weights.safetensors: Current LoRA weights
+      - optimizer_state.safetensors: Adam optimizer state for resume
+      - state.json: Training state (epoch, step, loss history)
+      - config.json: Training config snapshot
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+
+        # Save LoRA weights
+        lora_weights = _collect_lora_weights(model)
+        lora_weights = _to_diffusers_keys(lora_weights)
+        lora_path = tmpdir / "lora_weights.safetensors"
+        mx.save_safetensors(str(lora_path), lora_weights)
+
+        # Save optimizer state
+        opt_state = {}
+        for i, (key, value) in enumerate(mx.utils.tree_flatten(optimizer.state)):
+            opt_state[f"{i}.{key}"] = value
+        if opt_state:
+            opt_path = tmpdir / "optimizer_state.safetensors"
+            mx.save_safetensors(str(opt_path), opt_state)
+
+        # Save training state
+        state = {
+            "epoch": epoch,
+            "global_step": global_step,
+            "loss_history": loss_history_data,
+            "expert_label": expert_label,
+        }
+        state_path = tmpdir / "state.json"
+        with open(state_path, "w") as f:
+            json.dump(state, f, indent=2)
+
+        # Save config
+        config_path = tmpdir / "config.json"
+        with open(config_path, "w") as f:
+            # Re-read from original if available, else serialize what we have
+            json.dump(
+                {
+                    "model_dir": config.model_dir,
+                    "resolution": config.resolution,
+                    "seed": config.seed,
+                    "trigger_word": config.trigger_word,
+                    "lora": {
+                        "rank": config.lora.rank,
+                        "alpha": config.lora.alpha,
+                    },
+                },
+                f,
+                indent=2,
+            )
+
+        # Create zip
+        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for file in tmpdir.iterdir():
+                zf.write(file, file.name)
+
+    print(f"  Checkpoint saved: {output_path}")
+
+
+def load_checkpoint(
+    checkpoint_path: str,
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+) -> dict:
+    """Load a training checkpoint from a zip file.
+
+    Restores LoRA weights and optimizer state into the given model/optimizer.
+
+    Args:
+        checkpoint_path: Path to checkpoint .zip file.
+        model: Model with LoRA layers already injected.
+        optimizer: Optimizer to restore state into.
+
+    Returns:
+        Dict with 'epoch', 'global_step', 'loss_history', 'expert_label'.
+    """
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+
+        with zipfile.ZipFile(checkpoint_path, "r") as zf:
+            zf.extractall(tmpdir)
+
+        # Restore LoRA weights
+        lora_path = tmpdir / "lora_weights.safetensors"
+        if lora_path.exists():
+            saved_weights = mx.load(str(lora_path))
+            # Convert from diffusers keys back to model keys
+            model_weights = {}
+            for key, value in saved_weights.items():
+                model_key = key.replace("diffusion_model.", "", 1)
+                model_weights[model_key] = value
+
+            # Apply to model's LoRA layers
+            for name, module in model.named_modules():
+                if isinstance(module, TrainableLoRALinear):
+                    a_key = f"{name}.lora_A.weight"
+                    b_key = f"{name}.lora_B.weight"
+                    if a_key in model_weights:
+                        module.lora_A = model_weights[a_key]
+                    if b_key in model_weights:
+                        module.lora_B = model_weights[b_key]
+
+        # Restore optimizer state
+        opt_path = tmpdir / "optimizer_state.safetensors"
+        if opt_path.exists():
+            saved_opt = mx.load(str(opt_path))
+            # Rebuild the optimizer state tree from flat dict
+            if saved_opt:
+                opt_flat = list(mx.utils.tree_flatten(optimizer.state))
+                for i, (key, _) in enumerate(opt_flat):
+                    lookup = f"{i}.{key}"
+                    if lookup in saved_opt:
+                        opt_flat[i] = (key, saved_opt[lookup])
+                optimizer.state = mx.utils.tree_unflatten(opt_flat)
+
+        # Load training state
+        state_path = tmpdir / "state.json"
+        if state_path.exists():
+            with open(state_path) as f:
+                state = json.load(f)
+        else:
+            state = {"epoch": 0, "global_step": 0, "loss_history": []}
+
+    mx.eval(model.parameters(), optimizer.state)
+    return state

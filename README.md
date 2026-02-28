@@ -337,7 +337,9 @@ Create a JSON config file (e.g., `train.json`):
     "num_epochs": 50,
     "batch_size": 1,
     "learning_rate": 1e-4,
-    "timestep_sampling": "balanced"
+    "timestep_sampling": "balanced",
+    "experts": "both",
+    "expert_mode": "simultaneous"
   },
   "lora": {
     "rank": 32,
@@ -368,6 +370,12 @@ Create a JSON config file (e.g., `train.json`):
 python -m mlx_video.train_wan --config train.json
 ```
 
+To resume from a checkpoint:
+
+```bash
+python -m mlx_video.train_wan --config train.json --resume ./training_output/checkpoint_low_noise_epoch_25.zip
+```
+
 ### Training Config Options
 
 | Option | Default | Description |
@@ -381,6 +389,8 @@ python -m mlx_video.train_wan --config train.json
 | `training.batch_size` | `1` | Batch size (1 recommended for memory) |
 | `training.learning_rate` | `1e-4` | AdamW learning rate |
 | `training.timestep_sampling` | `"balanced"` | Timestep bias: `balanced`, `low_bias`, or `high_bias` |
+| `training.experts` | `"both"` | Which experts to train: `both`, `low`, or `high` |
+| `training.expert_mode` | `"simultaneous"` | `simultaneous` (both in memory) or `sequential` (one at a time) |
 | `lora.rank` | `32` | LoRA rank (lower = smaller file, higher = more capacity) |
 | `lora.alpha` | `32` | LoRA scaling factor |
 | `lora.targets` | all attn + ffn | Which layers to apply LoRA to |
@@ -391,6 +401,15 @@ python -m mlx_video.train_wan --config train.json
 | `monitoring.generate_image_frequency` | `0` | Generate preview image every N epochs (0 = disabled) |
 | `monitoring.preview_width` | `512` | Width of preview images |
 | `monitoring.preview_height` | `512` | Height of preview images |
+
+### Dual Expert Training
+
+Wan2.2 uses two transformer models that handle different noise levels. For best results, train both:
+
+- **Simultaneous** (`expert_mode: "simultaneous"`): Both loaded at once, ~65GB. Recommended for 128GB+.
+- **Sequential** (`expert_mode: "sequential"`): One at a time, ~33GB. For 64GB systems.
+
+Output: `lora_high_noise_final.safetensors` + `lora_low_noise_final.safetensors`
 
 ### Timestep Sampling
 
@@ -404,12 +423,20 @@ For character LoRAs, use `balanced` or `low_bias`.
 
 ### Using Trained LoRAs
 
-After training, use the saved LoRA with the existing inference pipeline:
+After training, use the saved LoRA(s) with the existing inference pipeline:
 
 ```bash
+# Single expert LoRA
 python -m mlx_video.generate_wan \
     --prompt "A video of ohwx dancing in a garden" \
-    --lora ./training_output/lora_epoch_50.safetensors \
+    --lora ./training_output/lora_final.safetensors \
+    --lora-scale 1.0
+
+# Dual expert LoRAs (high + low noise)
+python -m mlx_video.generate_wan \
+    --prompt "A video of ohwx dancing in a garden" \
+    --lora-high ./training_output/lora_high_noise_final.safetensors \
+    --lora-low ./training_output/lora_low_noise_final.safetensors \
     --lora-scale 1.0
 ```
 

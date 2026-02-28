@@ -96,7 +96,9 @@ For LoRA training, the timestep sampling strategy determines which noise levels 
   "training": {
     "num_epochs": 40,
     "learning_rate": 1e-4,
-    "timestep_sampling": "balanced"
+    "timestep_sampling": "balanced",
+    "experts": "both",
+    "expert_mode": "simultaneous"
   },
   "lora": {
     "rank": 16,
@@ -126,7 +128,9 @@ For LoRA training, the timestep sampling strategy determines which noise levels 
   "training": {
     "num_epochs": 30,
     "learning_rate": 5e-5,
-    "timestep_sampling": "balanced"
+    "timestep_sampling": "balanced",
+    "experts": "both",
+    "expert_mode": "sequential"
   },
   "lora": {
     "rank": 32,
@@ -153,3 +157,84 @@ For LoRA training, the timestep sampling strategy determines which noise levels 
 | Wan2.1 T2V-1.3B | 30 | 30 |
 
 If you're training on a 5B or 1.3B model, set `"end": 30`. The trainer handles out-of-range blocks gracefully (skips them), but setting the correct end avoids confusion.
+
+---
+
+## Dual Expert Training
+
+Wan2.2 uses two transformer models (experts) that handle different noise levels:
+
+- **High noise expert** (σ ≥ 0.875): Structure, composition, and motion
+- **Low noise expert** (σ < 0.875): Fine details, textures, and character identity
+
+For the best results, **train both experts**. The trainer supports two modes:
+
+### Simultaneous Mode (default, recommended for 128GB+)
+
+Both models are loaded into memory at once. Each training step samples a random sigma and routes to the correct expert based on the boundary (0.875). This matches the AI Toolkit approach (`switch_boundary_every: 1`).
+
+```json
+"training": {
+  "experts": "both",
+  "expert_mode": "simultaneous"
+}
+```
+
+**Memory**: ~65GB (both models + LoRA + optimizer + activations)
+
+### Sequential Mode (for 64GB or constrained systems)
+
+Trains one expert at a time. First the high-noise expert, then the low-noise expert. Each is loaded, trained, saved, and unloaded before the next.
+
+```json
+"training": {
+  "experts": "both",
+  "expert_mode": "sequential"
+}
+```
+
+**Memory**: ~33GB peak (only one model loaded at a time)
+
+### Single Expert Training
+
+If you only want to train one expert (e.g., for experimentation):
+
+```json
+"training": {
+  "experts": "low"
+}
+```
+
+Options: `"both"` (default), `"low"`, `"high"`
+
+### Output Files
+
+Dual expert training produces two LoRA files:
+- `lora_high_noise_final.safetensors` — for the high noise model
+- `lora_low_noise_final.safetensors` — for the low noise model
+
+Use them at inference time:
+```bash
+python -m mlx_video.generate_wan \
+  --lora-high ./output/lora_high_noise_final.safetensors \
+  --lora-low ./output/lora_low_noise_final.safetensors \
+  --prompt "A video of ohwx walking through a park"
+```
+
+---
+
+## Resuming Training
+
+Training saves checkpoint zip files at `save_frequency` intervals. To resume:
+
+```bash
+python -m mlx_video.train_wan --config train.json --resume ./output/checkpoint_low_noise_epoch_25.zip
+```
+
+The checkpoint contains:
+- LoRA weights (current training state)
+- Optimizer state (Adam momentum/variance)
+- Training state (epoch, step, loss history)
+- Config snapshot
+
+Training resumes from the saved epoch with the optimizer state intact, so the learning rate warmup and momentum are preserved.

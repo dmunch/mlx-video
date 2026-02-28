@@ -21,8 +21,10 @@ def _sample_timestep(
     num_train_timesteps: int,
     sampling: str,
     rng: random.Random,
+    sigma_min: float = 0.0,
+    sigma_max: float = 1.0,
 ) -> float:
-    """Sample a timestep (as sigma in [0, 1]) with optional bias.
+    """Sample a timestep (as sigma in [sigma_min, sigma_max]) with optional bias.
 
     For flow matching, sigma represents the noise level:
       - sigma=1.0: pure noise (high noise)
@@ -32,9 +34,11 @@ def _sample_timestep(
         num_train_timesteps: Number of training timesteps (e.g., 1000).
         sampling: One of 'balanced', 'low_bias', 'high_bias'.
         rng: Random number generator.
+        sigma_min: Minimum sigma value (inclusive).
+        sigma_max: Maximum sigma value (inclusive).
 
     Returns:
-        Sigma value in (0, 1).
+        Sigma value in (sigma_min, sigma_max).
     """
     if sampling == "balanced":
         # Uniform sampling across [0, 1]
@@ -50,8 +54,11 @@ def _sample_timestep(
     else:
         t = rng.random()
 
-    # Clamp to avoid exact 0 or 1
-    t = max(1e-5, min(1.0 - 1e-5, t))
+    # Scale to [sigma_min, sigma_max] range
+    t = sigma_min + t * (sigma_max - sigma_min)
+
+    # Clamp to avoid exact boundaries
+    t = max(sigma_min + 1e-5, min(sigma_max - 1e-5, t))
     return t
 
 
@@ -128,6 +135,11 @@ def train(
     model: nn.Module,
     encoded_data: list[EncodedItem],
     config: TrainingConfig,
+    sigma_min: float = 0.0,
+    sigma_max: float = 1.0,
+    expert_label: str = "",
+    output_suffix: str = "",
+    resume_state: dict | None = None,
 ) -> None:
     """Run the full training loop.
 
@@ -135,9 +147,14 @@ def train(
         model: WanModel with LoRA layers injected and base weights frozen.
         encoded_data: Pre-encoded training samples.
         config: Training configuration.
+        sigma_min: Minimum sigma for timestep sampling (expert boundary).
+        sigma_max: Maximum sigma for timestep sampling (expert boundary).
+        expert_label: Label for display (e.g., "high noise", "low noise").
+        output_suffix: Suffix for output files (e.g., "_high_noise", "_low_noise").
+        resume_state: If resuming, dict with 'epoch', 'global_step', 'loss_history'.
     """
     from mlx_video.training.plotting import LossHistory, plot_loss
-    from mlx_video.training.save import save_lora_weights
+    from mlx_video.training.save import save_checkpoint, save_lora_weights
 
     num_epochs = config.training.num_epochs
     batch_size = config.training.batch_size
@@ -174,54 +191,71 @@ def train(
     steps_per_epoch = max(1, len(encoded_data) // batch_size)
     total_steps = num_epochs * steps_per_epoch
     global_step = 0
+    start_epoch = 0
     running_loss = 0.0
     loss_count = 0
     loss_history = LossHistory()
-    plot_path = f"{output_dir}/loss_plot.png"
+    title_suffix = f" ({expert_label})" if expert_label else ""
+    plot_path = f"{output_dir}/loss_plot{output_suffix}.png"
+
+    # Restore state from checkpoint if resuming
+    if resume_state:
+        start_epoch = resume_state.get("epoch", 0)
+        global_step = resume_state.get("global_step", 0)
+        for step, loss_val in resume_state.get("loss_history", []):
+            loss_history.append(step, loss_val)
+        if loss_history.losses:
+            loss_history.baseline = loss_history.losses[0]
+        print(f"{Colors.DIM}  Resuming from epoch {start_epoch}, step {global_step}{Colors.RESET}")
 
     print(f"\n{Colors.CYAN}{'='*60}")
-    print(f"  Wan2.2 LoRA Training")
+    print(f"  Wan2.2 LoRA Training{title_suffix}")
     print(f"{'='*60}{Colors.RESET}")
     print(f"{Colors.DIM}  Training samples: {len(encoded_data)}")
     print(f"  Epochs: {num_epochs}, Steps/epoch: {steps_per_epoch}")
     print(f"  Total steps: {total_steps}")
     print(f"  Batch size: {batch_size}, LR: {lr}")
     print(f"  Timestep sampling: {sampling}")
+    if sigma_min > 0.0 or sigma_max < 1.0:
+        print(f"  Sigma range: [{sigma_min:.3f}, {sigma_max:.3f}]")
     print(f"  Shift: {shift}")
     print(f"  Optimizer: {config.training.optimizer}")
+    if start_epoch > 0:
+        print(f"  Resumed from epoch: {start_epoch}")
     print(f"{Colors.RESET}")
 
     t_start = time.time()
 
-    # --- Baseline loss at step 0 (forward-only, no gradient) ---
-    print(f"  {Colors.DIM}Computing baseline loss...{Colors.RESET}", end="", flush=True)
-    baseline_losses = []
-    for item in encoded_data:
-        sigma = _sample_timestep(1000, sampling, rng)
-        noise = mx.random.normal(shape=item.clean_latents.shape)
-        bl = compute_loss(model, item, sigma, noise, text_len, shift)
-        mx.eval(bl)
-        baseline_losses.append(bl.item())
-    baseline_loss = sum(baseline_losses) / len(baseline_losses)
-    loss_history.append(0, baseline_loss)
-    loss_history.baseline = baseline_loss
-    running_loss += baseline_loss
-    loss_count += 1
-    print(f"\r  {Colors.DIM}Baseline loss (step 0): {baseline_loss:.4f}{Colors.RESET}")
+    # --- Baseline loss at step 0 (skip if resuming) ---
+    if not resume_state:
+        print(f"  {Colors.DIM}Computing baseline loss...{Colors.RESET}", end="", flush=True)
+        baseline_losses = []
+        for item in encoded_data:
+            sigma = _sample_timestep(1000, sampling, rng, sigma_min, sigma_max)
+            noise = mx.random.normal(shape=item.clean_latents.shape)
+            bl = compute_loss(model, item, sigma, noise, text_len, shift)
+            mx.eval(bl)
+            baseline_losses.append(bl.item())
+        baseline_loss = sum(baseline_losses) / len(baseline_losses)
+        loss_history.append(0, baseline_loss)
+        loss_history.baseline = baseline_loss
+        running_loss += baseline_loss
+        loss_count += 1
+        print(f"\r  {Colors.DIM}Baseline loss (step 0): {baseline_loss:.4f}{Colors.RESET}")
 
-    # Baseline preview image
-    if preview_freq > 0:
-        from mlx_video.training.preview import generate_preview
+        # Baseline preview image
+        if preview_freq > 0:
+            from mlx_video.training.preview import generate_preview
 
-        preview_path = generate_preview(model, config, encoded_data, 0, output_dir)
-        if preview_path:
-            print(f"  {Colors.GREEN}✓ Baseline preview: {preview_path}{Colors.RESET}")
+            preview_path = generate_preview(model, config, encoded_data, 0, output_dir)
+            if preview_path:
+                print(f"  {Colors.GREEN}✓ Baseline preview: {preview_path}{Colors.RESET}")
 
-    # Baseline plot
-    if plot_freq > 0:
-        plot_loss(loss_history, plot_path)
+        # Baseline plot
+        if plot_freq > 0:
+            plot_loss(loss_history, plot_path)
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         # Shuffle data each epoch
         indices = list(range(len(encoded_data)))
         rng.shuffle(indices)
@@ -245,7 +279,7 @@ def train(
             items_batch = [encoded_data[i] for i in batch_indices]
 
             # Sample timesteps and noise
-            sigmas = [_sample_timestep(1000, sampling, rng) for _ in range(batch_size)]
+            sigmas = [_sample_timestep(1000, sampling, rng, sigma_min, sigma_max) for _ in range(batch_size)]
             noises = [
                 mx.random.normal(shape=items_batch[i].clean_latents.shape)
                 for i in range(batch_size)
@@ -262,14 +296,14 @@ def train(
             running_loss += loss_val
             loss_count += 1
             global_step += 1
-            loss_history.append(global_step, loss_val)
 
             # Update progress bar
             avg_loss = running_loss / loss_count
             pbar.set_postfix(loss=f"{loss_val:.4f}", avg=f"{avg_loss:.4f}")
 
-        # Epoch summary
+        # Record epoch average loss (cleaner than per-step for plotting)
         avg_epoch_loss = epoch_loss / max(1, epoch_steps)
+        loss_history.append(epoch + 1, avg_epoch_loss)
         if (epoch + 1) % log_freq == 0:
             elapsed = time.time() - t_start
             print(
@@ -278,10 +312,22 @@ def train(
                 f"elapsed={elapsed:.1f}s{Colors.RESET}"
             )
 
-        # Checkpoint
+        # Checkpoint (LoRA weights + resume zip)
         if save_freq > 0 and (epoch + 1) % save_freq == 0:
-            ckpt_path = f"{output_dir}/lora_epoch_{epoch + 1}.safetensors"
+            ckpt_path = f"{output_dir}/lora{output_suffix}_epoch_{epoch + 1}.safetensors"
             save_lora_weights(model, ckpt_path, config)
+            # Save resume checkpoint
+            ckpt_zip = f"{output_dir}/checkpoint{output_suffix}_epoch_{epoch + 1}.zip"
+            save_checkpoint(
+                model,
+                optimizer,
+                config,
+                epoch=epoch + 1,
+                global_step=global_step,
+                loss_history_data=list(zip(loss_history.steps, loss_history.losses)),
+                output_path=ckpt_zip,
+                expert_label=expert_label,
+            )
             print(f"  {Colors.GREEN}✓ Checkpoint saved: {ckpt_path}{Colors.RESET}")
 
         # Loss plot
@@ -299,7 +345,7 @@ def train(
                 print(f"  {Colors.GREEN}✓ Preview saved: {preview_path}{Colors.RESET}")
 
     # Final save
-    final_path = f"{output_dir}/lora_final.safetensors"
+    final_path = f"{output_dir}/lora{output_suffix}_final.safetensors"
     save_lora_weights(model, final_path, config)
     plot_loss(loss_history, plot_path)
 
@@ -311,4 +357,203 @@ def train(
     print(f"{Colors.DIM}  Final avg loss: {avg_loss:.4f}")
     print(f"  Total time: {total_time:.1f}s")
     print(f"  LoRA saved to: {final_path}")
+    print(f"  Loss plot: {plot_path}{Colors.RESET}")
+
+
+def train_simultaneous(
+    high_model: nn.Module,
+    low_model: nn.Module,
+    encoded_data: list[EncodedItem],
+    config: TrainingConfig,
+    boundary: float = 0.875,
+) -> None:
+    """Train both experts simultaneously, routing each step by sigma.
+
+    Each step: sample sigma → if sigma >= boundary, train high_model, else train low_model.
+    This matches AI Toolkit's switch_boundary_every=1 approach where each expert
+    gets approximately half the training steps.
+
+    Args:
+        high_model: High-noise expert with LoRA injected.
+        low_model: Low-noise expert with LoRA injected.
+        encoded_data: Pre-encoded training samples.
+        config: Training configuration.
+        boundary: Sigma boundary between experts (default 0.875).
+    """
+    from mlx_video.training.plotting import LossHistory, plot_loss
+    from mlx_video.training.save import save_lora_weights
+
+    num_epochs = config.training.num_epochs
+    batch_size = config.training.batch_size
+    lr = config.training.learning_rate
+    sampling = config.training.timestep_sampling
+    log_freq = config.monitoring.log_frequency
+    plot_freq = config.monitoring.plot_frequency
+    preview_freq = config.monitoring.generate_image_frequency
+    save_freq = config.checkpoint.save_frequency
+    output_dir = config.checkpoint.output_dir
+    shift = getattr(high_model.config, "sample_shift", 12.0)
+    text_len = high_model.config.text_len
+
+    # Separate optimizers for each expert
+    optimizer_cls = {"adam": optim.Adam, "adamw": optim.AdamW}.get(
+        config.training.optimizer.lower(), optim.AdamW
+    )
+    high_optimizer = optimizer_cls(learning_rate=lr)
+    low_optimizer = optimizer_cls(learning_rate=lr)
+
+    rng = random.Random(config.seed)
+    mx.random.seed(config.seed)
+
+    # Loss functions for each expert
+    def high_loss_fn(model, items_batch, sigmas, noises):
+        losses = []
+        for item, sigma, noise in zip(items_batch, sigmas, noises):
+            loss = compute_loss(model, item, sigma, noise, text_len, shift)
+            losses.append(loss)
+        return mx.mean(mx.stack(losses))
+
+    def low_loss_fn(model, items_batch, sigmas, noises):
+        losses = []
+        for item, sigma, noise in zip(items_batch, sigmas, noises):
+            loss = compute_loss(model, item, sigma, noise, text_len, shift)
+            losses.append(loss)
+        return mx.mean(mx.stack(losses))
+
+    high_loss_and_grad = nn.value_and_grad(high_model, high_loss_fn)
+    low_loss_and_grad = nn.value_and_grad(low_model, low_loss_fn)
+
+    # Training loop
+    steps_per_epoch = max(1, len(encoded_data) // batch_size)
+    total_steps = num_epochs * steps_per_epoch
+    global_step = 0
+    running_loss = 0.0
+    loss_count = 0
+    high_steps = 0
+    low_steps = 0
+    loss_history = LossHistory()
+    plot_path = f"{output_dir}/loss_plot.png"
+
+    print(f"\n{Colors.CYAN}{'='*60}")
+    print(f"  Wan2.2 LoRA Training (simultaneous dual-expert)")
+    print(f"{'='*60}{Colors.RESET}")
+    print(f"{Colors.DIM}  Training samples: {len(encoded_data)}")
+    print(f"  Epochs: {num_epochs}, Steps/epoch: {steps_per_epoch}")
+    print(f"  Total steps: {total_steps}")
+    print(f"  Batch size: {batch_size}, LR: {lr}")
+    print(f"  Timestep sampling: {sampling}")
+    print(f"  Expert boundary: σ={boundary:.3f}")
+    print(f"  Shift: {shift}")
+    print(f"  Optimizer: {config.training.optimizer}")
+    print(f"{Colors.RESET}")
+
+    t_start = time.time()
+
+    for epoch in range(num_epochs):
+        indices = list(range(len(encoded_data)))
+        rng.shuffle(indices)
+
+        epoch_loss = 0.0
+        epoch_steps = 0
+
+        pbar = tqdm(
+            range(steps_per_epoch),
+            desc=f"Epoch {epoch + 1}/{num_epochs}",
+            leave=True,
+        )
+
+        for step in pbar:
+            batch_indices = []
+            for b in range(batch_size):
+                idx = (step * batch_size + b) % len(encoded_data)
+                batch_indices.append(indices[idx])
+
+            items_batch = [encoded_data[i] for i in batch_indices]
+
+            # Sample sigma from full range, then route to correct expert
+            sigmas = [_sample_timestep(1000, sampling, rng) for _ in range(batch_size)]
+            noises = [
+                mx.random.normal(shape=items_batch[i].clean_latents.shape)
+                for i in range(batch_size)
+            ]
+
+            # Route based on sigma — use mean sigma for the batch
+            mean_sigma = sum(sigmas) / len(sigmas)
+            if mean_sigma >= boundary:
+                loss, grads = high_loss_and_grad(high_model, items_batch, sigmas, noises)
+                high_optimizer.update(high_model, grads)
+                mx.eval(high_model.parameters(), high_optimizer.state)
+                high_steps += 1
+                expert_tag = "H"
+            else:
+                loss, grads = low_loss_and_grad(low_model, items_batch, sigmas, noises)
+                low_optimizer.update(low_model, grads)
+                mx.eval(low_model.parameters(), low_optimizer.state)
+                low_steps += 1
+                expert_tag = "L"
+
+            loss_val = loss.item()
+            epoch_loss += loss_val
+            epoch_steps += 1
+            running_loss += loss_val
+            loss_count += 1
+            global_step += 1
+
+            avg_loss = running_loss / loss_count
+            pbar.set_postfix(
+                loss=f"{loss_val:.4f}", avg=f"{avg_loss:.4f}", expert=expert_tag,
+                H=high_steps, L=low_steps,
+            )
+
+        # Record epoch average
+        avg_epoch_loss = epoch_loss / max(1, epoch_steps)
+        loss_history.append(epoch + 1, avg_epoch_loss)
+        if (epoch + 1) % log_freq == 0:
+            elapsed = time.time() - t_start
+            print(
+                f"  {Colors.DIM}Epoch {epoch + 1}: "
+                f"loss={avg_epoch_loss:.4f}, "
+                f"H={high_steps}, L={low_steps}, "
+                f"elapsed={elapsed:.1f}s{Colors.RESET}"
+            )
+
+        # Checkpoint
+        if save_freq > 0 and (epoch + 1) % save_freq == 0:
+            high_path = f"{output_dir}/lora_high_noise_epoch_{epoch + 1}.safetensors"
+            low_path = f"{output_dir}/lora_low_noise_epoch_{epoch + 1}.safetensors"
+            save_lora_weights(high_model, high_path, config)
+            save_lora_weights(low_model, low_path, config)
+            print(f"  {Colors.GREEN}✓ Checkpoint: {high_path}, {low_path}{Colors.RESET}")
+
+        # Loss plot
+        if plot_freq > 0 and (epoch + 1) % plot_freq == 0:
+            plot_loss(loss_history, plot_path)
+
+        # Preview (uses low noise model by default for character detail)
+        if preview_freq > 0 and (epoch + 1) % preview_freq == 0:
+            from mlx_video.training.preview import generate_preview
+
+            preview_path = generate_preview(
+                low_model, config, encoded_data, epoch + 1, output_dir
+            )
+            if preview_path:
+                print(f"  {Colors.GREEN}✓ Preview saved: {preview_path}{Colors.RESET}")
+
+    # Final save
+    high_final = f"{output_dir}/lora_high_noise_final.safetensors"
+    low_final = f"{output_dir}/lora_low_noise_final.safetensors"
+    save_lora_weights(high_model, high_final, config)
+    save_lora_weights(low_model, low_final, config)
+    plot_loss(loss_history, plot_path)
+
+    total_time = time.time() - t_start
+    avg_loss = running_loss / max(1, loss_count)
+    print(f"\n{Colors.GREEN}{'='*60}")
+    print(f"  Training complete! (simultaneous dual-expert)")
+    print(f"{'='*60}{Colors.RESET}")
+    print(f"{Colors.DIM}  Final avg loss: {avg_loss:.4f}")
+    print(f"  High noise steps: {high_steps}, Low noise steps: {low_steps}")
+    print(f"  Total time: {total_time:.1f}s")
+    print(f"  LoRA (high): {high_final}")
+    print(f"  LoRA (low): {low_final}")
     print(f"  Loss plot: {plot_path}{Colors.RESET}")

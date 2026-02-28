@@ -8,8 +8,8 @@ from mlx_video.training.lora_layers import (
     freeze_base_weights,
     inject_lora_layers,
 )
-from mlx_video.training.save import save_lora_weights
-from mlx_video.training.trainer import train
+from mlx_video.training.save import load_checkpoint, save_checkpoint, save_lora_weights
+from mlx_video.training.trainer import train, train_simultaneous
 
 __all__ = [
     "TrainingConfig",
@@ -20,5 +20,8 @@ __all__ = [
     "freeze_base_weights",
     "count_trainable_params",
     "save_lora_weights",
+    "save_checkpoint",
+    "load_checkpoint",
     "train",
+    "train_simultaneous",
 ]

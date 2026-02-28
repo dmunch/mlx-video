@@ -83,15 +83,15 @@ def plot_loss(
 
     fig, ax = plt.subplots(figsize=(12, 5))
 
-    # Individual loss points
+    # Epoch average loss points
     ax.scatter(
         steps,
         losses,
-        s=6,
-        alpha=0.25,
+        s=20,
+        alpha=0.7,
         color="#5B9BD5",
         zorder=2,
-        label=f"Loss (min={min_loss:.4f} @ step {min_step})",
+        label=f"Epoch avg (min={min_loss:.4f} @ epoch {min_step})",
     )
 
     # Smoothed curve
@@ -126,7 +126,7 @@ def plot_loss(
         label=f"Mean={mean_loss:.4f}",
     )
 
-    ax.set_xlabel("Step", fontsize=11)
+    ax.set_xlabel("Epoch", fontsize=11)
     ax.set_ylabel("Loss", fontsize=11)
     ax.set_title(title, fontsize=13, fontweight="bold")
     ax.legend(loc="upper right", fontsize=9, framealpha=0.9)

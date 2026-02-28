@@ -21,6 +21,8 @@ class TrainingLoopConfig:
     learning_rate: float = 1e-4
     optimizer: str = "AdamW"
     timestep_sampling: str = "balanced"  # balanced, low_bias, high_bias
+    experts: str = "both"  # "both", "low", "high"
+    expert_mode: str = "simultaneous"  # "simultaneous", "sequential"
 
 
 @dataclass
@@ -212,6 +214,20 @@ def _validate(config: TrainingConfig, data_dir: Path) -> None:
         raise ValueError(
             f"timestep_sampling must be one of {valid_samplings}, "
             f"got '{config.training.timestep_sampling}'"
+        )
+
+    valid_experts = {"both", "low", "high"}
+    if config.training.experts not in valid_experts:
+        raise ValueError(
+            f"experts must be one of {valid_experts}, "
+            f"got '{config.training.experts}'"
+        )
+
+    valid_expert_modes = {"simultaneous", "sequential"}
+    if config.training.expert_mode not in valid_expert_modes:
+        raise ValueError(
+            f"expert_mode must be one of {valid_expert_modes}, "
+            f"got '{config.training.expert_mode}'"
         )
 
     if config.lora.rank <= 0:
