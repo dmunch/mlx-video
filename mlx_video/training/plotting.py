@@ -17,11 +17,22 @@ class LossHistory:
 
     steps: list[int] = field(default_factory=list)
     losses: list[float] = field(default_factory=list)
+    # Per-expert loss series (for dual-expert training)
+    high_steps: list[int] = field(default_factory=list)
+    high_losses: list[float] = field(default_factory=list)
+    low_steps: list[int] = field(default_factory=list)
+    low_losses: list[float] = field(default_factory=list)
     baseline: float | None = None
 
-    def append(self, step: int, loss: float) -> None:
+    def append(self, step: int, loss: float, expert: str | None = None) -> None:
         self.steps.append(step)
         self.losses.append(loss)
+        if expert == "H":
+            self.high_steps.append(step)
+            self.high_losses.append(loss)
+        elif expert == "L":
+            self.low_steps.append(step)
+            self.low_losses.append(loss)
 
     def __len__(self) -> int:
         return len(self.steps)
@@ -83,26 +94,80 @@ def plot_loss(
 
     fig, ax = plt.subplots(figsize=(12, 5))
 
-    # Epoch average loss points
-    ax.scatter(
-        steps,
-        losses,
-        s=20,
-        alpha=0.7,
-        color="#5B9BD5",
-        zorder=2,
-        label=f"Epoch avg (min={min_loss:.4f} @ epoch {min_step})",
-    )
+    has_dual = len(history.high_losses) > 0 and len(history.low_losses) > 0
 
-    # Smoothed curve
-    ax.plot(
-        steps,
-        smoothed,
-        color="#E04040",
-        linewidth=1.8,
-        zorder=3,
-        label=f"Smoothed EMA (final={final_smooth:.4f})",
-    )
+    if has_dual:
+        # Separate H/L series
+        if history.high_losses:
+            h_smooth = _smooth(history.high_losses, weight=0.85)
+            ax.scatter(
+                history.high_steps,
+                history.high_losses,
+                s=14,
+                alpha=0.5,
+                color="#E04040",
+                zorder=2,
+                label=f"H expert (n={len(history.high_losses)}, last={history.high_losses[-1]:.4f})",
+            )
+            ax.plot(
+                history.high_steps,
+                h_smooth,
+                color="#E04040",
+                linewidth=1.5,
+                alpha=0.8,
+                zorder=3,
+            )
+
+        if history.low_losses:
+            l_smooth = _smooth(history.low_losses, weight=0.85)
+            ax.scatter(
+                history.low_steps,
+                history.low_losses,
+                s=14,
+                alpha=0.5,
+                color="#5B9BD5",
+                zorder=2,
+                label=f"L expert (n={len(history.low_losses)}, last={history.low_losses[-1]:.4f})",
+            )
+            ax.plot(
+                history.low_steps,
+                l_smooth,
+                color="#5B9BD5",
+                linewidth=1.5,
+                alpha=0.8,
+                zorder=3,
+            )
+
+        # Combined EMA as reference
+        ax.plot(
+            steps,
+            smoothed,
+            color="#888888",
+            linewidth=1.2,
+            linestyle="--",
+            zorder=3,
+            label=f"Combined EMA (final={final_smooth:.4f})",
+        )
+    else:
+        # Single series (non-dual training)
+        ax.scatter(
+            steps,
+            losses,
+            s=20,
+            alpha=0.7,
+            color="#5B9BD5",
+            zorder=2,
+            label=f"Epoch avg (min={min_loss:.4f} @ epoch {min_step})",
+        )
+
+        ax.plot(
+            steps,
+            smoothed,
+            color="#E04040",
+            linewidth=1.8,
+            zorder=3,
+            label=f"Smoothed EMA (final={final_smooth:.4f})",
+        )
 
     # Reference lines
     if history.baseline is not None:

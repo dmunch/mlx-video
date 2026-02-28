@@ -121,9 +121,36 @@ The 0.875 boundary is baked into Wan2.2's architecture — it's where the model 
 ### Guidance
 
 - **Start with `alternating`** (default) — it's what AI Toolkit uses and ensures both experts learn well
-- Try `switch_every: 10` if you notice training instability (gives each expert a longer run before switching)
 - Try `proportional` if your character looks right but you want even sharper identity at the cost of slightly less motion quality
 - For character LoRAs, `alternating` + `timestep_sampling: balanced` is the safest combination
+
+### Understanding `switch_every`
+
+`switch_every` controls how many consecutive steps each expert trains before switching to the other. **It is purely a performance knob — it does not affect training quality.**
+
+Why no quality impact:
+- Each training step is independent (random σ, random noise, random data sample)
+- Over a full epoch, each expert gets the same ~50% of total steps regardless of `switch_every`
+- AdamW's exponential moving averages (β₁=0.9, β₂=0.999) are robust to the ordering of gradient updates
+
+Why it affects speed: On Apple Silicon, both expert models (~28GB each) reside in unified memory, but the GPU has a working set / cache hierarchy. Switching experts every step (`switch_every: 1`) forces the system to page different model weights into the GPU's active cache each time, causing significant overhead. Increasing `switch_every` reduces these cache swaps.
+
+```json
+"training": {
+  "expert_routing": "alternating",
+  "switch_every": 7
+}
+```
+
+**Recommendation**: Set `switch_every` to match your `steps_per_epoch` (= number of training samples ÷ batch size). This means each expert trains for one full epoch before switching, minimizing cache thrashing while maintaining balanced training.
+
+### Why alternating shows higher average loss
+
+With alternating routing, you'll notice ~2x higher average loss compared to proportional. This is expected and not a quality issue:
+
+- The H expert predicts from nearly-pure noise (σ ∈ [0.875, 1.0]) → inherently higher MSE
+- With alternating, H contributes ~50% of epoch averages (vs ~12.5% with proportional)
+- The loss plot shows separate H (red) and L (blue) series so you can track each expert's learning curve independently
 
 ---
 

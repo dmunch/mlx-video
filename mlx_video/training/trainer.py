@@ -473,6 +473,10 @@ def train_simultaneous(
 
         epoch_loss = 0.0
         epoch_steps = 0
+        epoch_h_loss = 0.0
+        epoch_h_steps = 0
+        epoch_l_loss = 0.0
+        epoch_l_steps = 0
 
         pbar = tqdm(
             range(steps_per_epoch),
@@ -523,6 +527,12 @@ def train_simultaneous(
             loss_val = loss.item()
             epoch_loss += loss_val
             epoch_steps += 1
+            if expert_tag == "H":
+                epoch_h_loss += loss_val
+                epoch_h_steps += 1
+            else:
+                epoch_l_loss += loss_val
+                epoch_l_steps += 1
             running_loss += loss_val
             loss_count += 1
             global_step += 1
@@ -533,17 +543,28 @@ def train_simultaneous(
                 H=high_steps, L=low_steps,
             )
 
-        # Record epoch average
+        # Record epoch averages (combined + per-expert)
         avg_epoch_loss = epoch_loss / max(1, epoch_steps)
+        avg_h = epoch_h_loss / max(1, epoch_h_steps) if epoch_h_steps > 0 else None
+        avg_l = epoch_l_loss / max(1, epoch_l_steps) if epoch_l_steps > 0 else None
+
+        # Record combined with expert breakdown for plotting
         loss_history.append(epoch + 1, avg_epoch_loss)
+        if avg_h is not None:
+            loss_history.append(epoch + 1, avg_h, expert="H")
+        if avg_l is not None:
+            loss_history.append(epoch + 1, avg_l, expert="L")
+
         if (epoch + 1) % log_freq == 0:
             elapsed = time.time() - t_start
-            print(
-                f"  {Colors.DIM}Epoch {epoch + 1}: "
-                f"loss={avg_epoch_loss:.4f}, "
-                f"H={high_steps}, L={low_steps}, "
-                f"elapsed={elapsed:.1f}s{Colors.RESET}"
-            )
+            parts = [f"Epoch {epoch + 1}: loss={avg_epoch_loss:.4f}"]
+            if avg_h is not None:
+                parts.append(f"H={avg_h:.4f}")
+            if avg_l is not None:
+                parts.append(f"L={avg_l:.4f}")
+            parts.append(f"H_steps={high_steps}, L_steps={low_steps}")
+            parts.append(f"elapsed={elapsed:.1f}s")
+            print(f"  {Colors.DIM}{', '.join(parts)}{Colors.RESET}")
 
         # Checkpoint
         if save_freq > 0 and (epoch + 1) % save_freq == 0:

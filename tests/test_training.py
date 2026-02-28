@@ -644,6 +644,52 @@ class TestPreviewSignature:
         assert result is None
 
 
+class TestDualLossHistory:
+    """Test LossHistory with separate H/L expert tracking."""
+
+    def test_dual_loss_append(self):
+        """Test that expert tags route to correct series."""
+        from mlx_video.training.plotting import LossHistory
+
+        h = LossHistory()
+        h.append(1, 0.15, expert="H")
+        h.append(1, 0.06, expert="L")
+        h.append(2, 0.12, expert="H")
+        h.append(2, 0.05)  # no expert tag
+
+        assert len(h) == 4
+        assert h.high_steps == [1, 2]
+        assert h.high_losses == [0.15, 0.12]
+        assert h.low_steps == [1]
+        assert h.low_losses == [0.06]
+
+    def test_dual_loss_empty_by_default(self):
+        """Test that H/L series are empty when no expert tags used."""
+        from mlx_video.training.plotting import LossHistory
+
+        h = LossHistory()
+        h.append(1, 0.10)
+        h.append(2, 0.08)
+
+        assert h.high_losses == []
+        assert h.low_losses == []
+        assert len(h) == 2
+
+    def test_plot_loss_with_dual_series(self, tmp_path):
+        """Test that plot_loss handles dual H/L series without error."""
+        from mlx_video.training.plotting import LossHistory, plot_loss
+
+        h = LossHistory()
+        for i in range(1, 11):
+            h.append(i, 0.15 - i * 0.005, expert="H")
+            h.append(i, 0.08 - i * 0.003, expert="L")
+
+        out = tmp_path / "dual_loss.png"
+        plot_loss(h, out)
+        assert out.exists()
+        assert out.stat().st_size > 0
+
+
 class TestBaseLoRAConfig:
     """Test base_loras config parsing and validation."""
 
