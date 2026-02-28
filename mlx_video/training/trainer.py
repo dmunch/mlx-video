@@ -240,6 +240,13 @@ def train(
 
     loss_and_grad = nn.value_and_grad(model, loss_fn)
 
+    # Wrap forward+backward+optimizer into a step function so that
+    # the `grads` reference is released before mx.eval (reduces peak memory).
+    def step(items_batch, sigmas, noises):
+        loss, grads = loss_and_grad(model, items_batch, sigmas, noises)
+        optimizer.update(model, grads)
+        return loss
+
     # Training loop
     steps_per_epoch = max(1, len(encoded_data) // batch_size)
     total_steps = num_epochs * steps_per_epoch
@@ -287,9 +294,10 @@ def train(
             sigma = _sample_timestep(1000, sampling, rng, sigma_min, sigma_max)
             noise = mx.random.normal(shape=item.clean_latents.shape)
             bl = compute_loss(model, item, sigma, noise, text_len, shift)
-            mx.eval(bl)
-            baseline_losses.append(bl.item())
-        baseline_loss = sum(baseline_losses) / len(baseline_losses)
+            baseline_losses.append(bl)
+        # Single eval for all baseline losses (avoids N sync barriers)
+        mx.eval(*baseline_losses)
+        baseline_loss = sum(bl.item() for bl in baseline_losses) / len(baseline_losses)
         loss_history.append(0, baseline_loss)
         loss_history.baseline = baseline_loss
         running_loss += baseline_loss
@@ -341,10 +349,9 @@ def train(
                 for i in range(batch_size)
             ]
 
-            # Forward + backward
-            loss, grads = loss_and_grad(model, items_batch, sigmas, noises)
-            optimizer.update(model, grads)
-            mx.eval(model.parameters(), optimizer.state)
+            # Forward + backward + optimizer (grads released inside step)
+            loss = step(items_batch, sigmas, noises)
+            mx.eval(loss, model.parameters(), optimizer.state)
 
             loss_val = loss.item()
             epoch_loss += loss_val
@@ -479,6 +486,17 @@ def train_simultaneous(
     high_loss_and_grad = nn.value_and_grad(high_model, high_loss_fn)
     low_loss_and_grad = nn.value_and_grad(low_model, low_loss_fn)
 
+    # Wrap in step functions to release grads before eval (reduces peak memory)
+    def high_step(items_batch, sigmas, noises):
+        loss, grads = high_loss_and_grad(high_model, items_batch, sigmas, noises)
+        high_optimizer.update(high_model, grads)
+        return loss
+
+    def low_step(items_batch, sigmas, noises):
+        loss, grads = low_loss_and_grad(low_model, items_batch, sigmas, noises)
+        low_optimizer.update(low_model, grads)
+        return loss
+
     # Training loop
     steps_per_epoch = max(1, len(encoded_data) // batch_size)
     total_steps = num_epochs * steps_per_epoch
@@ -570,16 +588,14 @@ def train_simultaneous(
 
             if use_high:
                 sigmas = [_sample_timestep(1000, sampling, rng, boundary, 1.0) for _ in range(batch_size)]
-                loss, grads = high_loss_and_grad(high_model, items_batch, sigmas, noises)
-                high_optimizer.update(high_model, grads)
-                mx.eval(high_model.parameters(), high_optimizer.state)
+                loss = high_step(items_batch, sigmas, noises)
+                mx.eval(loss, high_model.parameters(), high_optimizer.state)
                 high_steps += 1
                 expert_tag = "H"
             else:
                 sigmas = [_sample_timestep(1000, sampling, rng, 0.0, boundary) for _ in range(batch_size)]
-                loss, grads = low_loss_and_grad(low_model, items_batch, sigmas, noises)
-                low_optimizer.update(low_model, grads)
-                mx.eval(low_model.parameters(), low_optimizer.state)
+                loss = low_step(items_batch, sigmas, noises)
+                mx.eval(loss, low_model.parameters(), low_optimizer.state)
                 low_steps += 1
                 expert_tag = "L"
 
