@@ -468,6 +468,17 @@ def train_simultaneous(
 
     t_start = time.time()
 
+    # --- Baseline preview (before any training, uses low model for character detail) ---
+    if preview_freq > 0:
+        from mlx_video.training.preview import generate_preview
+
+        preview_path = generate_preview(
+            low_model, config, encoded_data, 0, output_dir,
+            steps=preview_steps, guide_scale=preview_guide_scale,
+        )
+        if preview_path:
+            print(f"  {Colors.GREEN}✓ Baseline preview: {preview_path}{Colors.RESET}")
+
     # Track which expert is active (for alternating mode)
     current_expert = "high"  # start with high
     steps_on_current = 0
