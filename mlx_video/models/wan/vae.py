@@ -367,7 +367,7 @@ class Encoder3d(nn.Module):
         if dim_mult is None:
             dim_mult = [1, 2, 4, 4]
         if temporal_downsample is None:
-            temporal_downsample = [True, True, False]
+            temporal_downsample = [False, True, True]
 
         dims = [dim * u for u in [1] + dim_mult]
 

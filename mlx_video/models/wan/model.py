@@ -151,17 +151,9 @@ class WanModel(nn.Module):
         # Output head
         self.head = Head(dim, config.out_dim, config.patch_size, config.eps)
 
-        # Precompute RoPE frequencies
-        d = dim // config.num_heads
-        d_t = d - 4 * (d // 6)
-        d_h = 2 * (d // 6)
-        d_w = 2 * (d // 6)
-        # Each rope_params returns [1024, d_x//2, 2]
-        freqs_t = rope_params(1024, d_t)
-        freqs_h = rope_params(1024, d_h)
-        freqs_w = rope_params(1024, d_w)
-        # Concatenate along the frequency dimension: [1024, d//2, 2]
-        self.freqs = mx.concatenate([freqs_t, freqs_h, freqs_w], axis=1)
+        # Precompute RoPE frequencies — single table, split by rope_apply
+        # Reference computes one rope_params(head_dim) and splits into t/h/w.
+        self.freqs = rope_params(1024, dim // config.num_heads)
 
         # Precompute sinusoidal inv_freq for time embedding
         half = config.freq_dim // 2
