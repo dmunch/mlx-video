@@ -435,3 +435,210 @@ class TestTimestepSampling:
         mean = sum(samples) / len(samples)
         # High bias: mean should be above 0.5
         assert mean > 0.55
+
+
+class TestCheckpointRoundtrip:
+    """Test checkpoint save/load for single and dual expert training."""
+
+    def _make_lora_model(self):
+        """Create a tiny model with LoRA layers for testing."""
+        from mlx_video.training.lora_layers import TrainableLoRALinear
+
+        class TinyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(8, 8)
+
+            def named_modules(self):
+                yield "linear", self.linear
+
+        model = TinyModel()
+        model.linear = TrainableLoRALinear(model.linear, rank=4, alpha=4.0)
+        return model
+
+    def _make_config(self, tmp_path):
+        """Create a minimal TrainingConfig for testing."""
+        from mlx_video.training.config import LoRAConfig, TrainingConfig
+
+        config = TrainingConfig.__new__(TrainingConfig)
+        config.model_dir = str(tmp_path / "model")
+        config.resolution = 512
+        config.seed = 42
+        config.trigger_word = "test"
+        config.lora = LoRAConfig(rank=4, alpha=4.0)
+        return config
+
+    def test_single_checkpoint_roundtrip(self, tmp_path):
+        """Test save and load of a single-expert checkpoint zip."""
+        import mlx.optimizers as optim
+
+        from mlx_video.training.save import load_checkpoint, save_checkpoint
+
+        model = self._make_lora_model()
+        optimizer = optim.AdamW(learning_rate=1e-4)
+        optimizer.init(model.trainable_parameters())
+
+        # Set known LoRA values
+        model.linear.lora_A = mx.ones_like(model.linear.lora_A) * 0.5
+        model.linear.lora_B = mx.ones_like(model.linear.lora_B) * 0.3
+        mx.eval(model.parameters(), optimizer.state)
+
+        config = self._make_config(tmp_path)
+        ckpt_path = str(tmp_path / "checkpoint.zip")
+
+        save_checkpoint(
+            model,
+            optimizer,
+            config,
+            epoch=10,
+            global_step=100,
+            loss_history_data=[(1, 0.5), (2, 0.4)],
+            output_path=ckpt_path,
+            expert_label="low",
+        )
+
+        # Verify zip contents
+        import zipfile
+
+        with zipfile.ZipFile(ckpt_path) as zf:
+            names = zf.namelist()
+            assert "lora_weights.safetensors" in names
+            assert "optimizer_state.safetensors" in names
+            assert "state.json" in names
+            assert "config.json" in names
+
+        # Load into fresh model
+        model2 = self._make_lora_model()
+        opt2 = optim.AdamW(learning_rate=1e-4)
+        opt2.init(model2.trainable_parameters())
+        mx.eval(model2.parameters(), opt2.state)
+
+        state = load_checkpoint(ckpt_path, model2, opt2)
+
+        assert state["epoch"] == 10
+        assert state["global_step"] == 100
+        assert state["expert_label"] == "low"
+        assert len(state["loss_history"]) == 2
+
+        # Verify LoRA weights restored
+        assert mx.allclose(
+            model2.linear.lora_A, mx.ones_like(model2.linear.lora_A) * 0.5
+        ).item()
+        assert mx.allclose(
+            model2.linear.lora_B, mx.ones_like(model2.linear.lora_B) * 0.3
+        ).item()
+
+    def test_dual_checkpoint_roundtrip(self, tmp_path):
+        """Test save and load of a dual-expert checkpoint zip."""
+        import mlx.optimizers as optim
+
+        from mlx_video.training.save import (
+            load_dual_checkpoint,
+            save_dual_checkpoint,
+        )
+
+        high_model = self._make_lora_model()
+        low_model = self._make_lora_model()
+        high_opt = optim.AdamW(learning_rate=1e-4)
+        low_opt = optim.AdamW(learning_rate=1e-4)
+        high_opt.init(high_model.trainable_parameters())
+        low_opt.init(low_model.trainable_parameters())
+
+        # Set distinct known values for each expert
+        high_model.linear.lora_A = mx.ones_like(high_model.linear.lora_A) * 0.7
+        high_model.linear.lora_B = mx.ones_like(high_model.linear.lora_B) * 0.9
+        low_model.linear.lora_A = mx.ones_like(low_model.linear.lora_A) * 0.2
+        low_model.linear.lora_B = mx.ones_like(low_model.linear.lora_B) * 0.4
+        mx.eval(
+            high_model.parameters(),
+            low_model.parameters(),
+            high_opt.state,
+            low_opt.state,
+        )
+
+        config = self._make_config(tmp_path)
+        ckpt_path = str(tmp_path / "dual_checkpoint.zip")
+
+        save_dual_checkpoint(
+            high_model,
+            low_model,
+            high_opt,
+            low_opt,
+            config,
+            epoch=5,
+            global_step=50,
+            loss_history_data=[(1, 0.8)],
+            output_path=ckpt_path,
+        )
+
+        # Verify zip contents
+        import zipfile
+
+        with zipfile.ZipFile(ckpt_path) as zf:
+            names = zf.namelist()
+            assert "lora_high_noise.safetensors" in names
+            assert "lora_low_noise.safetensors" in names
+            assert "high_optimizer_state.safetensors" in names
+            assert "low_optimizer_state.safetensors" in names
+            assert "state.json" in names
+            assert "config.json" in names
+
+        # Load into fresh models
+        high2 = self._make_lora_model()
+        low2 = self._make_lora_model()
+        high_opt2 = optim.AdamW(learning_rate=1e-4)
+        low_opt2 = optim.AdamW(learning_rate=1e-4)
+        high_opt2.init(high2.trainable_parameters())
+        low_opt2.init(low2.trainable_parameters())
+        mx.eval(high2.parameters(), low2.parameters(), high_opt2.state, low_opt2.state)
+
+        state = load_dual_checkpoint(ckpt_path, high2, low2, high_opt2, low_opt2)
+
+        assert state["epoch"] == 5
+        assert state["expert_mode"] == "simultaneous"
+
+        # Verify distinct weights restored to correct models
+        assert mx.allclose(
+            high2.linear.lora_A, mx.ones_like(high2.linear.lora_A) * 0.7
+        ).item()
+        assert mx.allclose(
+            low2.linear.lora_A, mx.ones_like(low2.linear.lora_A) * 0.2
+        ).item()
+        assert mx.allclose(
+            high2.linear.lora_B, mx.ones_like(high2.linear.lora_B) * 0.9
+        ).item()
+        assert mx.allclose(
+            low2.linear.lora_B, mx.ones_like(low2.linear.lora_B) * 0.4
+        ).item()
+
+    def test_checkpoint_missing_file_raises(self):
+        """Test that loading a nonexistent checkpoint raises FileNotFoundError."""
+        from mlx_video.training.save import load_checkpoint
+
+        with pytest.raises(FileNotFoundError):
+            load_checkpoint("/nonexistent/path.zip", None, None)
+
+
+class TestPreviewSignature:
+    """Test preview function signature and CFG parameter handling."""
+
+    def test_generate_preview_accepts_guide_scale(self):
+        """Test that generate_preview has guide_scale parameter with correct default."""
+        import inspect
+
+        from mlx_video.training.preview import generate_preview
+
+        sig = inspect.signature(generate_preview)
+        assert "guide_scale" in sig.parameters
+        assert sig.parameters["guide_scale"].default == 7.5
+        assert sig.parameters["steps"].default == 50
+
+    def test_generate_preview_returns_none_on_error(self):
+        """Test that generate_preview catches errors and returns None."""
+        from mlx_video.training.preview import generate_preview
+
+        # Pass invalid inputs — should catch the error, not crash
+        result = generate_preview(
+            model=None, config=None, encoded_data=[], epoch=0, output_dir="/tmp"
+        )
+        assert result is None
