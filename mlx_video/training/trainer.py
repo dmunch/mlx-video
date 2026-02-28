@@ -397,6 +397,7 @@ def train_simultaneous(
     sampling = config.training.timestep_sampling
     routing = config.training.expert_routing
     switch_every = config.training.switch_every
+    high_ratio = config.training.high_ratio
     log_freq = config.monitoring.log_frequency
     plot_freq = config.monitoring.plot_frequency
     preview_freq = config.monitoring.generate_image_frequency
@@ -457,7 +458,11 @@ def train_simultaneous(
     print(f"  Expert boundary: σ={boundary:.3f} (alternating each step)")
     print(f"  Shift: {shift}")
     print(f"  Optimizer: {config.training.optimizer}")
-    routing_desc = f"alternating (switch every {switch_every})" if routing == "alternating" else "proportional (σ-based)"
+    if routing == "alternating":
+        routing_desc = f"alternating (switch every {switch_every})"
+    else:
+        effective = high_ratio if high_ratio is not None else (1.0 - boundary)
+        routing_desc = f"proportional (H ratio={effective:.1%})"
     print(f"  Expert routing: {routing_desc}")
     print(f"{Colors.RESET}")
 
@@ -505,9 +510,9 @@ def train_simultaneous(
                     current_expert = "low" if current_expert == "high" else "high"
                     steps_on_current = 0
             else:
-                # Proportional: sample σ from full [0,1], route by boundary
-                probe_sigma = _sample_timestep(1000, sampling, rng)
-                use_high = probe_sigma >= boundary
+                # Proportional: use high_ratio if set, else derive from boundary
+                effective_ratio = high_ratio if high_ratio is not None else (1.0 - boundary)
+                use_high = rng.random() < effective_ratio
 
             if use_high:
                 sigmas = [_sample_timestep(1000, sampling, rng, boundary, 1.0) for _ in range(batch_size)]

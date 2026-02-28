@@ -98,31 +98,38 @@ The 0.875 boundary is baked into Wan2.2's architecture — it's where the model 
 
 | Strategy | Config | H/L Split | Best for |
 |----------|--------|-----------|----------|
-| **Alternating** | `"alternating"` | 50/50 | Balanced motion + identity (recommended) |
-| **Proportional** | `"proportional"` | ~12.5% / ~87.5% | Maximum identity focus, less motion training |
+| **Alternating** | `"alternating"` | 50/50 | Balanced motion + identity |
+| **Proportional** | `"proportional"` | configurable | Identity focus with tunable H ratio |
 
 **Alternating** (default): Switches between experts every `switch_every` steps. Each expert samples σ only from its own range. This matches AI Toolkit's `switch_boundary_every` approach and ensures the high-noise expert gets sufficient training for good motion and composition.
 
 ```json
 "training": {
   "expert_routing": "alternating",
-  "switch_every": 1
+  "switch_every": 7
 }
 ```
 
-**Proportional**: Samples σ uniformly from [0, 1] and routes to whichever expert owns that σ range. The high-noise expert naturally gets ~12.5% of steps. This mirrors the natural sigma distribution and focuses most training on identity/details, but the high-noise expert may be undertrained for motion.
+**Proportional**: Each step probabilistically selects H or L based on `high_ratio`. By default (`high_ratio: null`), the ratio is derived from the model's architectural boundary: `1 - 0.875 = 12.5%` H. You can override this to increase H training without going to a full 50/50 split.
 
 ```json
 "training": {
-  "expert_routing": "proportional"
+  "expert_routing": "proportional",
+  "high_ratio": 0.25
 }
 ```
 
+| `high_ratio` | H share | Use case |
+|---|---|---|
+| `null` (default) | ~12.5% | Natural boundary split, maximum L/identity focus |
+| `0.25` | ~25% | Recommended for image-based character training |
+| `0.4` | ~40% | More structural learning, closer to alternating |
+
 ### Guidance
 
-- **Start with `alternating`** (default) — it's what AI Toolkit uses and ensures both experts learn well
-- Try `proportional` if your character looks right but you want even sharper identity at the cost of slightly less motion quality
-- For character LoRAs, `alternating` + `timestep_sampling: balanced` is the safest combination
+- For **image-based character training**: Use `proportional` with `high_ratio: 0.25`. Images can't teach motion, so focus most budget on L (identity/details) with enough H (25%) for structural learning
+- For **video-based training** (future): Use `alternating` to ensure both motion (H) and identity (L) get equal training
+- `alternating` + `timestep_sampling: balanced` is the safest all-purpose combination
 
 ### Understanding `switch_every`
 

@@ -35,6 +35,7 @@ class TrainingLoopConfig:
     expert_mode: str = "simultaneous"  # "simultaneous", "sequential"
     expert_routing: str = "alternating"  # "alternating", "proportional"
     switch_every: int = 1  # steps per expert before switching (alternating only)
+    high_ratio: Optional[float] = None  # H expert probability (proportional only; None = 1-boundary)
 
 
 @dataclass
@@ -261,6 +262,13 @@ def _validate(config: TrainingConfig, data_dir: Path) -> None:
         raise ValueError(
             f"switch_every must be >= 1, got {config.training.switch_every}"
         )
+
+    if config.training.high_ratio is not None:
+        if not (0.0 < config.training.high_ratio < 1.0):
+            raise ValueError(
+                f"high_ratio must be between 0.0 and 1.0 (exclusive), "
+                f"got {config.training.high_ratio}"
+            )
 
     valid_base_lora_experts = {"both", "high", "low"}
     for i, bl in enumerate(config.base_loras):

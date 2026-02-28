@@ -838,3 +838,36 @@ class TestPreviewConfigFields:
         config_path = self._make_config_json(tmp_path)
         config = TrainingConfig.from_json(str(config_path))
         assert config.training.shift is None
+
+    def test_high_ratio_parsed(self, tmp_path):
+        """Test high_ratio is parsed from config."""
+        from mlx_video.training.config import TrainingConfig
+
+        config_path = self._make_config_json(
+            tmp_path,
+            {"training": {"high_ratio": 0.25}},
+        )
+        config = TrainingConfig.from_json(str(config_path))
+        assert config.training.high_ratio == 0.25
+
+    def test_high_ratio_default_none(self, tmp_path):
+        """Test high_ratio defaults to None (derive from boundary)."""
+        from mlx_video.training.config import TrainingConfig
+
+        config_path = self._make_config_json(tmp_path)
+        config = TrainingConfig.from_json(str(config_path))
+        assert config.training.high_ratio is None
+
+    def test_high_ratio_invalid_rejected(self, tmp_path):
+        """Test high_ratio outside (0, 1) is rejected."""
+        from mlx_video.training.config import TrainingConfig
+
+        for i, bad_value in enumerate([0.0, 1.0, -0.1, 1.5]):
+            sub = tmp_path / f"run_{i}"
+            sub.mkdir()
+            config_path = self._make_config_json(
+                sub,
+                {"training": {"high_ratio": bad_value}},
+            )
+            with pytest.raises(ValueError, match="high_ratio"):
+                TrainingConfig.from_json(str(config_path))
