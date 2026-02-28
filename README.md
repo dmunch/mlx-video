@@ -302,6 +302,121 @@ Set `--teacache-thresh 0` (the default) to disable. Higher thresholds = more spe
 
 ---
 
+## LoRA Training (Wan2.2)
+
+Train character/style LoRA adapters from a small set of images. The trainer uses single-frame flow-matching loss with balanced timestep sampling, optimized for Apple Silicon.
+
+### Training Data Format
+
+Create a directory with images and matching `.txt` prompt files:
+
+```
+training_data/
+  image1.png
+  image1.txt        # "A photo of ohwx sitting on a bench"
+  image2.jpg
+  image2.txt        # "A close-up of ohwx smiling"
+  image3.webp
+  image3.txt        # "ohwx walking through a park"
+```
+
+Each `.txt` file contains the prompt describing the corresponding image. Use a consistent trigger word (e.g., `ohwx`) to represent your character.
+
+### Training Config
+
+Create a JSON config file (e.g., `train.json`):
+
+```json
+{
+  "model_dir": "/path/to/wan22_mlx_model",
+  "data": "./training_data/",
+  "trigger_word": "ohwx",
+  "seed": 42,
+  "resolution": 512,
+  "training": {
+    "num_epochs": 50,
+    "batch_size": 1,
+    "learning_rate": 1e-4,
+    "timestep_sampling": "balanced"
+  },
+  "lora": {
+    "rank": 32,
+    "alpha": 32,
+    "targets": [
+      "self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
+      "cross_attn.q", "cross_attn.k", "cross_attn.v", "cross_attn.o",
+      "ffn.fc1", "ffn.fc2"
+    ],
+    "blocks": { "start": 0, "end": 40 }
+  },
+  "checkpoint": {
+    "save_frequency": 25,
+    "output_dir": "./training_output/"
+  },
+  "monitoring": {
+    "plot_frequency": 10,
+    "generate_image_frequency": 100,
+    "preview_width": 512,
+    "preview_height": 512
+  }
+}
+```
+
+### Run Training
+
+```bash
+python -m mlx_video.train_wan --config train.json
+```
+
+### Training Config Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `model_dir` | (required) | Path to converted MLX Wan2.2 weights |
+| `data` | (required) | Directory with image/prompt pairs |
+| `trigger_word` | `""` | Trigger word for your subject |
+| `resolution` | `512` | Training resolution (must be ≥ 64, divisible by 32) |
+| `seed` | `42` | Random seed |
+| `training.num_epochs` | `50` | Number of training epochs |
+| `training.batch_size` | `1` | Batch size (1 recommended for memory) |
+| `training.learning_rate` | `1e-4` | AdamW learning rate |
+| `training.timestep_sampling` | `"balanced"` | Timestep bias: `balanced`, `low_bias`, or `high_bias` |
+| `lora.rank` | `32` | LoRA rank (lower = smaller file, higher = more capacity) |
+| `lora.alpha` | `32` | LoRA scaling factor |
+| `lora.targets` | all attn + ffn | Which layers to apply LoRA to |
+| `lora.blocks.start/end` | `0` / `40` | Block range for LoRA injection |
+| `checkpoint.save_frequency` | `25` | Save checkpoint every N epochs |
+| `checkpoint.output_dir` | `./training_output/` | Output directory for LoRA weights |
+| `monitoring.plot_frequency` | `10` | Update loss plot PNG every N epochs |
+| `monitoring.generate_image_frequency` | `0` | Generate preview image every N epochs (0 = disabled) |
+| `monitoring.preview_width` | `512` | Width of preview images |
+| `monitoring.preview_height` | `512` | Height of preview images |
+
+### Timestep Sampling
+
+Wan2.2 uses a dual-model pipeline (high-noise and low-noise models). The timestep sampling strategy affects what the LoRA learns:
+
+- **`balanced`** (default): Uniform sampling across all timesteps. Good general-purpose setting.
+- **`low_bias`**: Favors low-noise timesteps. Better for character identity and fine details.
+- **`high_bias`**: Favors high-noise timesteps. Better for composition and motion patterns.
+
+For character LoRAs, use `balanced` or `low_bias`.
+
+### Using Trained LoRAs
+
+After training, use the saved LoRA with the existing inference pipeline:
+
+```bash
+python -m mlx_video.generate_wan \
+    --prompt "A video of ohwx dancing in a garden" \
+    --lora ./training_output/lora_epoch_50.safetensors \
+    --lora-scale 1.0
+```
+
+The trained LoRA files are saved in diffusers-compatible safetensors format and work with both mlx-video and other tools (ai-toolkit, ComfyUI, etc.).
+
+---
+
 ## Requirements
 
 - macOS with Apple Silicon
@@ -315,10 +430,17 @@ Set `--teacache-thresh 0` (the default) to disable. Higher thresholds = more spe
 mlx_video/
 ├── generate.py              # LTX-2 generation pipeline
 ├── generate_wan.py          # Wan2.1/2.2 generation pipeline
+├── train_wan.py             # Wan2.2 LoRA training CLI
 ├── convert.py               # LTX-2 weight conversion
 ├── convert_wan.py           # Wan weight conversion (PyTorch → MLX)
 ├── postprocess.py           # Video post-processing utilities
 ├── utils.py                 # Helper functions
+├── training/                # LoRA training pipeline
+│   ├── config.py            # Training config (JSON parsing)
+│   ├── dataset.py           # Image/prompt encoding (VAE + T5)
+│   ├── lora_layers.py       # Trainable LoRA layer injection
+│   ├── trainer.py           # Flow-matching training loop
+│   └── save.py              # LoRA weight saving (safetensors)
 └── models/
     ├── ltx/                 # LTX-2 model
     │   ├── ltx.py           # DiT transformer

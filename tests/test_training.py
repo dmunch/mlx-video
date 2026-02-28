@@ -1,0 +1,437 @@
+"""Tests for Wan2.2 LoRA training components."""
+
+import json
+
+import mlx.core as mx
+import mlx.nn as nn
+import pytest
+
+
+class TestTrainingConfig:
+    """Test config parsing and data discovery."""
+
+    def test_config_from_json(self, tmp_path):
+        """Test basic config loading with data discovery."""
+        # Create data directory with images and prompts
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+
+        # Create fake image files (1x1 PNG)
+        from PIL import Image
+
+        for i in range(3):
+            img = Image.new("RGB", (64, 64), color=(i * 50, 100, 200))
+            img.save(data_dir / f"img{i}.png")
+            (data_dir / f"img{i}.txt").write_text(f"A photo of a cat number {i}")
+
+        # Create a fake model dir
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        # Save a minimal config.json
+        model_config = {
+            "model_version": "2.2",
+            "dim": 5120,
+            "num_layers": 40,
+            "dual_model": True,
+        }
+        (model_dir / "config.json").write_text(json.dumps(model_config))
+
+        # Create config JSON
+        config = {
+            "model_dir": str(model_dir),
+            "data": str(data_dir),
+            "seed": 123,
+            "resolution": 512,
+            "trigger_word": "ohwx",
+            "training": {
+                "num_epochs": 10,
+                "batch_size": 1,
+                "learning_rate": 1e-4,
+            },
+            "lora": {
+                "rank": 16,
+                "alpha": 16.0,
+                "targets": ["self_attn.q", "self_attn.v"],
+                "blocks": {"start": 0, "end": 5},
+            },
+            "checkpoint": {
+                "save_frequency": 5,
+                "output_dir": str(tmp_path / "output"),
+            },
+        }
+        config_path = tmp_path / "train.json"
+        config_path.write_text(json.dumps(config))
+
+        from mlx_video.training.config import TrainingConfig
+
+        tc = TrainingConfig.from_json(str(config_path))
+
+        assert tc.seed == 123
+        assert tc.resolution == 512
+        assert tc.trigger_word == "ohwx"
+        assert len(tc.data_items) == 3
+        assert tc.lora.rank == 16
+        assert tc.lora.blocks.start == 0
+        assert tc.lora.blocks.end == 5
+        assert tc.training.num_epochs == 10
+
+        # Check trigger word was prepended
+        for item in tc.data_items:
+            assert item.prompt.startswith("ohwx")
+
+    def test_config_validates_resolution(self, tmp_path):
+        """Test that invalid resolution is rejected."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        from PIL import Image
+
+        img = Image.new("RGB", (64, 64))
+        img.save(data_dir / "img.png")
+        (data_dir / "img.txt").write_text("test")
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}")
+
+        config = {
+            "model_dir": str(model_dir),
+            "data": str(data_dir),
+            "resolution": 96 + 16,  # 112, not divisible by 32 but >= 64
+        }
+        config_path = tmp_path / "train.json"
+        config_path.write_text(json.dumps(config))
+
+        from mlx_video.training.config import TrainingConfig
+
+        with pytest.raises(ValueError, match="divisible by 32"):
+            TrainingConfig.from_json(str(config_path))
+
+    def test_config_missing_prompt(self, tmp_path):
+        """Test that missing prompt file raises error."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        from PIL import Image
+
+        img = Image.new("RGB", (64, 64))
+        img.save(data_dir / "img.png")
+        # No img.txt
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}")
+
+        config = {
+            "model_dir": str(model_dir),
+            "data": str(data_dir),
+        }
+        config_path = tmp_path / "train.json"
+        config_path.write_text(json.dumps(config))
+
+        from mlx_video.training.config import TrainingConfig
+
+        with pytest.raises(ValueError, match="Missing prompt file"):
+            TrainingConfig.from_json(str(config_path))
+
+    def test_monitoring_config_defaults(self, tmp_path):
+        """Test that monitoring config fields have correct defaults."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        from PIL import Image
+
+        img = Image.new("RGB", (64, 64))
+        img.save(data_dir / "img.png")
+        (data_dir / "img.txt").write_text("test prompt")
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}")
+
+        config = {"model_dir": str(model_dir), "data": str(data_dir)}
+        config_path = tmp_path / "train.json"
+        config_path.write_text(json.dumps(config))
+
+        from mlx_video.training.config import TrainingConfig
+
+        tc = TrainingConfig.from_json(str(config_path))
+        assert tc.monitoring.log_frequency == 1
+        assert tc.monitoring.plot_frequency == 10
+        assert tc.monitoring.generate_image_frequency == 0
+        assert tc.monitoring.preview_width == 512
+        assert tc.monitoring.preview_height == 512
+
+    def test_monitoring_config_custom(self, tmp_path):
+        """Test that monitoring config fields parse from JSON."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        from PIL import Image
+
+        img = Image.new("RGB", (64, 64))
+        img.save(data_dir / "img.png")
+        (data_dir / "img.txt").write_text("test prompt")
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}")
+
+        config = {
+            "model_dir": str(model_dir),
+            "data": str(data_dir),
+            "monitoring": {
+                "plot_frequency": 5,
+                "generate_image_frequency": 50,
+                "preview_width": 256,
+                "preview_height": 384,
+            },
+        }
+        config_path = tmp_path / "train.json"
+        config_path.write_text(json.dumps(config))
+
+        from mlx_video.training.config import TrainingConfig
+
+        tc = TrainingConfig.from_json(str(config_path))
+        assert tc.monitoring.plot_frequency == 5
+        assert tc.monitoring.generate_image_frequency == 50
+        assert tc.monitoring.preview_width == 256
+        assert tc.monitoring.preview_height == 384
+
+    def test_preview_prompt_from_data(self, tmp_path):
+        """Test that preview_prompt defaults to first training sample."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        from PIL import Image
+
+        img = Image.new("RGB", (64, 64))
+        img.save(data_dir / "img.png")
+        (data_dir / "img.txt").write_text("a photo of a cat")
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}")
+
+        config = {"model_dir": str(model_dir), "data": str(data_dir)}
+        config_path = tmp_path / "train.json"
+        config_path.write_text(json.dumps(config))
+
+        from mlx_video.training.config import TrainingConfig
+
+        tc = TrainingConfig.from_json(str(config_path))
+        assert tc.preview_prompt == "a photo of a cat"
+
+    def test_preview_prompt_from_file(self, tmp_path):
+        """Test that preview.txt overrides default preview prompt."""
+        data_dir = tmp_path / "data"
+        data_dir.mkdir()
+        from PIL import Image
+
+        img = Image.new("RGB", (64, 64))
+        img.save(data_dir / "img.png")
+        (data_dir / "img.txt").write_text("training prompt")
+        (data_dir / "preview.txt").write_text("custom preview prompt")
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}")
+
+        config = {"model_dir": str(model_dir), "data": str(data_dir)}
+        config_path = tmp_path / "train.json"
+        config_path.write_text(json.dumps(config))
+
+        from mlx_video.training.config import TrainingConfig
+
+        tc = TrainingConfig.from_json(str(config_path))
+        assert tc.preview_prompt == "custom preview prompt"
+
+
+class TestLoRALayers:
+    """Test LoRA layer injection and freezing."""
+
+    def test_trainable_lora_linear(self):
+        """Test TrainableLoRALinear forward pass."""
+        from mlx_video.training.lora_layers import TrainableLoRALinear
+
+        linear = nn.Linear(64, 128)
+        lora = TrainableLoRALinear(linear, rank=8, alpha=8.0)
+
+        x = mx.random.normal((2, 64))
+        output = lora(x)
+        assert output.shape == (2, 128)
+
+        # Initially lora_B is zero, so output should equal base linear output
+        base_output = linear(x)
+        mx.eval(output, base_output)
+        assert mx.allclose(output, base_output, atol=1e-5).item()
+
+    def test_inject_lora_layers(self):
+        """Test LoRA injection into a simple model with blocks."""
+        from mlx_video.training.config import BlockRange, LoRAConfig
+        from mlx_video.training.lora_layers import (
+            TrainableLoRALinear,
+            inject_lora_layers,
+        )
+
+        # Create a minimal model-like structure
+        class FakeAttn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q = nn.Linear(64, 64)
+                self.k = nn.Linear(64, 64)
+                self.v = nn.Linear(64, 64)
+                self.o = nn.Linear(64, 64)
+
+        class FakeBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = FakeAttn()
+
+        class FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = [FakeBlock() for _ in range(4)]
+
+        model = FakeModel()
+        lora_config = LoRAConfig(
+            rank=8,
+            alpha=8.0,
+            targets=["self_attn.q", "self_attn.v"],
+            blocks=BlockRange(start=0, end=2),
+        )
+
+        count = inject_lora_layers(model, lora_config)
+        assert count == 4  # 2 targets x 2 blocks
+
+        # Verify injection
+        assert isinstance(model.blocks[0].self_attn.q, TrainableLoRALinear)
+        assert isinstance(model.blocks[0].self_attn.v, TrainableLoRALinear)
+        assert isinstance(model.blocks[1].self_attn.q, TrainableLoRALinear)
+        assert isinstance(model.blocks[1].self_attn.v, TrainableLoRALinear)
+        # Block 2 should NOT be injected
+        assert isinstance(model.blocks[2].self_attn.q, nn.Linear)
+        assert isinstance(model.blocks[2].self_attn.v, nn.Linear)
+
+    def test_freeze_base_weights(self):
+        """Test that freeze_base_weights freezes everything except LoRA params."""
+        from mlx_video.training.lora_layers import (
+            TrainableLoRALinear,
+            freeze_base_weights,
+        )
+
+        linear = nn.Linear(32, 64)
+        lora = TrainableLoRALinear(linear, rank=4, alpha=4.0)
+
+        class SimpleModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer = lora
+                self.other = nn.Linear(32, 32)
+
+        model = SimpleModel()
+        freeze_base_weights(model)
+
+        # LoRA params should be trainable (unfrozen)
+        # This is verified by checking the model's trainable parameters
+        trainable = model.trainable_parameters()
+
+        # Should contain lora_A and lora_B
+        has_lora_a = False
+        has_lora_b = False
+        for key_path, param in _flatten_params(trainable):
+            if "lora_A" in key_path:
+                has_lora_a = True
+            if "lora_B" in key_path:
+                has_lora_b = True
+
+        assert has_lora_a, "lora_A should be trainable"
+        assert has_lora_b, "lora_B should be trainable"
+
+
+def _flatten_params(params, prefix=""):
+    """Helper to flatten nested parameter dict."""
+    results = []
+    if isinstance(params, dict):
+        for k, v in params.items():
+            new_prefix = f"{prefix}.{k}" if prefix else k
+            results.extend(_flatten_params(v, new_prefix))
+    elif isinstance(params, list):
+        for i, v in enumerate(params):
+            new_prefix = f"{prefix}.{i}" if prefix else str(i)
+            results.extend(_flatten_params(v, new_prefix))
+    elif isinstance(params, mx.array):
+        results.append((prefix, params))
+    return results
+
+
+class TestSaveLoRA:
+    """Test LoRA weight saving."""
+
+    def test_collect_and_save(self, tmp_path):
+        """Test that LoRA weights can be collected and saved."""
+        from mlx_video.training.lora_layers import TrainableLoRALinear
+        from mlx_video.training.save import _collect_lora_weights
+
+        class FakeAttn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q = TrainableLoRALinear(nn.Linear(64, 64), rank=4, alpha=4.0)
+
+        class FakeBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = FakeAttn()
+
+        class FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = [FakeBlock(), FakeBlock()]
+
+        model = FakeModel()
+        weights = _collect_lora_weights(model)
+
+        assert len(weights) == 4  # 2 blocks x (lora_A + lora_B)
+        assert "blocks.0.self_attn.q.lora_A.weight" in weights
+        assert "blocks.0.self_attn.q.lora_B.weight" in weights
+        assert "blocks.1.self_attn.q.lora_A.weight" in weights
+        assert "blocks.1.self_attn.q.lora_B.weight" in weights
+
+
+class TestTimestepSampling:
+    """Test timestep sampling strategies."""
+
+    def test_balanced_sampling(self):
+        """Test balanced sampling produces values in (0, 1)."""
+        import random
+
+        from mlx_video.training.trainer import _sample_timestep
+
+        rng = random.Random(42)
+        samples = [_sample_timestep(1000, "balanced", rng) for _ in range(100)]
+
+        assert all(0 < s < 1 for s in samples)
+        # Mean should be roughly 0.5
+        mean = sum(samples) / len(samples)
+        assert 0.3 < mean < 0.7
+
+    def test_low_bias_sampling(self):
+        """Test low_bias sampling is biased toward low sigma."""
+        import random
+
+        from mlx_video.training.trainer import _sample_timestep
+
+        rng = random.Random(42)
+        samples = [_sample_timestep(1000, "low_bias", rng) for _ in range(1000)]
+
+        mean = sum(samples) / len(samples)
+        # Low bias: mean should be below 0.5
+        assert mean < 0.45
+
+    def test_high_bias_sampling(self):
+        """Test high_bias sampling is biased toward high sigma."""
+        import random
+
+        from mlx_video.training.trainer import _sample_timestep
+
+        rng = random.Random(42)
+        samples = [_sample_timestep(1000, "high_bias", rng) for _ in range(1000)]
+
+        mean = sum(samples) / len(samples)
+        # High bias: mean should be above 0.5
+        assert mean > 0.55
