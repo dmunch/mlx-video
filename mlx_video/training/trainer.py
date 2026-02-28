@@ -242,7 +242,7 @@ def train(
 
     # Wrap forward+backward+optimizer into a step function so that
     # the `grads` reference is released before mx.eval (reduces peak memory).
-    def step(items_batch, sigmas, noises):
+    def train_step(items_batch, sigmas, noises):
         loss, grads = loss_and_grad(model, items_batch, sigmas, noises)
         optimizer.update(model, grads)
         return loss
@@ -326,6 +326,7 @@ def train(
 
         epoch_loss = 0.0
         epoch_steps = 0
+        _prev_loss = None  # For deferred async loss reading
 
         pbar = tqdm(
             range(steps_per_epoch),
@@ -334,7 +335,16 @@ def train(
         )
 
         for step in pbar:
-            # Gather batch
+            # Record previous step's deferred loss (ready by now — GPU moved on)
+            if _prev_loss is not None:
+                loss_val = _prev_loss.item()
+                epoch_loss += loss_val
+                running_loss += loss_val
+                loss_count += 1
+                avg_loss = running_loss / loss_count
+                pbar.set_postfix(loss=f"{loss_val:.4f}", avg=f"{avg_loss:.4f}")
+
+            # Gather batch (overlaps with GPU async eval from previous step)
             batch_indices = []
             for b in range(batch_size):
                 idx = (step * batch_size + b) % len(encoded_data)
@@ -349,20 +359,21 @@ def train(
                 for i in range(batch_size)
             ]
 
-            # Forward + backward + optimizer (grads released inside step)
-            loss = step(items_batch, sigmas, noises)
-            mx.eval(loss, model.parameters(), optimizer.state)
-
-            loss_val = loss.item()
-            epoch_loss += loss_val
+            # Forward + backward + optimizer (grads released inside train_step)
+            loss = train_step(items_batch, sigmas, noises)
+            # Async eval: returns immediately, GPU works while Python prepares next batch
+            mx.async_eval(loss, model.parameters(), optimizer.state)
+            _prev_loss = loss
             epoch_steps += 1
-            running_loss += loss_val
-            loss_count += 1
             global_step += 1
 
-            # Update progress bar
-            avg_loss = running_loss / loss_count
-            pbar.set_postfix(loss=f"{loss_val:.4f}", avg=f"{avg_loss:.4f}")
+        # Flush last step's deferred loss
+        if _prev_loss is not None:
+            loss_val = _prev_loss.item()
+            epoch_loss += loss_val
+            running_loss += loss_val
+            loss_count += 1
+            _prev_loss = None
 
         # Record epoch average loss (cleaner than per-step for plotting)
         avg_epoch_loss = epoch_loss / max(1, epoch_steps)
@@ -554,6 +565,8 @@ def train_simultaneous(
         epoch_h_steps = 0
         epoch_l_loss = 0.0
         epoch_l_steps = 0
+        _prev_loss = None  # For deferred async loss reading
+        _prev_expert = None
 
         pbar = tqdm(
             range(steps_per_epoch),
@@ -562,6 +575,25 @@ def train_simultaneous(
         )
 
         for step in pbar:
+            # Record previous step's deferred loss (ready by now — GPU moved on)
+            if _prev_loss is not None:
+                loss_val = _prev_loss.item()
+                epoch_loss += loss_val
+                if _prev_expert == "H":
+                    epoch_h_loss += loss_val
+                    epoch_h_steps += 1
+                else:
+                    epoch_l_loss += loss_val
+                    epoch_l_steps += 1
+                running_loss += loss_val
+                loss_count += 1
+                avg_loss = running_loss / loss_count
+                pbar.set_postfix(
+                    loss=f"{loss_val:.4f}", avg=f"{avg_loss:.4f}", expert=_prev_expert,
+                    H=high_steps, L=low_steps,
+                )
+
+            # Gather batch (overlaps with GPU async eval from previous step)
             batch_indices = []
             for b in range(batch_size):
                 idx = (step * batch_size + b) % len(encoded_data)
@@ -589,20 +621,26 @@ def train_simultaneous(
             if use_high:
                 sigmas = [_sample_timestep(1000, sampling, rng, boundary, 1.0) for _ in range(batch_size)]
                 loss = high_step(items_batch, sigmas, noises)
-                mx.eval(loss, high_model.parameters(), high_optimizer.state)
+                mx.async_eval(loss, high_model.parameters(), high_optimizer.state)
                 high_steps += 1
                 expert_tag = "H"
             else:
                 sigmas = [_sample_timestep(1000, sampling, rng, 0.0, boundary) for _ in range(batch_size)]
                 loss = low_step(items_batch, sigmas, noises)
-                mx.eval(loss, low_model.parameters(), low_optimizer.state)
+                mx.async_eval(loss, low_model.parameters(), low_optimizer.state)
                 low_steps += 1
                 expert_tag = "L"
 
-            loss_val = loss.item()
-            epoch_loss += loss_val
+            _prev_loss = loss
+            _prev_expert = expert_tag
             epoch_steps += 1
-            if expert_tag == "H":
+            global_step += 1
+
+        # Flush last step's deferred loss
+        if _prev_loss is not None:
+            loss_val = _prev_loss.item()
+            epoch_loss += loss_val
+            if _prev_expert == "H":
                 epoch_h_loss += loss_val
                 epoch_h_steps += 1
             else:
@@ -610,13 +648,7 @@ def train_simultaneous(
                 epoch_l_steps += 1
             running_loss += loss_val
             loss_count += 1
-            global_step += 1
-
-            avg_loss = running_loss / loss_count
-            pbar.set_postfix(
-                loss=f"{loss_val:.4f}", avg=f"{avg_loss:.4f}", expert=expert_tag,
-                H=high_steps, L=low_steps,
-            )
+            _prev_loss = None
 
         # Record epoch averages (combined + per-expert)
         avg_epoch_loss = epoch_loss / max(1, epoch_steps)
