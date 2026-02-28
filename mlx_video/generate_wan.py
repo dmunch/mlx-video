@@ -470,6 +470,7 @@ def generate_video(
 
         # Classifier-free guidance + scheduler step
         noise_pred = noise_pred_uncond + gs * (noise_pred_cond - noise_pred_uncond)
+
         latents = sched.step(noise_pred[None], timestep_val, latents[None]).squeeze(0)
 
         # TI2V-5B: re-apply mask to keep first frame frozen
