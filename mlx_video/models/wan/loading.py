@@ -6,14 +6,15 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
-def load_wan_model(model_path: Path, config, quantization: dict | None = None):
-    """Load and initialize WanModel, with optional quantization support.
+def load_wan_model(model_path: Path, config, quantization: dict | None = None, loras: list | None = None):
+    """Load and initialize WanModel, with optional quantization and LoRA support.
 
     Args:
         model_path: Path to model safetensors file
         config: WanModelConfig
         quantization: Optional dict with 'bits' and 'group_size' keys.
                       If provided, creates QuantizedLinear stubs before loading.
+        loras: Optional list of (lora_path, strength) tuples to apply.
     """
     from mlx_video.models.wan.model import WanModel
 
@@ -30,6 +31,13 @@ def load_wan_model(model_path: Path, config, quantization: dict | None = None):
         )
 
     weights = mx.load(str(model_path))
+
+    # Apply LoRAs before loading into model
+    if loras:
+        from mlx_video.convert_wan import load_and_apply_loras
+
+        weights = load_and_apply_loras(dict(weights), loras)
+
     model.load_weights(list(weights.items()), strict=False)
     mx.eval(model.parameters())
     return model

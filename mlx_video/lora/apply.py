@@ -1,0 +1,267 @@
+"""Apply LoRA weights to model layers."""
+
+from typing import Dict, List, Tuple
+
+import mlx.core as mx
+import mlx.nn as nn
+
+from mlx_video.lora.types import LoRAWeights
+
+
+def apply_lora_to_linear(
+    linear_weight: mx.array,
+    lora_weights_and_strengths: List[Tuple[LoRAWeights, float]],
+) -> mx.array:
+    """Apply one or more LoRAs to a linear layer weight.
+
+    Args:
+        linear_weight: Original weight matrix [out_features, in_features]
+        lora_weights_and_strengths: List of (LoRAWeights, strength) tuples
+
+    Returns:
+        Modified weight with LoRA deltas applied (preserves original dtype)
+    """
+    orig_dtype = linear_weight.dtype
+    modified_weight = linear_weight
+
+    for weights, strength in lora_weights_and_strengths:
+        scale = weights.scale
+        # Compute delta in float32 for precision, then cast back to avoid
+        # promoting model weights (e.g. bfloat16 → float32 causes ~1.5x slowdown)
+        delta = (weights.lora_B @ weights.lora_A) * (scale * strength)
+        modified_weight = modified_weight + delta.astype(orig_dtype)
+
+    return modified_weight
+
+
+def _normalize_wan_lora_key(lora_key: str, model_keys: set) -> str:
+    """Normalize LoRA module name to match Wan2.2 MLX model weight keys.
+
+    Handles:
+    - Stripping common prefixes (diffusion_model., model., etc.)
+    - FFN key mapping: ffn.0 → ffn.fc1, ffn.2 → ffn.fc2
+    - Embedding key mapping: text_embedding.0 → text_embedding_0, etc.
+    - Time projection: time_projection.1 → time_projection
+    - Patch embedding: patch_embedding → patch_embedding_proj
+
+    Args:
+        lora_key: Original LoRA module name
+        model_keys: Set of all model weight keys
+
+    Returns:
+        Normalized key that matches model weights
+    """
+    # Try the key as-is first
+    if f"{lora_key}.weight" in model_keys or lora_key in model_keys:
+        return lora_key
+
+    # Common prefixes to strip
+    prefixes_to_strip = [
+        "model.diffusion_model.",
+        "diffusion_model.",
+        "base_model.model.",
+        "model.",
+    ]
+
+    candidates = [lora_key]
+    for prefix in prefixes_to_strip:
+        if lora_key.startswith(prefix):
+            candidates.append(lora_key[len(prefix):])
+
+    for candidate in candidates:
+        # Try as-is
+        if f"{candidate}.weight" in model_keys or candidate in model_keys:
+            return candidate
+
+        # Apply Wan2.2 key transformations
+        transformed = candidate
+
+        # FFN: ffn.0 → ffn.fc1, ffn.2 → ffn.fc2
+        transformed = transformed.replace(".ffn.0.", ".ffn.fc1.")
+        transformed = transformed.replace(".ffn.2.", ".ffn.fc2.")
+        if transformed.endswith(".ffn.0"):
+            transformed = transformed[:-len(".ffn.0")] + ".ffn.fc1"
+        if transformed.endswith(".ffn.2"):
+            transformed = transformed[:-len(".ffn.2")] + ".ffn.fc2"
+
+        # Text embedding: text_embedding.0 → text_embedding_0
+        transformed = transformed.replace("text_embedding.0.", "text_embedding_0.")
+        transformed = transformed.replace("text_embedding.2.", "text_embedding_1.")
+        if transformed.endswith("text_embedding.0"):
+            transformed = transformed[:-len("text_embedding.0")] + "text_embedding_0"
+        if transformed.endswith("text_embedding.2"):
+            transformed = transformed[:-len("text_embedding.2")] + "text_embedding_1"
+
+        # Time embedding: time_embedding.0 → time_embedding_0
+        transformed = transformed.replace("time_embedding.0.", "time_embedding_0.")
+        transformed = transformed.replace("time_embedding.2.", "time_embedding_1.")
+        if transformed.endswith("time_embedding.0"):
+            transformed = transformed[:-len("time_embedding.0")] + "time_embedding_0"
+        if transformed.endswith("time_embedding.2"):
+            transformed = transformed[:-len("time_embedding.2")] + "time_embedding_1"
+
+        # Time projection: time_projection.1 → time_projection
+        transformed = transformed.replace("time_projection.1.", "time_projection.")
+        if transformed.endswith("time_projection.1"):
+            transformed = transformed[:-len("time_projection.1")] + "time_projection"
+
+        # Patch embedding: patch_embedding → patch_embedding_proj
+        if "patch_embedding" in transformed and "patch_embedding_proj" not in transformed:
+            transformed = transformed.replace("patch_embedding", "patch_embedding_proj")
+
+        if f"{transformed}.weight" in model_keys or transformed in model_keys:
+            return transformed
+
+    # Return best attempt with prefix stripped
+    for prefix in prefixes_to_strip:
+        if lora_key.startswith(prefix):
+            return lora_key[len(prefix):]
+
+    return lora_key
+
+
+# Also support LTX-style key normalization
+def _normalize_ltx_lora_key(lora_key: str, model_keys: set) -> str:
+    """Normalize LoRA module name to match LTX MLX model weight keys."""
+    if f"{lora_key}.weight" in model_keys or lora_key in model_keys:
+        return lora_key
+
+    prefixes_to_strip = [
+        "model.diffusion_model.",
+        "diffusion_model.",
+        "model.",
+    ]
+
+    for prefix in prefixes_to_strip:
+        if lora_key.startswith(prefix):
+            normalized = lora_key[len(prefix):]
+
+            if f"{normalized}.weight" in model_keys or normalized in model_keys:
+                return normalized
+
+            transformed = normalized
+            if transformed.endswith(".to_out.0"):
+                transformed = transformed[:-len(".to_out.0")] + ".to_out"
+            transformed = transformed.replace(".to_out.0.", ".to_out.")
+            transformed = transformed.replace(".ff.net.0.proj.", ".ff.proj_in.")
+            transformed = transformed.replace(".ff.net.0.proj", ".ff.proj_in")
+            transformed = transformed.replace(".ff.net.2.", ".ff.proj_out.")
+            transformed = transformed.replace(".ff.net.2", ".ff.proj_out")
+            transformed = transformed.replace(".audio_ff.net.0.proj.", ".audio_ff.proj_in.")
+            transformed = transformed.replace(".audio_ff.net.0.proj", ".audio_ff.proj_in")
+            transformed = transformed.replace(".audio_ff.net.2.", ".audio_ff.proj_out.")
+            transformed = transformed.replace(".audio_ff.net.2", ".audio_ff.proj_out")
+
+            if f"{transformed}.weight" in model_keys or transformed in model_keys:
+                return transformed
+
+    # Try transformations on the original key
+    transformed = lora_key
+    if transformed.endswith(".to_out.0"):
+        transformed = transformed[:-len(".to_out.0")] + ".to_out"
+    transformed = transformed.replace(".to_out.0.", ".to_out.")
+    transformed = transformed.replace(".ff.net.0.proj.", ".ff.proj_in.")
+    transformed = transformed.replace(".ff.net.0.proj", ".ff.proj_in")
+    transformed = transformed.replace(".ff.net.2.", ".ff.proj_out.")
+    transformed = transformed.replace(".ff.net.2", ".ff.proj_out")
+
+    if f"{transformed}.weight" in model_keys or transformed in model_keys:
+        return transformed
+
+    for prefix in prefixes_to_strip:
+        if lora_key.startswith(prefix):
+            return lora_key[len(prefix):]
+
+    return lora_key
+
+
+def _normalize_lora_key(lora_key: str, model_keys: set) -> str:
+    """Normalize LoRA module name to match model weight keys.
+
+    Auto-detects whether to use Wan2.2 or LTX key normalization based
+    on the presence of architecture-specific keys in the model.
+    """
+    # Detect model architecture from keys
+    is_wan = any("self_attn.q.weight" in k for k in model_keys)
+
+    if is_wan:
+        return _normalize_wan_lora_key(lora_key, model_keys)
+    else:
+        return _normalize_ltx_lora_key(lora_key, model_keys)
+
+
+def apply_loras_to_weights(
+    model_weights: Dict[str, mx.array],
+    module_to_loras: Dict[str, List[Tuple[LoRAWeights, float]]],
+    verbose: bool = False,
+) -> Dict[str, mx.array]:
+    """Apply LoRAs to model weights.
+
+    Args:
+        model_weights: Original model state dictionary
+        module_to_loras: Dictionary mapping module names to lists of
+                        (LoRAWeights, strength) tuples
+        verbose: If True, print detailed debug information
+
+    Returns:
+        New state dictionary with LoRA-modified weights
+    """
+    modified_weights = dict(model_weights)
+    model_keys = set(model_weights.keys())
+
+    applied_count = 0
+    skipped_count = 0
+    skipped_modules = []
+
+    for module_name, loras in module_to_loras.items():
+        normalized_name = _normalize_lora_key(module_name, model_keys)
+        weight_key = f"{normalized_name}.weight"
+
+        if weight_key not in modified_weights:
+            if normalized_name not in modified_weights:
+                skipped_count += 1
+                skipped_modules.append(module_name)
+                if verbose and skipped_count <= 5:
+                    print(f"    DEBUG: '{module_name}' -> '{normalized_name}' -> NOT FOUND")
+                    similar = [
+                        k
+                        for k in list(model_keys)[:1000]
+                        if normalized_name.split(".")[-1] in k
+                    ][:3]
+                    if similar:
+                        print(f"      Similar keys: {similar}")
+                continue
+            weight_key = normalized_name
+
+        original_weight = modified_weights[weight_key]
+        modified_weight = apply_lora_to_linear(original_weight, loras)
+        modified_weights[weight_key] = modified_weight
+        applied_count += 1
+
+    if applied_count > 0:
+        print(f"  ✓ Applied to {applied_count} modules")
+    if skipped_count > 0:
+        print(f"  ⚠ Skipped {skipped_count} incompatible modules")
+
+    return modified_weights
+
+
+class LoRALinear(nn.Module):
+    """Linear layer with on-the-fly LoRA application."""
+
+    def __init__(
+        self,
+        linear: nn.Linear,
+        lora_weights_and_strengths: List[Tuple[LoRAWeights, float]],
+    ):
+        super().__init__()
+        self.linear = linear
+        self.lora_weights_and_strengths = lora_weights_and_strengths
+
+    def __call__(self, x: mx.array) -> mx.array:
+        output = self.linear(x)
+        for weights, strength in self.lora_weights_and_strengths:
+            scale = weights.scale
+            lora_out = x @ weights.lora_A.T @ weights.lora_B.T
+            output = output + (scale * strength * lora_out)
+        return output

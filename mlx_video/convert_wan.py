@@ -2,11 +2,13 @@
 
 import logging
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.utils
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def load_torch_weights(path: str) -> Dict[str, mx.array]:
@@ -88,6 +90,7 @@ def sanitize_wan_transformer_weights(weights: Dict[str, mx.array]) -> Dict[str, 
         etc.
     """
     sanitized = {}
+    consumed = set()
 
     for key, value in weights.items():
         new_key = key
@@ -99,36 +102,43 @@ def sanitize_wan_transformer_weights(weights: Dict[str, mx.array]) -> Dict[str, 
             value = value.reshape(value.shape[0], -1)
             new_key = "patch_embedding_proj.weight"
             sanitized[new_key] = value
+            consumed.add(key)
             continue
         if key == "patch_embedding.bias":
             new_key = "patch_embedding_proj.bias"
             sanitized[new_key] = value
+            consumed.add(key)
             continue
 
         # Text embedding Sequential: 0=Linear, 1=GELU(no params), 2=Linear
         if key.startswith("text_embedding.0."):
             new_key = key.replace("text_embedding.0.", "text_embedding_0.")
             sanitized[new_key] = value
+            consumed.add(key)
             continue
         if key.startswith("text_embedding.2."):
             new_key = key.replace("text_embedding.2.", "text_embedding_1.")
             sanitized[new_key] = value
+            consumed.add(key)
             continue
 
         # Time embedding Sequential: 0=Linear, 1=SiLU(no params), 2=Linear
         if key.startswith("time_embedding.0."):
             new_key = key.replace("time_embedding.0.", "time_embedding_0.")
             sanitized[new_key] = value
+            consumed.add(key)
             continue
         if key.startswith("time_embedding.2."):
             new_key = key.replace("time_embedding.2.", "time_embedding_1.")
             sanitized[new_key] = value
+            consumed.add(key)
             continue
 
         # Time projection Sequential: 0=SiLU(no params), 1=Linear
         if key.startswith("time_projection.1."):
             new_key = key.replace("time_projection.1.", "time_projection.")
             sanitized[new_key] = value
+            consumed.add(key)
             continue
 
         # FFN: Sequential(Linear, GELU, Linear) -> ffn.{0,2} -> ffn.fc1, ffn.fc2
@@ -137,9 +147,15 @@ def sanitize_wan_transformer_weights(weights: Dict[str, mx.array]) -> Dict[str, 
 
         # Skip the freqs buffer (we compute it in the model)
         if key == "freqs":
+            consumed.add(key)
             continue
 
         sanitized[new_key] = value
+        consumed.add(key)
+
+    unconsumed = set(weights.keys()) - consumed
+    if unconsumed:
+        logger.warning("Unconsumed transformer weight keys: %s", sorted(unconsumed))
 
     return sanitized
 
@@ -171,6 +187,7 @@ def sanitize_wan_t5_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array]
         norm.weight
     """
     sanitized = {}
+    consumed = set()
 
     for key, value in weights.items():
         new_key = key
@@ -179,6 +196,11 @@ def sanitize_wan_t5_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array]
         new_key = new_key.replace(".ffn.gate.0.", ".ffn.gate_proj.")
 
         sanitized[new_key] = value
+        consumed.add(key)
+
+    unconsumed = set(weights.keys()) - consumed
+    if unconsumed:
+        logger.warning("Unconsumed T5 weight keys: %s", sorted(unconsumed))
 
     return sanitized
 
@@ -189,6 +211,7 @@ def sanitize_wan_vae_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array
     Handles Conv3d and Conv2d weight transpositions for MLX format.
     """
     sanitized = {}
+    consumed = set()
 
     for key, value in weights.items():
         new_key = key
@@ -206,8 +229,63 @@ def sanitize_wan_vae_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array
         # Need to adapt naming for our simplified structure
 
         sanitized[new_key] = value
+        consumed.add(key)
+
+    unconsumed = set(weights.keys()) - consumed
+    if unconsumed:
+        logger.warning("Unconsumed VAE weight keys: %s", sorted(unconsumed))
 
     return sanitized
+
+
+def load_and_apply_loras(
+    model_weights: Dict[str, mx.array],
+    lora_configs: Optional[List[Tuple[str, float]]] = None,
+    verbose: bool = False,
+) -> Dict[str, mx.array]:
+    """Load and apply LoRA weights to Wan model weights.
+
+    Args:
+        model_weights: Base model weights
+        lora_configs: List of (lora_path, strength) tuples
+        verbose: Enable verbose debug output
+
+    Returns:
+        Model weights with LoRAs applied
+    """
+    from mlx_video.lora import LoRAConfig, apply_loras_to_weights, load_multiple_loras
+    from mlx_video.utils import Colors
+
+    if not lora_configs:
+        return model_weights
+
+    print(f"\n{Colors.CYAN}Loading {len(lora_configs)} LoRA(s)...{Colors.RESET}")
+
+    configs = []
+    for lora_path, strength in lora_configs:
+        try:
+            config = LoRAConfig(path=lora_path, strength=strength)
+            configs.append(config)
+            print(f"  - {Path(lora_path).name} (strength: {strength})")
+        except Exception as e:
+            print(f"{Colors.RED}Error loading LoRA {lora_path}: {e}{Colors.RESET}")
+            raise
+
+    module_to_loras = load_multiple_loras(configs)
+
+    if not module_to_loras:
+        print(f"{Colors.YELLOW}Warning: No LoRA weights matched model layers{Colors.RESET}")
+        return model_weights
+
+    print(f"{Colors.GREEN}Applying LoRAs to {len(module_to_loras)} modules...{Colors.RESET}")
+    if verbose:
+        print(f"  Model has {len(model_weights)} weight keys")
+
+    modified_weights = apply_loras_to_weights(model_weights, module_to_loras, verbose=verbose)
+
+    print(f"{Colors.GREEN}✓ LoRAs applied successfully{Colors.RESET}")
+
+    return modified_weights
 
 
 def convert_wan_checkpoint(
