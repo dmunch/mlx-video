@@ -497,9 +497,11 @@ def generate_video(
     # Free transformer models and text embeddings
     if is_dual:
         del low_noise_model, high_noise_model, cross_kv_low, cross_kv_high
+        del context_cfg_low, context_cfg_high
     else:
         del single_model, cross_kv
-    del model, kv, context, context_null, context_cfg
+        del context_cfg
+    del model, kv, context, context_null
     gc.collect(); mx.clear_cache()
 
     # Load VAE and decode
