@@ -82,15 +82,15 @@ python -m mlx_video.generate \
 
 Both [Wan2.1](https://github.com/Wan-Video/Wan2.1) and [Wan2.2](https://github.com/Wan-Video/Wan2.2) are text-to-video diffusion models built on a DiT (Diffusion Transformer) backbone with a T5 text encoder and 3D VAE. They share the same model architecture — the difference is in the inference pipeline:
 
-| | Wan2.1 | Wan2.2 T2V-14B | Wan2.2 I2V-14B |
-|---|--------|--------|--------|
-| **Task** | Text-to-Video | Text-to-Video | Image-to-Video |
-| **Pipeline** | Single model | Dual model | Dual model |
-| **Sizes** | 1.3B, 14B | 14B | 14B |
-| **Steps** | 50 | 40 | 40 |
-| **Guidance** | 5.0 (fixed) | 3.0 / 4.0 | 3.5 / 3.5 |
-| **Shift** | 5.0 | 12.0 | 5.0 |
-| **VAE** | Wan2.1 (z=16) | Wan2.1 (z=16) | Wan2.1 (z=16) + encoder |
+| | Wan2.1 | Wan2.2 T2V-14B | Wan2.2 I2V-14B | Wan2.2 TI2V-5B |
+|---|--------|--------|--------|--------|
+| **Task** | Text-to-Video | Text-to-Video | Image-to-Video | Text+Image-to-Video |
+| **Pipeline** | Single model | Dual model | Dual model | Single model |
+| **Sizes** | 1.3B, 14B | 14B | 14B | 5B |
+| **Steps** | 50 | 40 | 40 | 40 |
+| **Guidance** | 5.0 (fixed) | 3.0 / 4.0 | 3.5 / 3.5 | 5.0 (fixed) |
+| **Shift** | 5.0 | 12.0 | 5.0 | 5.0 |
+| **VAE** | Wan2.1 (z=16) | Wan2.1 (z=16) | Wan2.1 (z=16) + encoder | Wan2.2 (z=48) |
 
 ### Step 1: Download Weights
 

@@ -84,7 +84,7 @@ class WanFFN(nn.Module):
     def __init__(self, dim: int, ffn_dim: int):
         super().__init__()
         self.fc1 = nn.Linear(dim, ffn_dim)
-        self.act = nn.GELU(approx="precise")
+        self.act = nn.GELU(approx="tanh")
         self.fc2 = nn.Linear(ffn_dim, dim)
 
     def __call__(self, x: mx.array) -> mx.array:

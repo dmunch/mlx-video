@@ -121,7 +121,7 @@ class WanModel(nn.Module):
 
         # Text embedding MLP
         self.text_embedding_0 = nn.Linear(config.text_dim, dim)
-        self.text_embedding_act = nn.GELU(approx="precise")
+        self.text_embedding_act = nn.GELU(approx="tanh")
         self.text_embedding_1 = nn.Linear(dim, dim)
 
         # Time embedding MLP

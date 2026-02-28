@@ -146,7 +146,7 @@ class T5FeedForward(nn.Module):
         self.dim = dim
         self.dim_ffn = dim_ffn
         self.gate_proj = nn.Linear(dim, dim_ffn, bias=False)
-        self.gate_act = nn.GELU(approx="precise")
+        self.gate_act = nn.GELU(approx="tanh")
         self.fc1 = nn.Linear(dim, dim_ffn, bias=False)
         self.fc2 = nn.Linear(dim_ffn, dim, bias=False)
 

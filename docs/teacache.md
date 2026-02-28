@@ -66,6 +66,7 @@ Set `--teacache-thresh 0` (the default) to disable.
 |-------|:---:|:---:|:---:|--------|
 | Wan T2V-14B (2.1 & 2.2) | ✅ | 0.1 (~2×) | 0.2 (~3×) | Official TeaCache4Wan2.1 |
 | Wan T2V-1.3B (2.1) | ✅ | 0.05 (~1.5×) | 0.08 (~2×) | Official TeaCache4Wan2.1 |
+| Wan I2V-14B (2.2) | ❌ | — | — | Needs profiling (dual-model boundary switching may invalidate Wan2.1 I2V coefficients) |
 | Wan TI2V-5B (2.2) | ❌ | — | — | Needs profiling |
 
 When TeaCache is used with an unsupported model, it prints a warning and falls back to full computation.

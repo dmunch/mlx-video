@@ -597,25 +597,36 @@ def generate_video(
 
     is_wan22_vae = config.vae_z_dim == 48
 
+    # Warm-up: prepend a copy of the first latent frame to provide temporal
+    # context for the real first frame. Causal convolutions in the VAE decoder
+    # pad with zeros on the left, so the first few output frames have degraded
+    # quality (no temporal context). By duplicating the first latent, the real
+    # first frame sees its own features as left context instead of zeros.
+    # We trim the extra output frames after decoding.
+    warmup_trim = vae_stride[0]  # 4 frames per latent temporal position
+    latents_for_decode = mx.concatenate([latents[:, 0:1], latents], axis=1)
+
     if is_wan22_vae:
         from mlx_video.models.wan.vae22 import denormalize_latents
 
         # latents: [C, T, H, W] → [1, T, H, W, C] (channels-last for Wan2.2 VAE)
-        z = latents.transpose(1, 2, 3, 0)[None]  # [1, T, H, W, C]
+        z = latents_for_decode.transpose(1, 2, 3, 0)[None]  # [1, T+1, H, W, C]
         z = denormalize_latents(z)
         video = vae(z)  # [1, T', H', W', 3]
         mx.eval(video)
         print(f"{Colors.DIM}  VAE decode: {time.time() - t4:.1f}s{Colors.RESET}")
 
         video = np.array(video[0])  # [T', H', W', 3]
+        video = video[warmup_trim:]  # Trim warm-up frames
         video = (video + 1.0) / 2.0
         video = np.clip(video * 255.0, 0, 255).astype(np.uint8)
     else:
-        video = vae.decode(latents[None])  # [1, 3, T, H, W]
+        video = vae.decode(latents_for_decode[None])  # [1, 3, T+1*4, H, W]
         mx.eval(video)
         print(f"{Colors.DIM}  VAE decode: {time.time() - t4:.1f}s{Colors.RESET}")
 
-        video = np.array(video[0])  # [3, T, H, W]
+        video = np.array(video[0])  # [3, T', H, W]
+        video = video[:, warmup_trim:]  # Trim warm-up frames (channels-first)
         video = (video + 1.0) / 2.0
         video = np.clip(video * 255.0, 0, 255).astype(np.uint8)
         video = video.transpose(1, 2, 3, 0)  # [T, H, W, 3]
