@@ -460,6 +460,14 @@ def generate_video(
                 _configure_teacache(single_model, steps)
             print(f"{Colors.DIM}  TeaCache: threshold={teacache_thresh}{Colors.RESET}")
 
+    # Compile model forward for faster denoising (incompatible with TeaCache)
+    if teacache_thresh <= 0:
+        models_to_compile = (
+            [high_noise_model, low_noise_model] if is_dual else [single_model]
+        )
+        for m in models_to_compile:
+            m._compiled = mx.compile(m, inputs=m.parameters())
+
     # Pre-convert timesteps to Python list to avoid .item() sync each step
     timestep_list = sched.timesteps.tolist()
 
@@ -481,6 +489,9 @@ def generate_video(
             kv = cross_kv
             rcs = rope_cos_sin
 
+        # Use compiled forward when available (faster after first trace)
+        _call = getattr(model, '_compiled', model)
+
         if cfg_disabled:
             # No CFG: B=1 forward pass (2x faster than B=2 CFG batch)
             if is_i2v_mask_blend:
@@ -500,7 +511,7 @@ def generate_video(
                 ctx = context_cond_high if timestep_val >= boundary else context_cond_low
             else:
                 ctx = context_cond
-            preds = model(
+            preds = _call(
                 [latents],
                 t=t_batch,
                 context=ctx,
@@ -534,7 +545,7 @@ def generate_video(
             ctx = context_cfg if not is_dual else (
                 context_cfg_high if timestep_val >= boundary else context_cfg_low
             )
-            preds = model(
+            preds = _call(
                 [latents, latents],
                 t=t_batch,
                 context=ctx,
