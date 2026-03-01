@@ -304,10 +304,13 @@ def apply_loras_to_model(
     module_to_loras: Dict[str, List[Tuple[LoRAWeights, float]]],
     verbose: bool = False,
 ) -> int:
-    """Apply LoRAs to a model by wrapping linear layers with LoRALinear.
+    """Apply LoRAs to a model by merging into weights.
 
-    This is the runtime approach: base weights stay untouched (quantized or not),
-    and LoRA deltas are computed on-the-fly during forward passes.
+    For QuantizedLinear layers: dequantizes to bf16, merges LoRA delta, and
+    replaces with a regular nn.Linear (no per-step overhead, no re-quantization
+    precision loss). Non-LoRA layers stay quantized.
+
+    For nn.Linear layers: merges LoRA delta directly into the weight.
 
     Args:
         model: The model to apply LoRAs to
@@ -315,26 +318,24 @@ def apply_loras_to_model(
         verbose: Print debug info
 
     Returns:
-        Number of modules wrapped
+        Number of modules modified
     """
     # Build a set of model module paths for key normalization
     module_paths = set()
     for name, _ in model.named_modules():
         module_paths.add(name)
-        # Also add as weight keys for _normalize_lora_key compatibility
         module_paths.add(f"{name}.weight")
 
     # Map LoRA keys → model module paths
     lora_to_module = {}
     for lora_key in module_to_loras:
         normalized = _normalize_lora_key(lora_key, module_paths)
-        # Strip .weight suffix if present (we need module path, not weight key)
         if normalized.endswith(".weight"):
             normalized = normalized[: -len(".weight")]
         lora_to_module[lora_key] = normalized
 
-    # Walk model and wrap matching modules
     applied_count = 0
+    dequant_count = 0
     skipped = []
 
     for lora_key, loras in module_to_loras.items():
@@ -354,22 +355,38 @@ def apply_loras_to_model(
                 print(f"    DEBUG: '{lora_key}' -> '{module_path}' -> module not found")
             continue
 
-        if not isinstance(target, (nn.Linear, nn.QuantizedLinear)):
+        if isinstance(target, nn.QuantizedLinear):
+            # Dequantize → merge LoRA → replace with bf16 Linear
+            weight = mx.dequantize(
+                target.weight, target.scales, target.biases,
+                group_size=target.group_size, bits=target.bits,
+            )
+            merged = apply_lora_to_linear(weight, loras)
+            new_linear = nn.Linear(merged.shape[1], merged.shape[0])
+            new_linear.weight = merged
+            if "bias" in target:
+                new_linear.bias = target.bias
+            if leaf_name.isdigit():
+                parent[int(leaf_name)] = new_linear
+            else:
+                setattr(parent, leaf_name, new_linear)
+            dequant_count += 1
+            applied_count += 1
+        elif isinstance(target, nn.Linear):
+            # Merge directly into weight
+            target.weight = apply_lora_to_linear(target.weight, loras)
+            applied_count += 1
+        else:
             skipped.append(lora_key)
             if verbose:
                 print(f"    DEBUG: '{module_path}' is {type(target).__name__}, not Linear")
             continue
 
-        # Wrap with LoRALinear
-        wrapped = LoRALinear(target, loras)
-        if leaf_name.isdigit():
-            parent[int(leaf_name)] = wrapped
-        else:
-            setattr(parent, leaf_name, wrapped)
-        applied_count += 1
-
     if applied_count > 0:
-        print(f"  ✓ Wrapped {applied_count} modules with runtime LoRA")
+        msg = f"  ✓ Applied to {applied_count} modules"
+        if dequant_count > 0:
+            msg += f" ({dequant_count} dequantized to bf16)"
+        print(msg)
     if skipped:
         print(f"  ⚠ Skipped {len(skipped)} incompatible modules")
 
