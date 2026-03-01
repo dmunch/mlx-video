@@ -109,20 +109,10 @@ def save_checkpoint(
         tmpdir = Path(tmpdir)
 
         # Save LoRA weights
-        lora_weights = _collect_lora_weights(model)
-        lora_weights = _to_diffusers_keys(lora_weights)
-        lora_path = tmpdir / "lora_weights.safetensors"
-        mx.save_safetensors(str(lora_path), lora_weights)
+        _save_lora_to_file(model, "lora_weights.safetensors", tmpdir)
 
         # Save optimizer state
-        import mlx.utils
-
-        opt_state = {}
-        for i, (key, value) in enumerate(mlx.utils.tree_flatten(optimizer.state)):
-            opt_state[f"{i}.{key}"] = value
-        if opt_state:
-            opt_path = tmpdir / "optimizer_state.safetensors"
-            mx.save_safetensors(str(opt_path), opt_state)
+        _save_optimizer_state(optimizer, "", tmpdir)
 
         # Save training state
         state = {
@@ -239,22 +229,32 @@ def load_checkpoint(
 
 
 def _save_optimizer_state(optimizer, prefix: str, tmpdir: Path) -> None:
-    """Save optimizer state to safetensors file."""
+    """Save optimizer state to safetensors file.
+
+    prefix="" -> optimizer_state.safetensors
+    prefix="high" -> high_optimizer_state.safetensors
+    """
     import mlx.utils
 
     opt_state = {}
     for i, (key, value) in enumerate(mlx.utils.tree_flatten(optimizer.state)):
         opt_state[f"{i}.{key}"] = value
     if opt_state:
-        opt_path = tmpdir / f"{prefix}_optimizer_state.safetensors"
+        fname = f"{prefix}_optimizer_state.safetensors" if prefix else "optimizer_state.safetensors"
+        opt_path = tmpdir / fname
         mx.save_safetensors(str(opt_path), opt_state)
 
 
 def _load_optimizer_state(optimizer, prefix: str, tmpdir: Path) -> None:
-    """Load optimizer state from safetensors file."""
+    """Load optimizer state from safetensors file.
+
+    prefix="" -> optimizer_state.safetensors
+    prefix="high" -> high_optimizer_state.safetensors
+    """
     import mlx.utils
 
-    opt_path = tmpdir / f"{prefix}_optimizer_state.safetensors"
+    fname = f"{prefix}_optimizer_state.safetensors" if prefix else "optimizer_state.safetensors"
+    opt_path = tmpdir / fname
     if opt_path.exists():
         saved_opt = mx.load(str(opt_path))
         if saved_opt:

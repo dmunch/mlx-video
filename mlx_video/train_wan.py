@@ -151,7 +151,7 @@ def _load_dual_resume(checkpoint_path, high_model, low_model):
     """Load LoRA weights + training state from a dual-expert checkpoint zip.
 
     Restores LoRA weights into both models and returns epoch/step/loss_history.
-    Optimizer state is not restored (train_simultaneous creates its own).
+    Optimizer state is loaded later by train_simultaneous after creating optimizers.
     """
     import tempfile
     import zipfile
@@ -181,6 +181,8 @@ def _load_dual_resume(checkpoint_path, high_model, low_model):
             state = {"epoch": 0, "global_step": 0, "loss_history": []}
 
     mx.eval(high_model.parameters(), low_model.parameters())
+    # Include checkpoint path so trainer can restore optimizer state
+    state["checkpoint_path"] = str(checkpoint_path)
     return state
 
 
@@ -189,7 +191,6 @@ def _train_single_expert(
     resume_path=None,
 ):
     """Load model, inject LoRA, train on sigma range, unload."""
-    from mlx_video.training.save import load_checkpoint
     from mlx_video.training.trainer import train
 
     print(f"\n{Colors.BLUE}Loading {expert_label} model ({weight_file})...{Colors.RESET}")
@@ -204,16 +205,37 @@ def _train_single_expert(
 
     _setup_lora(model, config.lora)
 
-    # Handle resume
+    # Handle resume: restore LoRA weights + training state
     resume_state = None
     if resume_path:
-        import mlx.optimizers as optim
+        from mlx_video.training.save import _load_lora_from_file
 
-        optimizer_cls = {"adam": optim.Adam, "adamw": optim.AdamW}.get(
-            config.training.optimizer.lower(), optim.AdamW
-        )
-        optimizer = optimizer_cls(learning_rate=config.training.learning_rate)
-        resume_state = load_checkpoint(resume_path, model, optimizer)
+        import tempfile
+        import zipfile
+        from pathlib import Path as _Path
+
+        ckpt = _Path(resume_path)
+        if not ckpt.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = _Path(tmpdir)
+            with zipfile.ZipFile(ckpt, "r") as zf:
+                zf.extractall(tmpdir)
+
+            # Restore LoRA weights
+            _load_lora_from_file(model, "lora_weights.safetensors", tmpdir)
+
+            # Load training state
+            state_path = tmpdir / "state.json"
+            if state_path.exists():
+                with open(state_path) as f:
+                    resume_state = json.load(f)
+            else:
+                resume_state = {"epoch": 0, "global_step": 0, "loss_history": []}
+
+        mx.eval(model.parameters())
+        resume_state["checkpoint_path"] = str(ckpt)
         print(f"{Colors.DIM}  Resumed from: {resume_path}{Colors.RESET}")
 
     train(

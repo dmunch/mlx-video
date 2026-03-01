@@ -7,6 +7,7 @@ MLX value_and_grad for LoRA parameters, and the training epoch loop.
 import random
 import time
 from functools import partial
+from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -276,6 +277,24 @@ def train(
     else:
         optimizer = optimizer_cls(learning_rate=lr)
         schedule_desc = "constant"
+
+    # Initialize optimizer state structure (needed for checkpoint restore)
+    optimizer.init(model.trainable_parameters())
+
+    # Restore optimizer state from checkpoint if resuming
+    if resume_state and resume_state.get("checkpoint_path"):
+        import tempfile
+        import zipfile
+
+        from mlx_video.training.save import _load_optimizer_state
+
+        ckpt = Path(resume_state["checkpoint_path"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            with zipfile.ZipFile(ckpt, "r") as zf:
+                zf.extractall(tmpdir)
+            _load_optimizer_state(optimizer, "", tmpdir)
+        mx.eval(optimizer.state)
 
     rng = random.Random(config.seed)
     mx.random.seed(config.seed)
@@ -582,6 +601,26 @@ def train_simultaneous(
         high_optimizer = optimizer_cls(learning_rate=lr)
         low_optimizer = optimizer_cls(learning_rate=lr)
         schedule_desc = "constant"
+
+    # Initialize optimizer state structure (needed for checkpoint restore)
+    high_optimizer.init(high_model.trainable_parameters())
+    low_optimizer.init(low_model.trainable_parameters())
+
+    # Restore optimizer state from checkpoint if resuming
+    if resume_state and resume_state.get("checkpoint_path"):
+        import tempfile
+        import zipfile
+
+        from mlx_video.training.save import _load_optimizer_state
+
+        ckpt = Path(resume_state["checkpoint_path"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+            with zipfile.ZipFile(ckpt, "r") as zf:
+                zf.extractall(tmpdir)
+            _load_optimizer_state(high_optimizer, "high", tmpdir)
+            _load_optimizer_state(low_optimizer, "low", tmpdir)
+        mx.eval(high_optimizer.state, low_optimizer.state)
 
     rng = random.Random(config.seed)
     mx.random.seed(config.seed)
