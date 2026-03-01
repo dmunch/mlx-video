@@ -83,6 +83,61 @@ For LoRA training, the timestep sampling strategy determines which noise levels 
 
 ---
 
+## Learning Rate Schedule
+
+The trainer supports cosine annealing with linear warmup — a standard technique that prevents early destabilization and allows fine-tuning in later steps.
+
+| Schedule | Config | Behavior |
+|----------|--------|----------|
+| **Cosine** (default) | `"lr_schedule": "cosine"` | Linear warmup → cosine decay to ~0 |
+| **Constant** | `"lr_schedule": "constant"` | Fixed LR throughout training |
+
+```json
+"training": {
+  "learning_rate": 1e-4,
+  "lr_schedule": "cosine",
+  "lr_warmup_ratio": 0.1
+}
+```
+
+**Why it helps for character LoRAs:**
+- **Warmup** (first 10% of steps): LoRA starts at zero, so early gradients are noisy. A low LR prevents destructive updates before the LoRA has learned useful features.
+- **Cosine decay** (remaining 90%): Gradually reduces LR, allowing the model to fine-tune character details in later steps instead of oscillating.
+
+`lr_warmup_ratio` controls what fraction of total steps are spent in warmup. Default is `0.1` (10%). For very short training runs (<100 steps), consider `0.05`.
+
+---
+
+## Loss Weighting (Min-SNR)
+
+By default, the trainer uses **Min-SNR-γ weighting** from *"Efficient Diffusion Training via Min-SNR Weighting Strategy"* (Hang et al., 2023). This focuses the training signal on noise levels where character identity is most learnable.
+
+| Weighting | Config | Behavior |
+|-----------|--------|----------|
+| **Min-SNR** (default) | `"loss_weighting": "min_snr"` | Downweights easy (low-noise) samples |
+| **Uniform** | `"loss_weighting": "uniform"` | All noise levels weighted equally |
+
+```json
+"training": {
+  "loss_weighting": "min_snr",
+  "min_snr_gamma": 5.0
+}
+```
+
+**How it works:** For flow matching, the signal-to-noise ratio at noise level σ is `SNR = (1-σ)²/σ²`. The weight for each sample is `min(SNR, γ) / SNR`:
+
+| σ range | SNR | Weight (γ=5) | Interpretation |
+|---------|-----|------|----------------|
+| 0.0–0.1 | Very high (>80) | ~0.06 | Near-clean image, trivial to denoise → downweighted |
+| 0.2–0.6 | Moderate (0.4–16) | 0.3–1.0 | Character features visible → full weight |
+| 0.7–1.0 | Low (<0.2) | ~1.0 | Heavy noise, structure learning → full weight |
+
+**For characters:** Min-SNR prevents the model from spending its gradient budget on trivially easy samples (near-clean images at low σ). Instead, it focuses on the intermediate noise levels where facial features, clothing details, and other identity markers are most distinguishable.
+
+`min_snr_gamma` (default 5.0) controls the clamping threshold. Lower values (e.g., 1.0) apply stronger downweighting. Higher values (e.g., 10.0) make the weighting more uniform. 5.0 is the paper's recommended default.
+
+---
+
 ## Expert Routing Strategies
 
 When training both experts simultaneously, the `expert_routing` config controls how training steps are distributed between the high-noise and low-noise models.

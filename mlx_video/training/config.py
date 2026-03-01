@@ -36,6 +36,10 @@ class TrainingLoopConfig:
     expert_routing: str = "alternating"  # "alternating", "proportional"
     switch_every: int = 1  # steps per expert before switching (alternating only)
     high_ratio: Optional[float] = None  # H expert probability (proportional only; None = 1-boundary)
+    lr_schedule: str = "cosine"  # "cosine", "constant"
+    lr_warmup_ratio: float = 0.1  # fraction of total steps for warmup (cosine only)
+    loss_weighting: str = "min_snr"  # "uniform", "min_snr"
+    min_snr_gamma: float = 5.0  # SNR clamping value for min-SNR weighting
 
 
 @dataclass
@@ -261,6 +265,28 @@ def _validate(config: TrainingConfig, data_dir: Path) -> None:
     if config.training.switch_every < 1:
         raise ValueError(
             f"switch_every must be >= 1, got {config.training.switch_every}"
+        )
+
+    valid_lr_schedules = {"cosine", "constant"}
+    if config.training.lr_schedule not in valid_lr_schedules:
+        raise ValueError(
+            f"lr_schedule must be one of {valid_lr_schedules}, "
+            f"got '{config.training.lr_schedule}'"
+        )
+    if not (0.0 <= config.training.lr_warmup_ratio < 1.0):
+        raise ValueError(
+            f"lr_warmup_ratio must be in [0.0, 1.0), got {config.training.lr_warmup_ratio}"
+        )
+
+    valid_loss_weightings = {"uniform", "min_snr"}
+    if config.training.loss_weighting not in valid_loss_weightings:
+        raise ValueError(
+            f"loss_weighting must be one of {valid_loss_weightings}, "
+            f"got '{config.training.loss_weighting}'"
+        )
+    if config.training.min_snr_gamma <= 0:
+        raise ValueError(
+            f"min_snr_gamma must be > 0, got {config.training.min_snr_gamma}"
         )
 
     if config.training.high_ratio is not None:

@@ -998,3 +998,134 @@ class TestQLoRA:
         assert lora.lora_A.shape == (16, 256)
         # lora_B: (out_features, rank) = (512, 16)
         assert lora.lora_B.shape == (512, 16)
+
+
+class TestMinSNRWeighting:
+    """Test min-SNR loss weighting functions."""
+
+    def test_min_snr_weight_scalar_mid_sigma(self):
+        """At σ=0.5 (SNR=1), weight = min(1, 5)/1 = 1.0."""
+        from mlx_video.training.trainer import _min_snr_weight_scalar
+
+        w = _min_snr_weight_scalar(0.5, gamma=5.0)
+        assert abs(w - 1.0) < 1e-4
+
+    def test_min_snr_weight_scalar_low_sigma(self):
+        """At σ=0.1 (SNR=81), weight = min(81, 5)/81 ≈ 0.062 — downweighted."""
+        from mlx_video.training.trainer import _min_snr_weight_scalar
+
+        w = _min_snr_weight_scalar(0.1, gamma=5.0)
+        expected = 5.0 / 81.0  # min(81, 5) / 81
+        assert abs(w - expected) < 1e-3
+
+    def test_min_snr_weight_scalar_high_sigma(self):
+        """At σ=0.9 (SNR≈0.012), weight ≈ 1.0 (SNR < γ)."""
+        from mlx_video.training.trainer import _min_snr_weight_scalar
+
+        w = _min_snr_weight_scalar(0.9, gamma=5.0)
+        assert abs(w - 1.0) < 1e-3
+
+    def test_min_snr_weight_scalar_zero_sigma(self):
+        """At σ≈0, avoid division by zero, return 1.0."""
+        from mlx_video.training.trainer import _min_snr_weight_scalar
+
+        w = _min_snr_weight_scalar(0.0, gamma=5.0)
+        assert w == 1.0
+
+    def test_min_snr_weight_mx_batch(self):
+        """Vectorized min-SNR weights match scalar versions."""
+        from mlx_video.training.trainer import (
+            _min_snr_weight_mx,
+            _min_snr_weight_scalar,
+        )
+
+        sigmas = [0.1, 0.3, 0.5, 0.7, 0.9]
+        gamma = 5.0
+        mx_weights = _min_snr_weight_mx(mx.array(sigmas), gamma)
+        mx.eval(mx_weights)
+        for i, s in enumerate(sigmas):
+            expected = _min_snr_weight_scalar(s, gamma)
+            assert abs(mx_weights[i].item() - expected) < 1e-3, f"Mismatch at σ={s}"
+
+    def test_min_snr_downweights_easy_samples(self):
+        """Min-SNR gives lower weight to low-σ (easy) samples than mid-σ ones."""
+        from mlx_video.training.trainer import _min_snr_weight_scalar
+
+        w_easy = _min_snr_weight_scalar(0.05, gamma=5.0)  # very low noise
+        w_mid = _min_snr_weight_scalar(0.5, gamma=5.0)  # medium noise
+        assert w_easy < w_mid
+
+
+class TestLRScheduleConfig:
+    """Test LR schedule and loss weighting config validation."""
+
+    def _make_config(self, tmp_path, overrides):
+        data_dir = tmp_path / "data"
+        data_dir.mkdir(exist_ok=True)
+        from PIL import Image
+
+        img = Image.new("RGB", (64, 64))
+        img.save(data_dir / "img.png")
+        (data_dir / "img.txt").write_text("test prompt")
+
+        model_dir = tmp_path / "model"
+        model_dir.mkdir(exist_ok=True)
+        (model_dir / "config.json").write_text("{}")
+
+        config = {"model_dir": str(model_dir), "data": str(data_dir)}
+        config.update(overrides)
+
+        config_path = tmp_path / "train.json"
+        config_path.write_text(json.dumps(config))
+        return str(config_path)
+
+    def test_default_lr_schedule_is_cosine(self, tmp_path):
+        from mlx_video.training.config import TrainingConfig
+
+        path = self._make_config(tmp_path, {})
+        tc = TrainingConfig.from_json(path)
+        assert tc.training.lr_schedule == "cosine"
+        assert tc.training.lr_warmup_ratio == 0.1
+
+    def test_default_loss_weighting_is_min_snr(self, tmp_path):
+        from mlx_video.training.config import TrainingConfig
+
+        path = self._make_config(tmp_path, {})
+        tc = TrainingConfig.from_json(path)
+        assert tc.training.loss_weighting == "min_snr"
+        assert tc.training.min_snr_gamma == 5.0
+
+    def test_constant_lr_schedule(self, tmp_path):
+        from mlx_video.training.config import TrainingConfig
+
+        path = self._make_config(tmp_path, {"training": {"lr_schedule": "constant"}})
+        tc = TrainingConfig.from_json(path)
+        assert tc.training.lr_schedule == "constant"
+
+    def test_invalid_lr_schedule_rejected(self, tmp_path):
+        from mlx_video.training.config import TrainingConfig
+
+        path = self._make_config(tmp_path, {"training": {"lr_schedule": "linear"}})
+        with pytest.raises(ValueError, match="lr_schedule"):
+            TrainingConfig.from_json(path)
+
+    def test_invalid_loss_weighting_rejected(self, tmp_path):
+        from mlx_video.training.config import TrainingConfig
+
+        path = self._make_config(tmp_path, {"training": {"loss_weighting": "snr_plus"}})
+        with pytest.raises(ValueError, match="loss_weighting"):
+            TrainingConfig.from_json(path)
+
+    def test_invalid_warmup_ratio_rejected(self, tmp_path):
+        from mlx_video.training.config import TrainingConfig
+
+        path = self._make_config(tmp_path, {"training": {"lr_warmup_ratio": 1.0}})
+        with pytest.raises(ValueError, match="lr_warmup_ratio"):
+            TrainingConfig.from_json(path)
+
+    def test_invalid_min_snr_gamma_rejected(self, tmp_path):
+        from mlx_video.training.config import TrainingConfig
+
+        path = self._make_config(tmp_path, {"training": {"min_snr_gamma": 0.0}})
+        with pytest.raises(ValueError, match="min_snr_gamma"):
+            TrainingConfig.from_json(path)

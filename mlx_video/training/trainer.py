@@ -68,6 +68,27 @@ def _apply_shift(sigma: float, shift: float) -> float:
     return shift * sigma / (1.0 + (shift - 1.0) * sigma)
 
 
+def _min_snr_weight_scalar(sigma_shifted: float, gamma: float) -> float:
+    """Compute min-SNR weight for a single sigma value (for non-compiled path).
+
+    SNR(σ) = (1-σ)² / σ² for flow matching.
+    Weight = min(SNR, γ) / SNR — clamps contribution from low-noise (easy) samples.
+    """
+    if sigma_shifted <= 1e-6:
+        return 1.0  # avoid division by zero at σ≈0
+    snr = ((1.0 - sigma_shifted) ** 2) / (sigma_shifted ** 2)
+    return min(snr, gamma) / max(snr, 1e-8)
+
+
+def _min_snr_weight_mx(sigmas_shifted: mx.array, gamma: float) -> mx.array:
+    """Compute min-SNR weights for a batch of sigmas (for compiled path).
+
+    Returns per-sample weights as mx.array of shape [batch_size].
+    """
+    snr = ((1.0 - sigmas_shifted) ** 2) / (sigmas_shifted ** 2 + 1e-8)
+    return mx.minimum(snr, gamma) / (snr + 1e-8)
+
+
 def compute_loss(
     model: nn.Module,
     item: EncodedItem,
@@ -75,6 +96,8 @@ def compute_loss(
     noise: mx.array,
     text_len: int,
     shift: float,
+    loss_weighting: str = "uniform",
+    min_snr_gamma: float = 5.0,
 ) -> mx.array:
     """Compute flow matching MSE loss for a single training sample.
 
@@ -88,6 +111,8 @@ def compute_loss(
         noise: Random noise matching latent shape.
         text_len: Model text sequence length.
         shift: Noise schedule shift parameter.
+        loss_weighting: "uniform" or "min_snr".
+        min_snr_gamma: SNR clamping value for min-SNR weighting.
 
     Returns:
         Scalar loss value.
@@ -127,9 +152,13 @@ def compute_loss(
     # Target velocity: v = noise - clean (flow matching convention)
     target_velocity = noise - clean
 
-    # MSE loss
+    # MSE loss with optional min-SNR weighting
     error = (predicted_velocity - target_velocity).square()
-    return error.mean()
+    mse = error.mean()
+    if loss_weighting == "min_snr":
+        weight = _min_snr_weight_scalar(sigma_shifted, min_snr_gamma)
+        return weight * mse
+    return mse
 
 
 def compute_batch_loss(
@@ -225,12 +254,27 @@ def train(
     output_dir = config.checkpoint.output_dir
     shift = config.training.shift or getattr(model.config, "sample_shift", 12.0)
     text_len = model.config.text_len
+    loss_weighting = config.training.loss_weighting
+    min_snr_gamma = config.training.min_snr_gamma
 
-    # Setup optimizer
+    # Pre-compute total steps for LR schedule
+    steps_per_epoch = max(1, len(encoded_data) // batch_size)
+    total_steps = num_epochs * steps_per_epoch
+
+    # Setup optimizer with LR schedule
     optimizer_cls = {"adam": optim.Adam, "adamw": optim.AdamW}.get(
         config.training.optimizer.lower(), optim.AdamW
     )
-    optimizer = optimizer_cls(learning_rate=lr)
+    if config.training.lr_schedule == "cosine" and total_steps > 1:
+        warmup_steps = max(1, int(total_steps * config.training.lr_warmup_ratio))
+        warmup = optim.linear_schedule(init=1e-7, end=lr, steps=warmup_steps)
+        decay = optim.cosine_decay(init=lr, decay_steps=total_steps - warmup_steps)
+        lr_schedule = optim.join_schedules([warmup, decay], [warmup_steps])
+        optimizer = optimizer_cls(learning_rate=lr_schedule)
+        schedule_desc = f"cosine (warmup={warmup_steps})"
+    else:
+        optimizer = optimizer_cls(learning_rate=lr)
+        schedule_desc = "constant"
 
     rng = random.Random(config.seed)
     mx.random.seed(config.seed)
@@ -254,7 +298,11 @@ def train(
         losses = []
         for pred, target in zip(predicted_list, targets):
             losses.append((pred - target).square().mean())
-        return mx.mean(mx.stack(losses))
+        per_sample = mx.stack(losses)
+        if loss_weighting == "min_snr":
+            weights = _min_snr_weight_mx(sigmas_shifted, min_snr_gamma)
+            per_sample = per_sample * weights
+        return mx.mean(per_sample)
 
     loss_and_grad = nn.value_and_grad(model, loss_fn)
 
@@ -269,8 +317,6 @@ def train(
         return loss
 
     # Training loop
-    steps_per_epoch = max(1, len(encoded_data) // batch_size)
-    total_steps = num_epochs * steps_per_epoch
     global_step = 0
     start_epoch = 0
     running_loss = 0.0
@@ -296,6 +342,8 @@ def train(
     print(f"  Epochs: {num_epochs}, Steps/epoch: {steps_per_epoch}")
     print(f"  Total steps: {total_steps}")
     print(f"  Batch size: {batch_size}, LR: {lr}")
+    print(f"  LR schedule: {schedule_desc}")
+    print(f"  Loss weighting: {loss_weighting}" + (f" (γ={min_snr_gamma})" if loss_weighting == "min_snr" else ""))
     print(f"  Timestep sampling: {sampling}")
     if sigma_min > 0.0 or sigma_max < 1.0:
         print(f"  Sigma range: [{sigma_min:.3f}, {sigma_max:.3f}]")
@@ -314,7 +362,8 @@ def train(
         for item in encoded_data:
             sigma = _sample_timestep(1000, sampling, rng, sigma_min, sigma_max)
             noise = mx.random.normal(shape=item.clean_latents.shape)
-            bl = compute_loss(model, item, sigma, noise, text_len, shift)
+            bl = compute_loss(model, item, sigma, noise, text_len, shift,
+                              loss_weighting=loss_weighting, min_snr_gamma=min_snr_gamma)
             baseline_losses.append(bl)
         # Single eval for all baseline losses (avoids N sync barriers)
         mx.eval(*baseline_losses)
@@ -504,13 +553,29 @@ def train_simultaneous(
     output_dir = config.checkpoint.output_dir
     shift = config.training.shift or getattr(high_model.config, "sample_shift", 12.0)
     text_len = high_model.config.text_len
+    loss_weighting = config.training.loss_weighting
+    min_snr_gamma = config.training.min_snr_gamma
 
-    # Separate optimizers for each expert
+    # Pre-compute total steps for LR schedule
+    steps_per_epoch = max(1, len(encoded_data) // batch_size)
+    total_steps = num_epochs * steps_per_epoch
+
+    # Separate optimizers for each expert (with LR schedule)
     optimizer_cls = {"adam": optim.Adam, "adamw": optim.AdamW}.get(
         config.training.optimizer.lower(), optim.AdamW
     )
-    high_optimizer = optimizer_cls(learning_rate=lr)
-    low_optimizer = optimizer_cls(learning_rate=lr)
+    if config.training.lr_schedule == "cosine" and total_steps > 1:
+        warmup_steps = max(1, int(total_steps * config.training.lr_warmup_ratio))
+        warmup = optim.linear_schedule(init=1e-7, end=lr, steps=warmup_steps)
+        decay = optim.cosine_decay(init=lr, decay_steps=total_steps - warmup_steps)
+        lr_schedule = optim.join_schedules([warmup, decay], [warmup_steps])
+        high_optimizer = optimizer_cls(learning_rate=lr_schedule)
+        low_optimizer = optimizer_cls(learning_rate=lr_schedule)
+        schedule_desc = f"cosine (warmup={warmup_steps})"
+    else:
+        high_optimizer = optimizer_cls(learning_rate=lr)
+        low_optimizer = optimizer_cls(learning_rate=lr)
+        schedule_desc = "constant"
 
     rng = random.Random(config.seed)
     mx.random.seed(config.seed)
@@ -534,7 +599,11 @@ def train_simultaneous(
         losses = []
         for pred, target in zip(predicted_list, targets):
             losses.append((pred - target).square().mean())
-        return mx.mean(mx.stack(losses))
+        per_sample = mx.stack(losses)
+        if loss_weighting == "min_snr":
+            weights = _min_snr_weight_mx(sigmas_shifted, min_snr_gamma)
+            per_sample = per_sample * weights
+        return mx.mean(per_sample)
 
     def low_loss_fn(model, cleans, texts, sigmas, noises):
         sigmas_shifted = shift * sigmas / (1.0 + (shift - 1.0) * sigmas)
@@ -549,7 +618,11 @@ def train_simultaneous(
         losses = []
         for pred, target in zip(predicted_list, targets):
             losses.append((pred - target).square().mean())
-        return mx.mean(mx.stack(losses))
+        per_sample = mx.stack(losses)
+        if loss_weighting == "min_snr":
+            weights = _min_snr_weight_mx(sigmas_shifted, min_snr_gamma)
+            per_sample = per_sample * weights
+        return mx.mean(per_sample)
 
     high_loss_and_grad = nn.value_and_grad(high_model, high_loss_fn)
     low_loss_and_grad = nn.value_and_grad(low_model, low_loss_fn)
@@ -571,8 +644,6 @@ def train_simultaneous(
         return loss
 
     # Training loop
-    steps_per_epoch = max(1, len(encoded_data) // batch_size)
-    total_steps = num_epochs * steps_per_epoch
     global_step = 0
     running_loss = 0.0
     loss_count = 0
@@ -588,6 +659,8 @@ def train_simultaneous(
     print(f"  Epochs: {num_epochs}, Steps/epoch: {steps_per_epoch}")
     print(f"  Total steps: {total_steps}")
     print(f"  Batch size: {batch_size}, LR: {lr}")
+    print(f"  LR schedule: {schedule_desc}")
+    print(f"  Loss weighting: {loss_weighting}" + (f" (γ={min_snr_gamma})" if loss_weighting == "min_snr" else ""))
     print(f"  Timestep sampling: {sampling}")
     print(f"  Expert boundary: σ={boundary:.3f} (alternating each step)")
     print(f"  Shift: {shift}")
