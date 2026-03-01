@@ -275,11 +275,15 @@ def apply_loras_to_weights(
 
 
 class LoRALinear(nn.Module):
-    """Linear layer with on-the-fly LoRA application."""
+    """Linear layer with on-the-fly LoRA application.
+
+    Wraps nn.Linear or nn.QuantizedLinear, computing LoRA delta at runtime:
+      output = base_linear(x) + (x @ lora_A.T @ lora_B.T) * scale * strength
+    """
 
     def __init__(
         self,
-        linear: nn.Linear,
+        linear: nn.Module,
         lora_weights_and_strengths: List[Tuple[LoRAWeights, float]],
     ):
         super().__init__()
@@ -293,3 +297,80 @@ class LoRALinear(nn.Module):
             lora_out = x @ weights.lora_A.T @ weights.lora_B.T
             output = output + (scale * strength * lora_out)
         return output
+
+
+def apply_loras_to_model(
+    model: nn.Module,
+    module_to_loras: Dict[str, List[Tuple[LoRAWeights, float]]],
+    verbose: bool = False,
+) -> int:
+    """Apply LoRAs to a model by wrapping linear layers with LoRALinear.
+
+    This is the runtime approach: base weights stay untouched (quantized or not),
+    and LoRA deltas are computed on-the-fly during forward passes.
+
+    Args:
+        model: The model to apply LoRAs to
+        module_to_loras: Dictionary mapping module names to (LoRAWeights, strength) lists
+        verbose: Print debug info
+
+    Returns:
+        Number of modules wrapped
+    """
+    # Build a set of model module paths for key normalization
+    module_paths = set()
+    for name, _ in model.named_modules():
+        module_paths.add(name)
+        # Also add as weight keys for _normalize_lora_key compatibility
+        module_paths.add(f"{name}.weight")
+
+    # Map LoRA keys → model module paths
+    lora_to_module = {}
+    for lora_key in module_to_loras:
+        normalized = _normalize_lora_key(lora_key, module_paths)
+        # Strip .weight suffix if present (we need module path, not weight key)
+        if normalized.endswith(".weight"):
+            normalized = normalized[: -len(".weight")]
+        lora_to_module[lora_key] = normalized
+
+    # Walk model and wrap matching modules
+    applied_count = 0
+    skipped = []
+
+    for lora_key, loras in module_to_loras.items():
+        module_path = lora_to_module[lora_key]
+        parts = module_path.split(".")
+
+        # Traverse to the parent module
+        parent = model
+        try:
+            for part in parts[:-1]:
+                parent = getattr(parent, part) if not part.isdigit() else parent[int(part)]
+            leaf_name = parts[-1]
+            target = getattr(parent, leaf_name) if not leaf_name.isdigit() else parent[int(leaf_name)]
+        except (AttributeError, IndexError, TypeError):
+            skipped.append(lora_key)
+            if verbose:
+                print(f"    DEBUG: '{lora_key}' -> '{module_path}' -> module not found")
+            continue
+
+        if not isinstance(target, (nn.Linear, nn.QuantizedLinear)):
+            skipped.append(lora_key)
+            if verbose:
+                print(f"    DEBUG: '{module_path}' is {type(target).__name__}, not Linear")
+            continue
+
+        # Wrap with LoRALinear
+        wrapped = LoRALinear(target, loras)
+        if leaf_name.isdigit():
+            parent[int(leaf_name)] = wrapped
+        else:
+            setattr(parent, leaf_name, wrapped)
+        applied_count += 1
+
+    if applied_count > 0:
+        print(f"  ✓ Wrapped {applied_count} modules with runtime LoRA")
+    if skipped:
+        print(f"  ⚠ Skipped {len(skipped)} incompatible modules")
+
+    return applied_count

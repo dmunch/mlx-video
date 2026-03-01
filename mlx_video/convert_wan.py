@@ -239,28 +239,15 @@ def sanitize_wan_vae_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array
     return sanitized
 
 
-def load_and_apply_loras(
-    model_weights: Dict[str, mx.array],
-    lora_configs: Optional[List[Tuple[str, float]]] = None,
-    verbose: bool = False,
-    quantization_bits: int = 0,
-) -> Dict[str, mx.array]:
-    """Load and apply LoRA weights to Wan model weights.
+def _load_lora_configs(
+    lora_configs: List[Tuple[str, float]],
+) -> Dict[str, list]:
+    """Load LoRA weights from config tuples, returning module_to_loras dict.
 
-    Args:
-        model_weights: Base model weights
-        lora_configs: List of (lora_path, strength) tuples
-        verbose: Enable verbose debug output
-        quantization_bits: If >0, weights are quantized at this bit width
-
-    Returns:
-        Model weights with LoRAs applied
+    Shared between weight-merging and runtime-wrapping paths.
     """
-    from mlx_video.lora import LoRAConfig, apply_loras_to_weights, load_multiple_loras
+    from mlx_video.lora import LoRAConfig, load_multiple_loras
     from mlx_video.utils import Colors
-
-    if not lora_configs:
-        return model_weights
 
     print(f"\n{Colors.CYAN}Loading {len(lora_configs)} LoRA(s)...{Colors.RESET}")
 
@@ -278,6 +265,28 @@ def load_and_apply_loras(
 
     if not module_to_loras:
         print(f"{Colors.YELLOW}Warning: No LoRA weights matched model layers{Colors.RESET}")
+
+    return module_to_loras
+
+
+def load_and_apply_loras(
+    model_weights: Dict[str, mx.array],
+    lora_configs: Optional[List[Tuple[str, float]]] = None,
+    verbose: bool = False,
+    quantization_bits: int = 0,
+) -> Dict[str, mx.array]:
+    """Load and apply LoRA weights to model weights by merging into weight dict.
+
+    For non-quantized (bf16) models. For quantized models, use apply_loras_to_model().
+    """
+    from mlx_video.lora import apply_loras_to_weights
+    from mlx_video.utils import Colors
+
+    if not lora_configs:
+        return model_weights
+
+    module_to_loras = _load_lora_configs(lora_configs)
+    if not module_to_loras:
         return model_weights
 
     print(f"{Colors.GREEN}Applying LoRAs to {len(module_to_loras)} modules...{Colors.RESET}")

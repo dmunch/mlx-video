@@ -32,12 +32,23 @@ def load_wan_model(model_path: Path, config, quantization: dict | None = None, l
 
     weights = mx.load(str(model_path))
 
-    # Apply LoRAs before loading into model
+    # Apply LoRAs: runtime wrapping for quantized models, weight merging for bf16
     if loras:
-        from mlx_video.convert_wan import load_and_apply_loras
+        if quantization:
+            # Runtime LoRA: keep base quantized, compute LoRA delta on-the-fly
+            from mlx_video.convert_wan import _load_lora_configs
+            from mlx_video.lora import apply_loras_to_model
 
-        q_bits = quantization["bits"] if quantization else 0
-        weights = load_and_apply_loras(dict(weights), loras, quantization_bits=q_bits)
+            model.load_weights(list(weights.items()), strict=False)
+            mx.eval(model.parameters())
+            module_to_loras = _load_lora_configs(loras)
+            apply_loras_to_model(model, module_to_loras)
+            return model
+        else:
+            # Weight merging: fold LoRA into bf16 weights before loading
+            from mlx_video.convert_wan import load_and_apply_loras
+
+            weights = load_and_apply_loras(dict(weights), loras)
 
     model.load_weights(list(weights.items()), strict=False)
     mx.eval(model.parameters())
