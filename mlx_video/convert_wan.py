@@ -543,29 +543,40 @@ def _quantize_saved_model(
     is_dual: bool,
     bits: int,
     group_size: int,
+    source_dir: Path = None,
 ):
-    """Load saved bf16 model, quantize, and re-save."""
+    """Load saved bf16 model, quantize, and re-save.
+
+    Args:
+        output_dir: Directory to write quantized weights to.
+        config: WanModelConfig for creating the model.
+        is_dual: Whether this is a dual-expert model.
+        bits: Quantization bits.
+        group_size: Quantization group size.
+        source_dir: Directory to read bf16 weights from. Defaults to output_dir.
+    """
     import json
 
     import mlx.nn as nn
 
     from mlx_video.models.wan.model import WanModel
 
-    model_files = []
+    if source_dir is None:
+        source_dir = output_dir
+
+    model_names = []
     if is_dual:
         for name in ["low_noise_model.safetensors", "high_noise_model.safetensors"]:
-            p = output_dir / name
-            if p.exists():
-                model_files.append(p)
+            if (source_dir / name).exists():
+                model_names.append(name)
     else:
-        p = output_dir / "model.safetensors"
-        if p.exists():
-            model_files.append(p)
+        if (source_dir / "model.safetensors").exists():
+            model_names.append("model.safetensors")
 
-    for model_path in model_files:
-        print(f"  Quantizing {model_path.name}...")
+    for name in model_names:
+        print(f"  Quantizing {name}...")
         model = WanModel(config)
-        weights = mx.load(str(model_path))
+        weights = mx.load(str(source_dir / name))
         model.load_weights(list(weights.items()), strict=False)
         mx.eval(model.parameters())
         del weights
@@ -597,7 +608,7 @@ def _quantize_saved_model(
                 f"(e.g. {bad_keys[0]}). Try re-running with more available memory."
             )
 
-        mx.save_safetensors(str(model_path), weights_dict)
+        mx.save_safetensors(str(output_dir / name), weights_dict)
         n_quantized = sum(1 for k in weights_dict if ".scales" in k)
         print(f"    {n_quantized} layers quantized, {len(weights_dict)} tensors saved")
 
@@ -666,16 +677,17 @@ def quantize_mlx_model(
             config_dict[key] = tuple(config_dict[key])
     config = WanModelConfig(**config_dict)
 
-    # Copy files to output dir if different from source
+    # Copy non-transformer files to output dir (skip large model weights)
+    transformer_files = {"low_noise_model.safetensors", "high_noise_model.safetensors", "model.safetensors"}
     if dst.resolve() != src.resolve():
         dst.mkdir(parents=True, exist_ok=True)
         for f in src.iterdir():
-            if f.is_file():
+            if f.is_file() and f.name not in transformer_files:
                 shutil.copy2(f, dst / f.name)
-        print(f"Copied MLX model from {src} to {dst}")
+        print(f"Copied non-transformer files from {src} to {dst}")
 
     print(f"Quantizing transformer weights ({bits}-bit, group_size={group_size})...")
-    _quantize_saved_model(dst, config, is_dual, bits, group_size)
+    _quantize_saved_model(dst, config, is_dual, bits, group_size, source_dir=src)
 
     print(f"\nQuantization complete! Output: {dst}")
 
