@@ -522,6 +522,7 @@ def train_simultaneous(
     encoded_data: list[EncodedItem],
     config: TrainingConfig,
     boundary: float = 0.875,
+    resume_state: dict = None,
 ) -> None:
     """Train both experts simultaneously, routing each step to an expert.
 
@@ -650,12 +651,23 @@ def train_simultaneous(
 
     # Training loop
     global_step = 0
+    start_epoch = 0
     running_loss = 0.0
     loss_count = 0
     high_steps = 0
     low_steps = 0
     loss_history = LossHistory()
     plot_path = f"{output_dir}/loss_plot.png"
+
+    # Restore state from checkpoint if resuming
+    if resume_state:
+        start_epoch = resume_state.get("epoch", 0)
+        global_step = resume_state.get("global_step", 0)
+        for entry in resume_state.get("loss_history", []):
+            if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                loss_history.append(entry[0], entry[1])
+        if loss_history.losses:
+            loss_history.baseline = loss_history.losses[0]
 
     print(f"\n{Colors.CYAN}{'='*60}")
     print(f"  Wan2.2 LoRA Training (simultaneous dual-expert)")
@@ -678,12 +690,14 @@ def train_simultaneous(
         effective = high_ratio if high_ratio is not None else (1.0 - boundary)
         routing_desc = f"proportional (H ratio={effective:.1%})"
     print(f"  Expert routing: {routing_desc}")
+    if resume_state:
+        print(f"  Resumed from epoch: {start_epoch}, step: {global_step}")
     print(f"{Colors.RESET}")
 
     t_start = time.time()
 
     # --- Baseline preview (before any training, uses low model for character detail) ---
-    if preview_freq > 0:
+    if preview_freq > 0 and start_epoch == 0:
         from mlx_video.training.preview import generate_preview
 
         preview_path = generate_preview(
@@ -698,7 +712,7 @@ def train_simultaneous(
     current_expert = "high"  # start with high
     steps_on_current = 0
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         indices = list(range(len(encoded_data)))
         rng.shuffle(indices)
 

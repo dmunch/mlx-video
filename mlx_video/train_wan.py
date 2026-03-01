@@ -147,6 +147,43 @@ def _setup_lora(model, lora_config):
     return trainable, total
 
 
+def _load_dual_resume(checkpoint_path, high_model, low_model):
+    """Load LoRA weights + training state from a dual-expert checkpoint zip.
+
+    Restores LoRA weights into both models and returns epoch/step/loss_history.
+    Optimizer state is not restored (train_simultaneous creates its own).
+    """
+    import tempfile
+    import zipfile
+    from pathlib import Path
+
+    from mlx_video.training.save import _load_lora_from_file
+
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        with zipfile.ZipFile(checkpoint_path, "r") as zf:
+            zf.extractall(tmpdir)
+
+        # Restore LoRA weights for both experts
+        _load_lora_from_file(high_model, "lora_high_noise.safetensors", tmpdir)
+        _load_lora_from_file(low_model, "lora_low_noise.safetensors", tmpdir)
+
+        # Load training state
+        state_path = tmpdir / "state.json"
+        if state_path.exists():
+            with open(state_path) as f:
+                state = json.load(f)
+        else:
+            state = {"epoch": 0, "global_step": 0, "loss_history": []}
+
+    mx.eval(high_model.parameters(), low_model.parameters())
+    return state
+
+
 def _train_single_expert(
     config, encoded_data, model_dir, weight_file, sigma_min, sigma_max, expert_label, output_suffix,
     resume_path=None,
@@ -313,12 +350,21 @@ def main():
             _setup_lora(low_model, config.lora)
             print(f"{Colors.DIM}  ^ Low noise expert{Colors.RESET}")
 
+            # Handle resume for simultaneous training
+            resume_state = None
+            if args.resume:
+                resume_state = _load_dual_resume(
+                    args.resume, high_model, low_model,
+                )
+                print(f"{Colors.DIM}  Resumed from: {args.resume}{Colors.RESET}")
+
             train_simultaneous(
                 high_model=high_model,
                 low_model=low_model,
                 encoded_data=encoded_data,
                 config=config,
                 boundary=EXPERT_BOUNDARY,
+                resume_state=resume_state,
             )
 
             del high_model, low_model
