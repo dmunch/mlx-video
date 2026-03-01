@@ -1,5 +1,6 @@
 """Weight conversion for Wan2.2 models (PyTorch -> MLX)."""
 
+import gc
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -566,6 +567,10 @@ def _quantize_saved_model(
         model = WanModel(config)
         weights = mx.load(str(model_path))
         model.load_weights(list(weights.items()), strict=False)
+        mx.eval(model.parameters())
+        del weights
+        gc.collect()
+        mx.clear_cache()
 
         # Apply quantization to targeted layers
         nn.quantize(
@@ -580,6 +585,11 @@ def _quantize_saved_model(
         mx.save_safetensors(str(model_path), weights_dict)
         n_quantized = sum(1 for k in weights_dict if ".scales" in k)
         print(f"    {n_quantized} layers quantized, {len(weights_dict)} tensors saved")
+
+        # Free model before processing next file
+        del model, weights_dict
+        gc.collect()
+        mx.clear_cache()
 
     # Update config.json with quantization metadata
     config_path = output_dir / "config.json"
