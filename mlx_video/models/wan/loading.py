@@ -36,7 +36,8 @@ def load_wan_model(model_path: Path, config, quantization: dict | None = None, l
     if loras:
         from mlx_video.convert_wan import load_and_apply_loras
 
-        weights = load_and_apply_loras(dict(weights), loras)
+        q_bits = quantization["bits"] if quantization else 0
+        weights = load_and_apply_loras(dict(weights), loras, quantization_bits=q_bits)
 
     model.load_weights(list(weights.items()), strict=False)
     mx.eval(model.parameters())

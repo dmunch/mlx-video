@@ -194,6 +194,7 @@ def apply_loras_to_weights(
     model_weights: Dict[str, mx.array],
     module_to_loras: Dict[str, List[Tuple[LoRAWeights, float]]],
     verbose: bool = False,
+    quantization_bits: int = 0,
 ) -> Dict[str, mx.array]:
     """Apply LoRAs to model weights.
 
@@ -202,6 +203,9 @@ def apply_loras_to_weights(
         module_to_loras: Dictionary mapping module names to lists of
                         (LoRAWeights, strength) tuples
         verbose: If True, print detailed debug information
+        quantization_bits: If >0, weights are quantized at this bit width.
+                          Quantized layers are dequantized before LoRA application
+                          and re-quantized after.
 
     Returns:
         New state dictionary with LoRA-modified weights
@@ -234,8 +238,32 @@ def apply_loras_to_weights(
             weight_key = normalized_name
 
         original_weight = modified_weights[weight_key]
-        modified_weight = apply_lora_to_linear(original_weight, loras)
-        modified_weights[weight_key] = modified_weight
+
+        # Handle quantized weights: dequantize → apply delta → re-quantize
+        scales_key = f"{normalized_name}.scales"
+        biases_key = f"{normalized_name}.biases"
+        is_quantized = (
+            original_weight.dtype == mx.uint32
+            and scales_key in modified_weights
+            and biases_key in modified_weights
+        )
+
+        if is_quantized:
+            scales = modified_weights[scales_key]
+            biases = modified_weights[biases_key]
+            group_size = (original_weight.shape[-1] * 32) // (scales.shape[-1] * quantization_bits)
+            dequantized = mx.dequantize(
+                original_weight, scales, biases, group_size=group_size, bits=quantization_bits
+            )
+            modified = apply_lora_to_linear(dequantized, loras)
+            # Re-quantize with same parameters
+            new_w, new_scales, new_biases = mx.quantize(modified, group_size=group_size, bits=quantization_bits)
+            modified_weights[weight_key] = new_w
+            modified_weights[scales_key] = new_scales
+            modified_weights[biases_key] = new_biases
+        else:
+            modified_weights[weight_key] = apply_lora_to_linear(original_weight, loras)
+
         applied_count += 1
 
     if applied_count > 0:

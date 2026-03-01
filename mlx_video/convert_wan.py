@@ -243,6 +243,7 @@ def load_and_apply_loras(
     model_weights: Dict[str, mx.array],
     lora_configs: Optional[List[Tuple[str, float]]] = None,
     verbose: bool = False,
+    quantization_bits: int = 0,
 ) -> Dict[str, mx.array]:
     """Load and apply LoRA weights to Wan model weights.
 
@@ -250,6 +251,7 @@ def load_and_apply_loras(
         model_weights: Base model weights
         lora_configs: List of (lora_path, strength) tuples
         verbose: Enable verbose debug output
+        quantization_bits: If >0, weights are quantized at this bit width
 
     Returns:
         Model weights with LoRAs applied
@@ -282,7 +284,9 @@ def load_and_apply_loras(
     if verbose:
         print(f"  Model has {len(model_weights)} weight keys")
 
-    modified_weights = apply_loras_to_weights(model_weights, module_to_loras, verbose=verbose)
+    modified_weights = apply_loras_to_weights(
+        model_weights, module_to_loras, verbose=verbose, quantization_bits=quantization_bits
+    )
 
     print(f"{Colors.GREEN}✓ LoRAs applied successfully{Colors.RESET}")
 
