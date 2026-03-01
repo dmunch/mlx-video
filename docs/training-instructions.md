@@ -405,3 +405,83 @@ python -m mlx_video.generate_wan \
   --prompt "A video of ohwx walking" \
   --steps 4 --guide-scale 1.0
 ```
+
+---
+
+## QLoRA (4-Bit Quantized Training)
+
+QLoRA dramatically reduces memory bandwidth by storing base model weights in 4-bit quantized format while keeping LoRA adapters in full bf16 precision. This is especially effective on Apple Silicon where training is memory-bandwidth-bound.
+
+### How it works
+
+1. **Pre-convert** the model to 4-bit quantized format (one-time step)
+2. The trainer auto-detects quantization from the model's `config.json`
+3. Base weights load as `QuantizedLinear` (~8GB instead of ~28GB)
+4. LoRA matrices (`lora_A`, `lora_B`) remain in full bf16 precision
+5. Forward: `output = quantized_matmul(x, W_q) + scale * (x @ A^T @ B^T)`
+6. Saved LoRA adapters are pure bf16 — **fully portable** to full-precision inference
+
+### Pre-converting the model
+
+```bash
+python -m mlx_video.convert_wan \
+  --model-dir /path/to/wan22_bf16 \
+  --output-dir /path/to/wan22_4bit \
+  --quantize --q-bits 4 --q-group-size 64
+```
+
+This creates a quantized copy with `config.json` containing `{"quantization": {"bits": 4, "group_size": 64}}`. The original model is unchanged.
+
+### Training with QLoRA
+
+Point `model_dir` at the quantized model — no other config changes needed:
+
+```json
+{
+  "model_dir": "/path/to/wan22_4bit",
+  "data": "./my_character/",
+  "trigger_word": "ohwx",
+  "training": {
+    "num_epochs": 40,
+    "batch_size": 4,
+    "learning_rate": 1e-4
+  }
+}
+```
+
+The trainer logs `Quantized: 4-bit` in the header when it detects a quantized model.
+
+### Performance impact
+
+| Metric | bf16 (28GB) | 4-bit QLoRA (8GB) |
+|--------|-------------|-------------------|
+| Weight memory | ~28 GB per model | ~8 GB per model |
+| Memory bandwidth per step | ~56 GB (fwd+bwd) | ~16 GB (fwd+bwd) |
+| Estimated speedup | 1× | 2–4× |
+| LoRA quality | Baseline | Equivalent (bf16 adapters) |
+
+### Batch size by memory tier
+
+With QLoRA, you can increase batch size for better GPU utilization:
+
+| RAM | Base Model | Recommended Batch Size |
+|-----|-----------|----------------------|
+| 32 GB | 4-bit single expert | 1–2 |
+| 64 GB | 4-bit single expert | 4–8 |
+| 64 GB | 4-bit dual expert | 2–4 |
+| 128 GB | bf16 single expert | 2–4 |
+| 128 GB | bf16 dual expert | 1–2 |
+| 128 GB | 4-bit single expert | 8–16 |
+| 128 GB | 4-bit dual expert | 4–8 |
+
+Larger batch sizes improve arithmetic intensity (more compute per byte loaded), which is the key to better GPU utilization on Apple Silicon.
+
+### Using QLoRA adapters at inference
+
+LoRA adapters are saved in bf16 regardless of base quantization. Use them with the full-precision model:
+
+```bash
+python -m mlx_video.generate_wan \
+  --lora ./output/lora_final.safetensors \
+  --prompt "A video of ohwx walking"
+```
