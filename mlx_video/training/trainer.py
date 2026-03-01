@@ -381,6 +381,7 @@ def train(
             preview_path = generate_preview(
                 model, config, encoded_data, 0, output_dir,
                 steps=preview_steps, guide_scale=preview_guide_scale,
+                seed=config.seed + 9999,
             )
             if preview_path:
                 print(f"  {Colors.GREEN}✓ Baseline preview: {preview_path}{Colors.RESET}")
@@ -492,12 +493,12 @@ def train(
             preview_path = generate_preview(
                 model, config, encoded_data, epoch + 1, output_dir,
                 steps=preview_steps, guide_scale=preview_guide_scale,
+                seed=config.seed + 9999,
             )
             if preview_path:
                 print(f"  {Colors.GREEN}✓ Preview saved: {preview_path}{Colors.RESET}")
 
     # Final save
-    final_path = f"{output_dir}/lora{output_suffix}_final.safetensors"
     save_lora_weights(model, final_path, config)
     plot_loss(loss_history, plot_path)
 
@@ -682,6 +683,7 @@ def train_simultaneous(
         preview_path = generate_preview(
             low_model, config, encoded_data, 0, output_dir,
             steps=preview_steps, guide_scale=preview_guide_scale,
+            seed=config.seed + 9999,
         )
         if preview_path:
             print(f"  {Colors.GREEN}✓ Baseline preview: {preview_path}{Colors.RESET}")
@@ -850,6 +852,7 @@ def train_simultaneous(
             preview_path = generate_preview(
                 low_model, config, encoded_data, epoch + 1, output_dir,
                 steps=preview_steps, guide_scale=preview_guide_scale,
+                seed=config.seed + 9999,
             )
             if preview_path:
                 print(f"  {Colors.GREEN}✓ Preview saved: {preview_path}{Colors.RESET}")

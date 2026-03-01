@@ -25,11 +25,15 @@ def generate_preview(
     output_dir: str,
     steps: int = 20,
     guide_scale: float = 1.0,
+    seed: int | None = None,
 ) -> str | None:
     """Generate a single-frame preview image using the current model state.
 
     Runs a denoising loop with CFG guidance, loads the VAE decoder temporarily
     to decode the result, saves as PNG, then frees the VAE.
+
+    Uses a fixed seed (config.seed + 9999 by default) so previews are
+    comparable across epochs — same starting noise shows LoRA evolution.
 
     Args:
         model: WanModel with trained LoRA layers.
@@ -37,15 +41,17 @@ def generate_preview(
         encoded_data: Pre-encoded training data (uses first item's text embedding).
         epoch: Current epoch number (for filename).
         output_dir: Base output directory.
-        steps: Number of denoising steps (default 50, matches inference quality).
-        guide_scale: CFG guidance scale (default 7.5, 1.0 to disable CFG).
+        steps: Number of denoising steps.
+        guide_scale: CFG guidance scale (1.0 to disable CFG).
+        seed: Fixed seed for preview noise. Defaults to config.seed + 9999.
 
     Returns:
         Path to the saved preview image, or None on failure.
     """
     try:
         return _generate_preview_impl(
-            model, config, encoded_data, epoch, output_dir, steps, guide_scale
+            model, config, encoded_data, epoch, output_dir, steps, guide_scale,
+            seed=seed if seed is not None else config.seed + 9999,
         )
     except Exception as e:
         print(f"  {Colors.DIM}⚠ Preview generation failed: {e}{Colors.RESET}")
@@ -60,6 +66,7 @@ def _generate_preview_impl(
     output_dir: str,
     steps: int,
     guide_scale: float,
+    seed: int = 42,
 ) -> str:
     from mlx_video.models.wan.config import WanModelConfig
     from mlx_video.models.wan.loading import load_vae_decoder
@@ -70,7 +77,8 @@ def _generate_preview_impl(
 
     preview_w = config.monitoring.preview_width
     preview_h = config.monitoring.preview_height
-    shift = getattr(model_config, "sample_shift", 12.0)
+    # Use training shift if set, otherwise fall back to model config
+    shift = config.training.shift or getattr(model_config, "sample_shift", 12.0)
     z_dim = model_config.vae_z_dim
     vae_stride = model_config.vae_stride
     patch_size = model_config.patch_size
@@ -110,8 +118,12 @@ def _generate_preview_impl(
     )
     sched.set_timesteps(steps, shift=shift)
 
+    # Fixed seed for deterministic preview noise (same noise every epoch → shows LoRA evolution)
+    # Use mx.random.key for a separate RNG stream that doesn't affect the training state
+    preview_key = mx.random.key(seed)
+
     # Initial noise
-    latents = mx.random.normal(shape=(z_dim, t_latent, h_latent, w_latent))
+    latents = mx.random.normal(shape=(z_dim, t_latent, h_latent, w_latent), key=preview_key)
 
     # Denoising loop
     for i, timestep_val in enumerate(sched.timesteps):

@@ -1129,3 +1129,47 @@ class TestLRScheduleConfig:
         path = self._make_config(tmp_path, {"training": {"min_snr_gamma": 0.0}})
         with pytest.raises(ValueError, match="min_snr_gamma"):
             TrainingConfig.from_json(path)
+
+
+class TestPreviewSeed:
+    """Test fixed seed produces deterministic preview noise."""
+
+    def test_fixed_seed_deterministic(self):
+        """Same key should produce identical noise."""
+        seed = 12345
+        shape = (16, 1, 8, 8)
+
+        key1 = mx.random.key(seed)
+        noise1 = mx.random.normal(shape=shape, key=key1)
+        mx.eval(noise1)
+
+        key2 = mx.random.key(seed)
+        noise2 = mx.random.normal(shape=shape, key=key2)
+        mx.eval(noise2)
+
+        assert mx.array_equal(noise1, noise2).item()
+
+    def test_preview_key_does_not_affect_training_rng(self):
+        """Using mx.random.key for preview shouldn't affect global RNG sequence."""
+        mx.random.seed(42)
+        # Generate training noise
+        train_a = mx.random.normal(shape=(4,))
+        mx.eval(train_a)
+
+        # Simulate preview with separate key (doesn't touch global state)
+        preview_key = mx.random.key(9999)
+        _preview = mx.random.normal(shape=(4,), key=preview_key)
+        mx.eval(_preview)
+
+        # Continue training
+        train_b_with_preview = mx.random.normal(shape=(4,))
+        mx.eval(train_b_with_preview)
+
+        # Compare: fresh sequence without preview
+        mx.random.seed(42)
+        _skip = mx.random.normal(shape=(4,))
+        mx.eval(_skip)
+        train_b_without_preview = mx.random.normal(shape=(4,))
+        mx.eval(train_b_without_preview)
+
+        assert mx.array_equal(train_b_with_preview, train_b_without_preview).item()
