@@ -466,7 +466,7 @@ def generate_video(
             [high_noise_model, low_noise_model] if is_dual else [single_model]
         )
         for m in models_to_compile:
-            m._compiled = mx.compile(m, inputs=m.parameters())
+            m._compiled = mx.compile(m)
 
     # Pre-convert timesteps to Python list to avoid .item() sync each step
     timestep_list = sched.timesteps.tolist()
