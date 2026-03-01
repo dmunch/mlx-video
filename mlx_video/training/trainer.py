@@ -256,9 +256,10 @@ def train(
     text_len = model.config.text_len
     loss_weighting = config.training.loss_weighting
     min_snr_gamma = config.training.min_snr_gamma
+    repeat = config.training.repeat
 
     # Pre-compute total steps for LR schedule
-    steps_per_epoch = max(1, len(encoded_data) // batch_size)
+    steps_per_epoch = max(1, (len(encoded_data) * repeat) // batch_size)
     total_steps = num_epochs * steps_per_epoch
 
     # Setup optimizer with LR schedule
@@ -342,6 +343,8 @@ def train(
     print(f"  Epochs: {num_epochs}, Steps/epoch: {steps_per_epoch}")
     print(f"  Total steps: {total_steps}")
     print(f"  Batch size: {batch_size}, LR: {lr}")
+    if repeat > 1:
+        print(f"  Dataset repeat: {repeat}x")
     print(f"  LR schedule: {schedule_desc}")
     print(f"  Loss weighting: {loss_weighting}" + (f" (γ={min_snr_gamma})" if loss_weighting == "min_snr" else ""))
     print(f"  Timestep sampling: {sampling}")
@@ -556,9 +559,10 @@ def train_simultaneous(
     text_len = high_model.config.text_len
     loss_weighting = config.training.loss_weighting
     min_snr_gamma = config.training.min_snr_gamma
+    repeat = config.training.repeat
 
     # Pre-compute total steps for LR schedule
-    steps_per_epoch = max(1, len(encoded_data) // batch_size)
+    steps_per_epoch = max(1, (len(encoded_data) * repeat) // batch_size)
     total_steps = num_epochs * steps_per_epoch
 
     # Separate optimizers for each expert (with LR schedule)
@@ -660,6 +664,8 @@ def train_simultaneous(
     print(f"  Epochs: {num_epochs}, Steps/epoch: {steps_per_epoch}")
     print(f"  Total steps: {total_steps}")
     print(f"  Batch size: {batch_size}, LR: {lr}")
+    if repeat > 1:
+        print(f"  Dataset repeat: {repeat}x")
     print(f"  LR schedule: {schedule_desc}")
     print(f"  Loss weighting: {loss_weighting}" + (f" (γ={min_snr_gamma})" if loss_weighting == "min_snr" else ""))
     print(f"  Timestep sampling: {sampling}")

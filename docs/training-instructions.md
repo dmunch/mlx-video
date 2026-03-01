@@ -540,6 +540,33 @@ With QLoRA, you can increase batch size for better GPU utilization:
 
 Larger batch sizes improve arithmetic intensity (more compute per byte loaded), which is the key to better GPU utilization on Apple Silicon.
 
+### Dataset repeat
+
+With small datasets and large batch sizes, you may get very few steps per epoch:
+
+```
+15 images ÷ batch_size 6 = 2 steps/epoch
+```
+
+The `repeat` option multiplies the effective dataset size for step calculation, giving more gradient updates per epoch without changing checkpoint/preview cadence:
+
+```json
+"training": {
+    "batch_size": 6,
+    "repeat": 3
+}
+```
+
+This gives `(15 × 3) ÷ 6 = 7` steps/epoch instead of 2.
+
+| Dataset Size | Batch Size | Steps/epoch (repeat=1) | Suggested Repeat | Steps/epoch |
+|-------------|-----------|----------------------|-----------------|-------------|
+| 5–10 images | 4 | 1–2 | 4–6 | 5–10 |
+| 10–20 images | 5 | 2–4 | 2–3 | 6–10 |
+| 50+ images | 8 | 6+ | 1 | 6+ |
+
+**Rule of thumb:** Aim for 5–10 steps per epoch. If `dataset_size ÷ batch_size` gives fewer than 5, increase `repeat`.
+
 ### Using QLoRA adapters at inference
 
 LoRA adapters are saved in bf16 regardless of base quantization. Use them with the full-precision model:

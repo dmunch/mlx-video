@@ -40,6 +40,7 @@ class TrainingLoopConfig:
     lr_warmup_ratio: float = 0.1  # fraction of total steps for warmup (cosine only)
     loss_weighting: str = "min_snr"  # "uniform", "min_snr"
     min_snr_gamma: float = 5.0  # SNR clamping value for min-SNR weighting
+    repeat: int = 1  # dataset repeats per epoch (increases steps/epoch)
 
 
 @dataclass
@@ -288,6 +289,9 @@ def _validate(config: TrainingConfig, data_dir: Path) -> None:
         raise ValueError(
             f"min_snr_gamma must be > 0, got {config.training.min_snr_gamma}"
         )
+
+    if config.training.repeat < 1:
+        raise ValueError(f"repeat must be >= 1, got {config.training.repeat}")
 
     if config.training.high_ratio is not None:
         if not (0.0 < config.training.high_ratio < 1.0):
