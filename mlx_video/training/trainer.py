@@ -6,6 +6,7 @@ MLX value_and_grad for LoRA parameters, and the training epoch loop.
 
 import random
 import time
+from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -234,16 +235,36 @@ def train(
     rng = random.Random(config.seed)
     mx.random.seed(config.seed)
 
-    # Define loss function for value_and_grad (batched forward pass)
-    def loss_fn(model, items_batch, sigmas, noises):
-        return compute_batch_loss(model, items_batch, sigmas, noises, text_len, shift)
+    # Pre-compute seq_len (constant for all items — same resolution)
+    _, _, h_lat, w_lat = encoded_data[0].clean_latents.shape
+    patch_size = model.config.patch_size
+    seq_len = (1 // patch_size[0]) * (h_lat // patch_size[1]) * (w_lat // patch_size[2])
+
+    # Compile-friendly loss function with raw array inputs (no Python objects)
+    def loss_fn(model, cleans, texts, sigmas, noises):
+        sigmas_shifted = shift * sigmas / (1.0 + (shift - 1.0) * sigmas)
+        noisy_list = []
+        targets = []
+        for i in range(batch_size):
+            s = sigmas_shifted[i]
+            noisy_list.append((1.0 - s) * cleans[i] + s * noises[i])
+            targets.append(noises[i] - cleans[i])
+        t_batch = sigmas_shifted * 1000.0
+        predicted_list = model(noisy_list, t=t_batch, context=texts, seq_len=seq_len)
+        losses = []
+        for pred, target in zip(predicted_list, targets):
+            losses.append((pred - target).square().mean())
+        return mx.mean(mx.stack(losses))
 
     loss_and_grad = nn.value_and_grad(model, loss_fn)
 
-    # Wrap forward+backward+optimizer into a step function so that
-    # the `grads` reference is released before mx.eval (reduces peak memory).
-    def train_step(items_batch, sigmas, noises):
-        loss, grads = loss_and_grad(model, items_batch, sigmas, noises)
+    # Compiled training step: fuses ops across transformer blocks,
+    # grads released inside (reduces peak memory)
+    state = [model, optimizer.state]
+
+    @partial(mx.compile, inputs=state, outputs=state)
+    def train_step(cleans, texts, sigmas, noises):
+        loss, grads = loss_and_grad(model, cleans, texts, sigmas, noises)
         optimizer.update(model, grads)
         return loss
 
@@ -352,17 +373,24 @@ def train(
 
             items_batch = [encoded_data[i] for i in batch_indices]
 
+            # Extract raw arrays for compiled step
+            cleans = [item.clean_latents for item in items_batch]
+            texts = [item.text_embedding for item in items_batch]
+
             # Sample timesteps and noise
-            sigmas = [_sample_timestep(1000, sampling, rng, sigma_min, sigma_max) for _ in range(batch_size)]
+            sigmas = mx.array([
+                _sample_timestep(1000, sampling, rng, sigma_min, sigma_max)
+                for _ in range(batch_size)
+            ])
             noises = [
                 mx.random.normal(shape=items_batch[i].clean_latents.shape)
                 for i in range(batch_size)
             ]
 
-            # Forward + backward + optimizer (grads released inside train_step)
-            loss = train_step(items_batch, sigmas, noises)
+            # Forward + backward + optimizer (compiled + fused)
+            loss = train_step(cleans, texts, sigmas, noises)
             # Async eval: returns immediately, GPU works while Python prepares next batch
-            mx.async_eval(loss, model.parameters(), optimizer.state)
+            mx.async_eval(loss, state)
             _prev_loss = loss
             epoch_steps += 1
             global_step += 1
@@ -487,24 +515,58 @@ def train_simultaneous(
     rng = random.Random(config.seed)
     mx.random.seed(config.seed)
 
-    # Loss functions for each expert (batched forward pass)
-    def high_loss_fn(model, items_batch, sigmas, noises):
-        return compute_batch_loss(model, items_batch, sigmas, noises, text_len, shift)
+    # Pre-compute seq_len (constant for all items — same resolution)
+    _, _, h_lat, w_lat = encoded_data[0].clean_latents.shape
+    patch_size = high_model.config.patch_size
+    seq_len = (1 // patch_size[0]) * (h_lat // patch_size[1]) * (w_lat // patch_size[2])
 
-    def low_loss_fn(model, items_batch, sigmas, noises):
-        return compute_batch_loss(model, items_batch, sigmas, noises, text_len, shift)
+    # Compile-friendly loss functions with raw array inputs
+    def high_loss_fn(model, cleans, texts, sigmas, noises):
+        sigmas_shifted = shift * sigmas / (1.0 + (shift - 1.0) * sigmas)
+        noisy_list = []
+        targets = []
+        for i in range(batch_size):
+            s = sigmas_shifted[i]
+            noisy_list.append((1.0 - s) * cleans[i] + s * noises[i])
+            targets.append(noises[i] - cleans[i])
+        t_batch = sigmas_shifted * 1000.0
+        predicted_list = model(noisy_list, t=t_batch, context=texts, seq_len=seq_len)
+        losses = []
+        for pred, target in zip(predicted_list, targets):
+            losses.append((pred - target).square().mean())
+        return mx.mean(mx.stack(losses))
+
+    def low_loss_fn(model, cleans, texts, sigmas, noises):
+        sigmas_shifted = shift * sigmas / (1.0 + (shift - 1.0) * sigmas)
+        noisy_list = []
+        targets = []
+        for i in range(batch_size):
+            s = sigmas_shifted[i]
+            noisy_list.append((1.0 - s) * cleans[i] + s * noises[i])
+            targets.append(noises[i] - cleans[i])
+        t_batch = sigmas_shifted * 1000.0
+        predicted_list = model(noisy_list, t=t_batch, context=texts, seq_len=seq_len)
+        losses = []
+        for pred, target in zip(predicted_list, targets):
+            losses.append((pred - target).square().mean())
+        return mx.mean(mx.stack(losses))
 
     high_loss_and_grad = nn.value_and_grad(high_model, high_loss_fn)
     low_loss_and_grad = nn.value_and_grad(low_model, low_loss_fn)
 
-    # Wrap in step functions to release grads before eval (reduces peak memory)
-    def high_step(items_batch, sigmas, noises):
-        loss, grads = high_loss_and_grad(high_model, items_batch, sigmas, noises)
+    # Compiled training steps: separate state per expert
+    high_state = [high_model, high_optimizer.state]
+    low_state = [low_model, low_optimizer.state]
+
+    @partial(mx.compile, inputs=high_state, outputs=high_state)
+    def high_step(cleans, texts, sigmas, noises):
+        loss, grads = high_loss_and_grad(high_model, cleans, texts, sigmas, noises)
         high_optimizer.update(high_model, grads)
         return loss
 
-    def low_step(items_batch, sigmas, noises):
-        loss, grads = low_loss_and_grad(low_model, items_batch, sigmas, noises)
+    @partial(mx.compile, inputs=low_state, outputs=low_state)
+    def low_step(cleans, texts, sigmas, noises):
+        loss, grads = low_loss_and_grad(low_model, cleans, texts, sigmas, noises)
         low_optimizer.update(low_model, grads)
         return loss
 
@@ -601,6 +663,10 @@ def train_simultaneous(
 
             items_batch = [encoded_data[i] for i in batch_indices]
 
+            # Extract raw arrays for compiled step
+            cleans = [item.clean_latents for item in items_batch]
+            texts = [item.text_embedding for item in items_batch]
+
             noises = [
                 mx.random.normal(shape=items_batch[i].clean_latents.shape)
                 for i in range(batch_size)
@@ -619,15 +685,21 @@ def train_simultaneous(
                 use_high = rng.random() < effective_ratio
 
             if use_high:
-                sigmas = [_sample_timestep(1000, sampling, rng, boundary, 1.0) for _ in range(batch_size)]
-                loss = high_step(items_batch, sigmas, noises)
-                mx.async_eval(loss, high_model.parameters(), high_optimizer.state)
+                sigmas = mx.array([
+                    _sample_timestep(1000, sampling, rng, boundary, 1.0)
+                    for _ in range(batch_size)
+                ])
+                loss = high_step(cleans, texts, sigmas, noises)
+                mx.async_eval(loss, high_state)
                 high_steps += 1
                 expert_tag = "H"
             else:
-                sigmas = [_sample_timestep(1000, sampling, rng, 0.0, boundary) for _ in range(batch_size)]
-                loss = low_step(items_batch, sigmas, noises)
-                mx.async_eval(loss, low_model.parameters(), low_optimizer.state)
+                sigmas = mx.array([
+                    _sample_timestep(1000, sampling, rng, 0.0, boundary)
+                    for _ in range(batch_size)
+                ])
+                loss = low_step(cleans, texts, sigmas, noises)
+                mx.async_eval(loss, low_state)
                 low_steps += 1
                 expert_tag = "L"
 

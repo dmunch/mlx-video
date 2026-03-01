@@ -871,3 +871,130 @@ class TestPreviewConfigFields:
             )
             with pytest.raises(ValueError, match="high_ratio"):
                 TrainingConfig.from_json(str(config_path))
+
+
+class TestQLoRA:
+    """Test LoRA on QuantizedLinear layers (QLoRA support)."""
+
+    def test_trainable_lora_on_quantized_linear(self):
+        """Test TrainableLoRALinear wraps QuantizedLinear correctly."""
+        from mlx_video.training.lora_layers import TrainableLoRALinear
+
+        # Wrap linear in a module so nn.quantize can replace it
+        class Wrapper(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer = nn.Linear(64, 128)
+
+        wrapper = Wrapper()
+        mx.eval(wrapper.parameters())
+        nn.quantize(wrapper, bits=4, group_size=64)
+        mx.eval(wrapper.parameters())
+
+        linear = wrapper.layer
+        assert isinstance(linear, nn.QuantizedLinear)
+
+        lora = TrainableLoRALinear(linear, rank=8, alpha=8.0)
+
+        # Forward pass should work
+        x = mx.random.normal((2, 64))
+        output = lora(x)
+        mx.eval(output)
+        assert output.shape == (2, 128)
+
+    def test_lora_on_quantized_initial_zero(self):
+        """Test that LoRA output starts at zero (lora_B is zero-initialized)."""
+        from mlx_video.training.lora_layers import TrainableLoRALinear
+
+        class Wrapper(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer = nn.Linear(64, 128)
+
+        wrapper = Wrapper()
+        mx.eval(wrapper.parameters())
+        nn.quantize(wrapper, bits=4, group_size=64)
+        mx.eval(wrapper.parameters())
+
+        linear = wrapper.layer
+        lora = TrainableLoRALinear(linear, rank=8, alpha=8.0)
+        x = mx.random.normal((2, 64))
+        base_output = linear(x)
+        lora_output = lora(x)
+        mx.eval(base_output, lora_output)
+        assert mx.allclose(base_output, lora_output, atol=1e-4).item()
+
+    def test_inject_lora_on_quantized_model(self):
+        """Test LoRA injection into a model with QuantizedLinear layers."""
+        from mlx_video.training.config import BlockRange, LoRAConfig
+        from mlx_video.training.lora_layers import (
+            TrainableLoRALinear,
+            inject_lora_layers,
+        )
+
+        class FakeAttn(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q = nn.Linear(64, 64)
+                self.k = nn.Linear(64, 64)
+
+        class FakeBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = FakeAttn()
+
+        class FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.blocks = [FakeBlock() for _ in range(2)]
+
+        model = FakeModel()
+        mx.eval(model.parameters())
+
+        # Quantize the model (targets q and k layers)
+        nn.quantize(
+            model,
+            bits=4,
+            group_size=64,
+            class_predicate=lambda p, m: isinstance(m, nn.Linear),
+        )
+        mx.eval(model.parameters())
+
+        # Verify layers are quantized
+        assert isinstance(model.blocks[0].self_attn.q, nn.QuantizedLinear)
+
+        # Inject LoRA on quantized layers
+        lora_config = LoRAConfig(
+            rank=4,
+            alpha=4.0,
+            targets=["self_attn.q", "self_attn.k"],
+            blocks=BlockRange(start=0, end=2),
+        )
+        count = inject_lora_layers(model, lora_config)
+        assert count == 4  # 2 blocks × 2 targets
+
+        # Verify LoRA wraps quantized linear
+        wrapped = model.blocks[0].self_attn.q
+        assert isinstance(wrapped, TrainableLoRALinear)
+        assert isinstance(wrapped.linear, nn.QuantizedLinear)
+
+    def test_quantized_lora_dimensions(self):
+        """Test that LoRA A/B matrices have correct dimensions for quantized base."""
+        from mlx_video.training.lora_layers import TrainableLoRALinear
+
+        class Wrapper(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layer = nn.Linear(256, 512)
+
+        wrapper = Wrapper()
+        mx.eval(wrapper.parameters())
+        nn.quantize(wrapper, bits=4, group_size=64)
+        mx.eval(wrapper.parameters())
+
+        lora = TrainableLoRALinear(wrapper.layer, rank=16, alpha=16.0)
+
+        # lora_A: (rank, in_features) = (16, 256)
+        assert lora.lora_A.shape == (16, 256)
+        # lora_B: (out_features, rank) = (512, 16)
+        assert lora.lora_B.shape == (512, 16)

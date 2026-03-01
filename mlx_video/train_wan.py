@@ -42,21 +42,27 @@ def _resolve_base_loras(config, expert: str) -> list[tuple[str, float]] | None:
 def _load_model(model_dir: Path, weight_file: str, base_loras=None):
     """Load a WanModel from model_dir with the specified weight file.
 
+    Automatically detects pre-quantized models from config.json metadata
+    and creates QuantizedLinear stubs before loading weights.
+
     Args:
         model_dir: Path to model directory.
         weight_file: Name of the weights safetensors file.
         base_loras: Optional list of (lora_path, strength) tuples to merge
                     into base weights before returning.
     """
+    import mlx.nn as nn
+
     from mlx_video.models.wan.config import WanModelConfig
     from mlx_video.models.wan.model import WanModel
 
     model_config_path = model_dir / "config.json"
+    quantization = None
 
     if model_config_path.exists():
         with open(model_config_path) as f:
             config_dict = json.load(f)
-        config_dict.pop("quantization", None)
+        quantization = config_dict.pop("quantization", None)
         for key in ("patch_size", "vae_stride", "window_size", "sample_guide_scale"):
             if key in config_dict and isinstance(config_dict[key], list):
                 config_dict[key] = tuple(config_dict[key])
@@ -71,6 +77,17 @@ def _load_model(model_dir: Path, weight_file: str, base_loras=None):
         model_config = WanModelConfig.wan22_t2v_14b()
 
     model = WanModel(model_config)
+
+    # For pre-quantized models, create QuantizedLinear stubs before loading
+    if quantization:
+        from mlx_video.convert_wan import _quantize_predicate
+
+        nn.quantize(
+            model,
+            group_size=quantization["group_size"],
+            bits=quantization["bits"],
+            class_predicate=lambda path, m: _quantize_predicate(path, m),
+        )
 
     weight_path = model_dir / weight_file
     if not weight_path.exists():
@@ -90,7 +107,7 @@ def _load_model(model_dir: Path, weight_file: str, base_loras=None):
     gc.collect()
     mx.clear_cache()
 
-    return model
+    return model, quantization
 
 
 def _setup_lora(model, lora_config):
@@ -126,7 +143,9 @@ def _train_single_expert(
     # Determine expert type from label for base LoRA filtering
     expert_type = "high" if "high" in expert_label else "low"
     base_loras = _resolve_base_loras(config, expert_type)
-    model = _load_model(model_dir, weight_file, base_loras=base_loras)
+    model, quantization = _load_model(model_dir, weight_file, base_loras=base_loras)
+    if quantization:
+        print(f"{Colors.DIM}  Quantized: {quantization['bits']}-bit (group_size={quantization['group_size']}){Colors.RESET}")
     print(f"{Colors.DIM}  Model loaded: {time.time() - t0:.1f}s{Colors.RESET}")
 
     _setup_lora(model, config.lora)
@@ -265,8 +284,11 @@ def main():
             t0 = time.time()
             high_base_loras = _resolve_base_loras(config, "high")
             low_base_loras = _resolve_base_loras(config, "low")
-            high_model = _load_model(model_dir, "high_noise_model.safetensors", base_loras=high_base_loras)
-            low_model = _load_model(model_dir, "low_noise_model.safetensors", base_loras=low_base_loras)
+            high_model, q1 = _load_model(model_dir, "high_noise_model.safetensors", base_loras=high_base_loras)
+            low_model, q2 = _load_model(model_dir, "low_noise_model.safetensors", base_loras=low_base_loras)
+            quantization = q1 or q2
+            if quantization:
+                print(f"{Colors.DIM}  Quantized: {quantization['bits']}-bit{Colors.RESET}")
             print(f"{Colors.DIM}  Both models loaded: {time.time() - t0:.1f}s{Colors.RESET}")
 
             _setup_lora(high_model, config.lora)
@@ -324,7 +346,9 @@ def main():
         print(f"\n{Colors.BLUE}Loading model ({weight_file})...{Colors.RESET}")
         t0 = time.time()
         single_base_loras = _resolve_base_loras(config, "single")
-        model = _load_model(model_dir, weight_file, base_loras=single_base_loras)
+        model, quantization = _load_model(model_dir, weight_file, base_loras=single_base_loras)
+        if quantization:
+            print(f"{Colors.DIM}  Quantized: {quantization['bits']}-bit{Colors.RESET}")
         print(f"{Colors.DIM}  Model loaded: {time.time() - t0:.1f}s{Colors.RESET}")
 
         _setup_lora(model, config.lora)

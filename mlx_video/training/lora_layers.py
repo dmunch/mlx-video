@@ -21,15 +21,20 @@ class TrainableLoRALinear(nn.Module):
     so the LoRA contribution starts at zero (standard practice).
     """
 
-    def __init__(self, linear: nn.Linear, rank: int, alpha: float):
+    def __init__(self, linear: nn.Linear | nn.QuantizedLinear, rank: int, alpha: float):
         super().__init__()
         self.linear = linear
         self.rank = rank
         self.alpha = alpha
         self.scale = alpha / rank
 
-        in_features = linear.weight.shape[1]
-        out_features = linear.weight.shape[0]
+        # QuantizedLinear packs weights into uint32 — unpack to get true dimensions
+        if isinstance(linear, nn.QuantizedLinear):
+            in_features = linear.weight.shape[1] * 32 // linear.bits
+            out_features = linear.weight.shape[0]
+        else:
+            in_features = linear.weight.shape[1]
+            out_features = linear.weight.shape[0]
 
         # Kaiming uniform init for A, zero init for B
         bound = 1.0 / math.sqrt(in_features)
@@ -93,7 +98,7 @@ def inject_lora_layers(model: nn.Module, lora_config: LoRAConfig) -> int:
 
             attr_name = parts[-1]
             layer = getattr(parent, attr_name, None)
-            if layer is None or not isinstance(layer, nn.Linear):
+            if layer is None or not isinstance(layer, (nn.Linear, nn.QuantizedLinear)):
                 continue
 
             wrapped = TrainableLoRALinear(layer, lora_config.rank, lora_config.alpha)
