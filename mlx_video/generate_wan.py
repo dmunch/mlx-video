@@ -608,17 +608,18 @@ def generate_video(
 
     is_wan22_vae = config.vae_z_dim == 48
 
-    # Warmup frame: prepend a duplicate of the first latent frame before
-    # decoding.  CausalConv3d uses replicate padding (first-frame context
-    # instead of zeros), so the warmup frame decodes with clean but static
-    # features.  The real first frame then sees those clean features as
-    # temporal context, giving it proper motion.  We trim the extra pixel
-    # frames (vae_stride[0] per warmup latent) produced by the warmup.
-    warmup_latents = 1
+    # Mirror-reflect warmup: prepend a time-reversed copy of the first few
+    # latent frames before VAE decoding.  This gives the real first frame
+    # varied temporal context (not zeros, not static duplicates) so the
+    # causal convolutions produce natural-looking output from frame 1.
+    # Sequence: [f1_mirror, f0_mirror, f0, f1, f2, ...]
+    # At the real f0 position, conv sees (f1, f0, f0) — real temporal
+    # dynamics without any zero-padding artifacts or gain bias.
+    # Extra pixel frames from the mirror prefix are trimmed after decoding.
+    warmup_latents = 2
     warmup_trim = warmup_latents * vae_stride[0]
-    latents_for_decode = mx.concatenate(
-        [latents[:, 0:1]] * warmup_latents + [latents], axis=1
-    )
+    mirror = latents[:, :warmup_latents][:, ::-1]  # time-reverse first W frames
+    latents_for_decode = mx.concatenate([mirror, latents], axis=1)
 
     if is_wan22_vae:
         from mlx_video.models.wan.vae22 import denormalize_latents

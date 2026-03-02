@@ -81,10 +81,10 @@ class CausalConv3d(nn.Module):
             y = mx.conv_general(x_flat, w2d) + self.bias
             return y.reshape(B, T, y.shape[1], y.shape[2], -1)
 
-        # Causal temporal padding (left only) — replicate first frame instead
-        # of zeros so the first output frame gets meaningful temporal context.
+        # Causal temporal padding (left only) — zeros match the reference
+        # implementation and what the model was trained with.
         if self._causal_pad_t > 0:
-            pad_t = mx.broadcast_to(x[:, 0:1], (B, self._causal_pad_t, H, W, C))
+            pad_t = mx.zeros((B, self._causal_pad_t, H, W, C))
             x = mx.concatenate([pad_t, x], axis=1)
 
         # Spatial padding
