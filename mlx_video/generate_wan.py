@@ -173,6 +173,13 @@ def generate_video(
     # Validate frame count
     assert (num_frames - 1) % 4 == 0, f"num_frames must be 4n+1, got {num_frames}"
 
+    # For T2V: generate 1 extra latent frame so the VAE's causal zero-padding
+    # artifacts land on throwaway frames. The reference Wan2.2 speech2video.py
+    # uses a similar "drop_first_motion" approach (drops 3 pixel frames).
+    # For I2V the reference image provides real first-frame content, so no extra needed.
+    extra_frames = config.vae_stride[0] if not is_i2v else 0
+    gen_frames = num_frames + extra_frames
+
     version_str = f"Wan{config.model_version}"
     mode_str = "dual-model" if is_dual else "single-model"
     pipeline_str = "Image-to-Video" if is_i2v else "Text-to-Video"
@@ -223,7 +230,7 @@ def generate_video(
 
     # Compute target latent shape
     z_dim = config.vae_z_dim
-    t_latent = (num_frames - 1) // vae_stride[0] + 1
+    t_latent = (gen_frames - 1) // vae_stride[0] + 1
     h_latent = height // vae_stride[1]
     w_latent = width // vae_stride[2]
     target_shape = (z_dim, t_latent, h_latent, w_latent)
@@ -234,6 +241,8 @@ def generate_video(
     )
 
     print(f"{Colors.DIM}  Latent shape: {target_shape}")
+    if extra_frames > 0:
+        print(f"  Generating {extra_frames} extra pixel frames to absorb VAE boundary artifacts")
     print(f"  Sequence length: {seq_len}{Colors.RESET}")
 
     # Load T5 encoder
@@ -608,58 +617,28 @@ def generate_video(
 
     is_wan22_vae = config.vae_z_dim == 48
 
-    # Linear-extrapolation warmup: prepend frames that extend the video
-    # backward in time using the motion vector between f0 and f1.
-    #
-    # f_{-k} = f0 + k * (f0 - f1) = (1+k)*f0 - k*f1
-    #
-    # This gives: [..., 3f0-2f1, 2f0-f1, f0, f1, f2, ...]
-    # The temporal gradient is consistent (same direction, same magnitude)
-    # so the CausalConv3d layers see natural-looking temporal dynamics at
-    # every position — no zeros, no duplicates, no temporal convergence.
-    #
-    # Why not mirror?  Mirror [fW,...,f1, f0, f1,...] reverses motion at
-    # the junction, creating temporal blur (averaging of approaching motion
-    # from both sides).  Linear extrapolation maintains direction.
-    #
-    # The reference Wan2.2 implementation does NOT handle first-frame
-    # artifacts — it accepts the zero-padding degradation as-is.  This
-    # warmup improves on the reference by absorbing the degradation in
-    # extra frames that we trim after decoding.
-    T_lat = latents.shape[1]
-    warmup_latents = min(4, T_lat - 1) if T_lat > 1 else 0
-    warmup_trim = warmup_latents * vae_stride[0]
-    if warmup_latents > 0:
-        delta = latents[:, 0:1] - latents[:, 1:2]  # backward motion vector
-        warmup_frames = []
-        for k in range(warmup_latents, 0, -1):
-            warmup_frames.append(latents[:, 0:1] + k * delta)
-        warmup = mx.concatenate(warmup_frames, axis=1)
-        latents_for_decode = mx.concatenate([warmup, latents], axis=1)
-    else:
-        latents_for_decode = latents
-
     if is_wan22_vae:
         from mlx_video.models.wan.vae22 import denormalize_latents
 
         # latents: [C, T, H, W] → [1, T, H, W, C] (channels-last for Wan2.2 VAE)
-        z = latents_for_decode.transpose(1, 2, 3, 0)[None]
+        z = latents.transpose(1, 2, 3, 0)[None]
         z = denormalize_latents(z)
         video = vae(z)
         mx.eval(video)
         print(f"{Colors.DIM}  VAE decode: {time.time() - t4:.1f}s{Colors.RESET}")
 
         video = np.array(video[0])  # [T', H', W', 3]
-        video = video[warmup_trim:]  # Trim warmup frames
+        # Trim extra frames generated for zero-padding warmup
+        if extra_frames > 0:
+            video = video[extra_frames:]
         video = (video + 1.0) / 2.0
         video = np.clip(video * 255.0, 0, 255).astype(np.uint8)
     else:
-        video = vae.decode(latents_for_decode[None])
+        video = vae.decode(latents[None])
         mx.eval(video)
         print(f"{Colors.DIM}  VAE decode: {time.time() - t4:.1f}s{Colors.RESET}")
 
         video = np.array(video[0])  # [3, T', H, W]
-        video = video[:, warmup_trim:]  # Trim warmup frames (channels-first)
         video = (video + 1.0) / 2.0
         video = np.clip(video * 255.0, 0, 255).astype(np.uint8)
         video = video.transpose(1, 2, 3, 0)  # [T, H, W, 3]
