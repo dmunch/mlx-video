@@ -608,24 +608,34 @@ def generate_video(
 
     is_wan22_vae = config.vae_z_dim == 48
 
-    # Offset-mirror warmup: prepend time-reversed copies of latent frames
-    # 1..W (not 0..W-1) before VAE decoding.  Using an offset avoids
-    # duplicating f0 at the junction — the old mirror [f1, f0, f0, f1, ...]
-    # had identical values at positions W-1 and W, producing zero temporal
-    # gradient and "no motion" in the first visible frames.
+    # Linear-extrapolation warmup: prepend frames that extend the video
+    # backward in time using the motion vector between f0 and f1.
     #
-    # Offset mirror sequence: [fW, ..., f2, f1, f0, f1, f2, ..., fN]
-    # At the junction: f1 → f0 → f1, with varied temporal context everywhere.
-    # The zero-padding degradation from 30+ CausalConv3d layers is absorbed
-    # by the 4 warmup positions (degradation intensity falls exponentially
-    # with distance, and 4 warmup pushes the first real frame past the
-    # heavily-degraded zone).
+    # f_{-k} = f0 + k * (f0 - f1) = (1+k)*f0 - k*f1
+    #
+    # This gives: [..., 3f0-2f1, 2f0-f1, f0, f1, f2, ...]
+    # The temporal gradient is consistent (same direction, same magnitude)
+    # so the CausalConv3d layers see natural-looking temporal dynamics at
+    # every position — no zeros, no duplicates, no temporal convergence.
+    #
+    # Why not mirror?  Mirror [fW,...,f1, f0, f1,...] reverses motion at
+    # the junction, creating temporal blur (averaging of approaching motion
+    # from both sides).  Linear extrapolation maintains direction.
+    #
+    # The reference Wan2.2 implementation does NOT handle first-frame
+    # artifacts — it accepts the zero-padding degradation as-is.  This
+    # warmup improves on the reference by absorbing the degradation in
+    # extra frames that we trim after decoding.
     T_lat = latents.shape[1]
     warmup_latents = min(4, T_lat - 1) if T_lat > 1 else 0
     warmup_trim = warmup_latents * vae_stride[0]
     if warmup_latents > 0:
-        mirror = latents[:, 1:1 + warmup_latents][:, ::-1]
-        latents_for_decode = mx.concatenate([mirror, latents], axis=1)
+        delta = latents[:, 0:1] - latents[:, 1:2]  # backward motion vector
+        warmup_frames = []
+        for k in range(warmup_latents, 0, -1):
+            warmup_frames.append(latents[:, 0:1] + k * delta)
+        warmup = mx.concatenate(warmup_frames, axis=1)
+        latents_for_decode = mx.concatenate([warmup, latents], axis=1)
     else:
         latents_for_decode = latents
 
