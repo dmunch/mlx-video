@@ -47,6 +47,7 @@ def generate_video(
     loras: list | None = None,
     loras_high: list | None = None,
     loras_low: list | None = None,
+    tiling: str = "auto",
 ):
     """Generate video using Wan pipeline (supports T2V and I2V).
 
@@ -68,6 +69,12 @@ def generate_video(
         loras: Optional list of (path, strength) tuples applied to all models
         loras_high: Optional list of (path, strength) tuples for high-noise model only
         loras_low: Optional list of (path, strength) tuples for low-noise model only
+        tiling: Tiling mode for VAE decoding. Options:
+            - "auto": Automatically determine tiling based on video size (default)
+            - "none": Disable tiling
+            - "default", "aggressive", "conservative": Preset tiling configs
+            - "spatial": Spatial tiling only
+            - "temporal": Temporal tiling only
     """
     import json
 
@@ -617,13 +624,42 @@ def generate_video(
 
     is_wan22_vae = config.vae_z_dim == 48
 
+    # Select tiling configuration
+    from mlx_video.models.ltx.video_vae.tiling import TilingConfig
+
+    if tiling == "none":
+        tiling_config = None
+    elif tiling == "auto":
+        tiling_config = TilingConfig.auto(height, width, num_frames)
+    elif tiling == "default":
+        tiling_config = TilingConfig.default()
+    elif tiling == "aggressive":
+        tiling_config = TilingConfig.aggressive()
+    elif tiling == "conservative":
+        tiling_config = TilingConfig.conservative()
+    elif tiling == "spatial":
+        tiling_config = TilingConfig.spatial_only()
+    elif tiling == "temporal":
+        tiling_config = TilingConfig.temporal_only()
+    else:
+        print(f"{Colors.YELLOW}  Unknown tiling mode '{tiling}', using auto{Colors.RESET}")
+        tiling_config = TilingConfig.auto(height, width, num_frames)
+
+    if tiling_config is not None:
+        spatial_info = f"{tiling_config.spatial_config.tile_size_in_pixels}px" if tiling_config.spatial_config else "none"
+        temporal_info = f"{tiling_config.temporal_config.tile_size_in_frames}f" if tiling_config.temporal_config else "none"
+        print(f"{Colors.DIM}  Tiling ({tiling}): spatial={spatial_info}, temporal={temporal_info}{Colors.RESET}")
+
     if is_wan22_vae:
         from mlx_video.models.wan.vae22 import denormalize_latents
 
         # latents: [C, T, H, W] → [1, T, H, W, C] (channels-last for Wan2.2 VAE)
         z = latents.transpose(1, 2, 3, 0)[None]
         z = denormalize_latents(z)
-        video = vae(z)
+        if tiling_config is not None:
+            video = vae.decode_tiled(z, tiling_config)
+        else:
+            video = vae(z)
         mx.eval(video)
         print(f"{Colors.DIM}  VAE decode: {time.time() - t4:.1f}s{Colors.RESET}")
 
@@ -634,7 +670,10 @@ def generate_video(
         video = (video + 1.0) / 2.0
         video = np.clip(video * 255.0, 0, 255).astype(np.uint8)
     else:
-        video = vae.decode(latents[None])
+        if tiling_config is not None:
+            video = vae.decode_tiled(latents[None], tiling_config)
+        else:
+            video = vae.decode(latents[None])
         mx.eval(video)
         print(f"{Colors.DIM}  VAE decode: {time.time() - t4:.1f}s{Colors.RESET}")
 
@@ -687,6 +726,13 @@ def main():
         "--lora-low", nargs=2, action="append", metavar=("PATH", "STRENGTH"),
         help="Apply a LoRA to low-noise model only (dual-model, repeatable)",
     )
+    parser.add_argument(
+        "--tiling",
+        type=str,
+        default="auto",
+        choices=["auto", "none", "default", "aggressive", "conservative", "spatial", "temporal"],
+        help="VAE tiling mode to reduce memory during decoding (default: auto)",
+    )
     args = parser.parse_args()
 
     # Parse guide scale
@@ -724,6 +770,7 @@ def main():
         loras=_parse_lora_args(args.lora),
         loras_high=_parse_lora_args(args.lora_high),
         loras_low=_parse_lora_args(args.lora_low),
+        tiling=args.tiling,
     )
 
 
