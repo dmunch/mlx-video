@@ -25,16 +25,18 @@ class WanModelConfig(BaseModelConfig):
     cross_attn_norm: bool = True
     eps: float = 1e-6
 
-    # TeaCache polynomial coefficients (from official TeaCache4Wan2.1).
-    # Maps relative L1 distance of timestep embeddings to output distance.
+    # TeaCache polynomial coefficients (ret-mode, from ComfyUI-TeaCache).
+    # Maps relative L1 distance of projected time embeddings (e0) to output distance.
     # Format: np.poly1d convention (highest degree first).
+    # Ret-mode coefficients are profiled against e0 and work better across
+    # different step counts and schedule shifts than non-ret (raw e) coefficients.
     # These are overridden per model variant in the classmethod constructors.
     teacache_coefficients: Optional[tuple] = (
-        -5784.54975374,
-        5449.50911966,
-        -1811.16591783,
-        256.27178429,
-        -13.02252404,
+        -3.03318725e05,
+        4.90537029e04,
+        -2.65530556e03,
+        5.87365115e01,
+        -3.15583525e-01,
     )
 
     # VAE
@@ -98,11 +100,11 @@ class WanModelConfig(BaseModelConfig):
             sample_steps=50,
             sample_guide_scale=5.0,
             teacache_coefficients=(
-                2.39676752e+03,
-                -1.31110545e+03,
-                2.01331979e+02,
-                -8.29855975e+00,
-                1.37887774e-01,
+                -5.21862437e04,
+                9.23041404e03,
+                -5.28275948e02,
+                1.36987616e01,
+                -4.99875664e-02,
             ),
         )
 
@@ -123,8 +125,14 @@ class WanModelConfig(BaseModelConfig):
             sample_shift=5.0,
             sample_guide_scale=(3.5, 3.5),
             max_area=704 * 1280,
-            # No profiled TeaCache coefficients for I2V yet
-            teacache_coefficients=None,
+            # Ret-mode coefficients from ComfyUI (i2v_480p variant)
+            teacache_coefficients=(
+                2.57151496e05,
+                -3.54229917e04,
+                1.40286849e03,
+                -1.35890334e01,
+                1.32517977e-01,
+            ),
         )
 
     @classmethod

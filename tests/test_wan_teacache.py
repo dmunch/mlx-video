@@ -3,7 +3,6 @@
 import mlx.core as mx
 import numpy as np
 import pytest
-
 from wan_test_helpers import _make_tiny_config
 
 from mlx_video.models.wan.model import TeaCacheState, WanModel
@@ -33,14 +32,15 @@ class TestTeaCacheState:
 
     def test_polynomial_rescaling(self):
         """Verify polynomial rescaling matches np.poly1d."""
+        # Ret-mode coefficients for T2V 14B
         coefficients = (
-            -5784.54975374,
-            5449.50911966,
-            -1811.16591783,
-            256.27178429,
-            -13.02252404,
+            -3.03318725e05,
+            4.90537029e04,
+            -2.65530556e03,
+            5.87365115e01,
+            -3.15583525e-01,
         )
-        x = 0.05  # typical relative L1 distance
+        x = 0.02  # typical relative L1 distance for e0
 
         # np.poly1d evaluation
         expected = np.poly1d(coefficients)(x)
@@ -71,7 +71,10 @@ class TestTeaCacheIntegration:
 
         latent = mx.random.normal((C, F, H, W))
         t = mx.array([500.0, 500.0])
-        context = [mx.random.normal((6, config.text_dim)), mx.random.normal((6, config.text_dim))]
+        context = [
+            mx.random.normal((6, config.text_dim)),
+            mx.random.normal((6, config.text_dim)),
+        ]
 
         # Run without TeaCache
         out1 = model([latent, latent], t=t, context=context, seq_len=seq_len)
@@ -82,9 +85,7 @@ class TestTeaCacheIntegration:
         out2 = model([latent, latent], t=t, context=context, seq_len=seq_len)
         mx.eval(out2)
 
-        np.testing.assert_allclose(
-            np.array(out1[0]), np.array(out2[0]), atol=1e-5
-        )
+        np.testing.assert_allclose(np.array(out1[0]), np.array(out2[0]), atol=1e-5)
 
     def test_teacache_skips_steps(self):
         """With a very high threshold, steps should be skipped after the first."""
@@ -135,7 +136,10 @@ class TestTeaCacheIntegration:
         seq_len = (F // pt) * (H // ph) * (W // pw)
 
         latent = mx.random.normal((C, F, H, W))
-        context = [mx.random.normal((6, config.text_dim)), mx.random.normal((6, config.text_dim))]
+        context = [
+            mx.random.normal((6, config.text_dim)),
+            mx.random.normal((6, config.text_dim)),
+        ]
         t = mx.array([500.0, 500.0])
 
         out = model([latent, latent], t=t, context=context, seq_len=seq_len)

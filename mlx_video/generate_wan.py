@@ -14,14 +14,9 @@ import numpy as np
 from tqdm import tqdm
 
 from mlx_video.models.wan.i2v_utils import build_i2v_mask, preprocess_image
-from mlx_video.models.wan.loading import (
-    _clean_text,
-    encode_text,
-    load_t5_encoder,
-    load_vae_decoder,
-    load_vae_encoder,
-    load_wan_model,
-)
+from mlx_video.models.wan.loading import (_clean_text, encode_text,
+                                          load_t5_encoder, load_vae_decoder,
+                                          load_vae_encoder, load_wan_model)
 from mlx_video.postprocess import save_video
 from mlx_video.utils import Colors
 
@@ -68,6 +63,7 @@ def generate_video(
     output_path: str = "output.mp4",
     scheduler: str = "unipc",
     teacache_thresh: float = 0.0,
+    teacache_verbose: bool = False,
     spectrum: bool = False,
     spectrum_w: float = 0.5,
     spectrum_flex_window: float = 0.75,
@@ -95,6 +91,7 @@ def generate_video(
         output_path: Output video path
         scheduler: Solver type: 'euler', 'dpm++', or 'unipc' (default)
         teacache_thresh: TeaCache threshold (0=disabled, 0.1=~2x speedup, 0.2=~3x speedup)
+        teacache_verbose: Print per-step TeaCache diagnostics (rel_l1, rescaled, skip/compute)
         spectrum: Enable Spectrum acceleration (Chebyshev polynomial feature forecasting)
         spectrum_w: Spectrum blend weight: 0=Taylor only, 1=Chebyshev only (default: 0.5)
         spectrum_flex_window: Window growth rate controlling speedup (0.75=~3.5x, 3.0=~5x)
@@ -113,11 +110,9 @@ def generate_video(
     import json
 
     from mlx_video.models.wan.config import WanModelConfig
-    from mlx_video.models.wan.scheduler import (
-        FlowDPMPP2MScheduler,
-        FlowMatchEulerScheduler,
-        FlowUniPCScheduler,
-    )
+    from mlx_video.models.wan.scheduler import (FlowDPMPP2MScheduler,
+                                                FlowMatchEulerScheduler,
+                                                FlowUniPCScheduler)
 
     model_dir = Path(model_dir)
 
@@ -133,10 +128,13 @@ def generate_video(
         for key in ("patch_size", "vae_stride", "window_size", "sample_guide_scale"):
             if key in config_dict and isinstance(config_dict[key], list):
                 config_dict[key] = tuple(config_dict[key])
-        config = WanModelConfig(**{
-            k: v for k, v in config_dict.items()
-            if k in WanModelConfig.__dataclass_fields__
-        })
+        config = WanModelConfig(
+            **{
+                k: v
+                for k, v in config_dict.items()
+                if k in WanModelConfig.__dataclass_fields__
+            }
+        )
     else:
         # Auto-detect: dual model files → 2.2, single model → 2.1
         if (model_dir / "low_noise_model.safetensors").exists():
@@ -172,7 +170,9 @@ def generate_video(
                 if "patch_embedding_proj.weight" in k:
                     actual_dim = v.shape[0]
                     if actual_dim != config.dim:
-                        print(f"{Colors.YELLOW}  Config dim={config.dim} doesn't match weights dim={actual_dim}, auto-correcting...{Colors.RESET}")
+                        print(
+                            f"{Colors.YELLOW}  Config dim={config.dim} doesn't match weights dim={actual_dim}, auto-correcting...{Colors.RESET}"
+                        )
                         if actual_dim <= 2048:
                             config = WanModelConfig.wan21_t2v_1_3b()
                         else:
@@ -182,13 +182,20 @@ def generate_video(
 
     # Auto-correct Wan2.2 VAE params from stale configs
     if config.in_dim == 48 and config.vae_z_dim != 48:
-        print(f"{Colors.YELLOW}  Auto-correcting Wan2.2 VAE params (in_dim=48 but vae_z_dim={config.vae_z_dim}){Colors.RESET}")
-        config = WanModelConfig(**{
-            **{f.name: getattr(config, f.name) for f in config.__dataclass_fields__.values()},
-            "vae_z_dim": 48,
-            "vae_stride": (4, 16, 16),
-            "sample_fps": 24,
-        })
+        print(
+            f"{Colors.YELLOW}  Auto-correcting Wan2.2 VAE params (in_dim=48 but vae_z_dim={config.vae_z_dim}){Colors.RESET}"
+        )
+        config = WanModelConfig(
+            **{
+                **{
+                    f.name: getattr(config, f.name)
+                    for f in config.__dataclass_fields__.values()
+                },
+                "vae_z_dim": 48,
+                "vae_stride": (4, 16, 16),
+                "sample_fps": 24,
+            }
+        )
 
     # Apply defaults from config if not overridden
     if steps is None:
@@ -234,10 +241,16 @@ def generate_video(
     if is_i2v:
         print(f"  Image: {image}")
     if neg_prompt_resolved and neg_prompt_resolved.strip():
-        neg_display = neg_prompt_resolved[:60] + "..." if len(neg_prompt_resolved) > 60 else neg_prompt_resolved
+        neg_display = (
+            neg_prompt_resolved[:60] + "..."
+            if len(neg_prompt_resolved) > 60
+            else neg_prompt_resolved
+        )
         print(f"  Neg prompt: {neg_display}")
     print(f"  Size: {width}x{height}, Frames: {num_frames}")
-    print(f"  Steps: {steps}, Guide: {guide_scale}, Shift: {shift}, Solver: {scheduler}")
+    print(
+        f"  Steps: {steps}, Guide: {guide_scale}, Shift: {shift}, Solver: {scheduler}"
+    )
     if cfg_disabled:
         print(f"  CFG: disabled (guide_scale≤1 → B=1 fast path, 2x denoising speedup)")
     print(f"{Colors.RESET}")
@@ -262,7 +275,9 @@ def generate_video(
             height = align_h
         if width == 0:
             width = align_w
-        print(f"{Colors.DIM}  Aligned {old_w}x{old_h} → {width}x{height} (must be divisible by {align_w}x{align_h}){Colors.RESET}")
+        print(
+            f"{Colors.DIM}  Aligned {old_w}x{old_h} → {width}x{height} (must be divisible by {align_w}x{align_h}){Colors.RESET}"
+        )
 
     # Enforce max_area constraint (model-specific resolution limit)
     if config.max_area > 0 and height * width > config.max_area:
@@ -286,6 +301,11 @@ def generate_video(
     )
 
     print(f"{Colors.DIM}  Latent shape: {target_shape}")
+    if extra_frames > 0:
+        print(
+            f"  Generating {extra_frames} extra pixel frames to absorb VAE boundary artifacts"
+        )
+
     print(f"  Sequence length: {seq_len}{Colors.RESET}")
 
     # Load T5 encoder
@@ -296,6 +316,7 @@ def generate_video(
 
     # Load tokenizer
     from transformers import AutoTokenizer
+
     tokenizer = AutoTokenizer.from_pretrained("google/umt5-xxl")
 
     # Encode prompts
@@ -305,12 +326,15 @@ def generate_video(
         context_null = None
         mx.eval(context)
     else:
-        context_null = encode_text(t5_encoder, tokenizer, neg_prompt_resolved, config.text_len)
+        context_null = encode_text(
+            t5_encoder, tokenizer, neg_prompt_resolved, config.text_len
+        )
         mx.eval(context, context_null)
 
     # Free T5 from memory
     del t5_encoder
-    gc.collect(); mx.clear_cache()
+    gc.collect()
+    mx.clear_cache()
     print(f"{Colors.DIM}  T5 encoding: {time.time() - t1:.1f}s{Colors.RESET}")
 
     # I2V: encode image to latent space
@@ -333,18 +357,25 @@ def generate_video(
 
             img = Image.open(image).convert("RGB")
             scale = max(width / img.width, height / img.height)
-            img = img.resize((round(img.width * scale), round(img.height * scale)), Image.LANCZOS)
+            img = img.resize(
+                (round(img.width * scale), round(img.height * scale)), Image.LANCZOS
+            )
             x1, y1 = (img.width - width) // 2, (img.height - height) // 2
             img = img.crop((x1, y1, x1 + width, y1 + height))
-            img_arr = mx.array(np.array(img, dtype=np.float32) / 255.0 * 2.0 - 1.0)  # [H, W, 3]
+            img_arr = mx.array(
+                np.array(img, dtype=np.float32) / 255.0 * 2.0 - 1.0
+            )  # [H, W, 3]
             img_chw = img_arr.transpose(2, 0, 1)  # [3, H, W]
 
             # Build video: first frame = image, rest = zeros -> [3, F, H, W]
             # Chunked encoding processes 1-frame + 4-frame chunks with temporal caching
-            video = mx.concatenate([
-                img_chw[:, None, :, :],
-                mx.zeros((3, num_frames - 1, height, width)),
-            ], axis=1)
+            video = mx.concatenate(
+                [
+                    img_chw[:, None, :, :],
+                    mx.zeros((3, num_frames - 1, height, width)),
+                ],
+                axis=1,
+            )
 
             # Encode through Wan2.1 VAE -> [1, z_dim, T_lat, H_lat, W_lat]
             vae_enc = load_vae_encoder(vae_path, config)
@@ -354,12 +385,17 @@ def generate_video(
 
             # Build mask: 1 for first frame, 0 for rest -> rearrange to [4, T_lat, H, W]
             msk = mx.ones((1, num_frames, h_latent, w_latent))
-            msk = mx.concatenate([msk[:, :1], mx.zeros((1, num_frames - 1, h_latent, w_latent))], axis=1)
+            msk = mx.concatenate(
+                [msk[:, :1], mx.zeros((1, num_frames - 1, h_latent, w_latent))], axis=1
+            )
             # Repeat first frame 4x, concat rest: [1, 4 + (F-1), H_lat, W_lat]
-            msk = mx.concatenate([
-                mx.repeat(msk[:, :1], 4, axis=1),
-                msk[:, 1:],
-            ], axis=1)
+            msk = mx.concatenate(
+                [
+                    mx.repeat(msk[:, :1], 4, axis=1),
+                    msk[:, 1:],
+                ],
+                axis=1,
+            )
             # Reshape to [1, T_lat, 4, H_lat, W_lat] then transpose -> [4, T_lat, H_lat, W_lat]
             msk = msk.reshape(1, msk.shape[1] // 4, 4, h_latent, w_latent)
             msk = msk.transpose(0, 2, 1, 3, 4)[0]  # [4, T_lat, H_lat, W_lat]
@@ -382,13 +418,16 @@ def generate_video(
 
             del vae_enc, img_tensor
 
-        gc.collect(); mx.clear_cache()
+        gc.collect()
+        mx.clear_cache()
         print(f"{Colors.DIM}  Image encoding: {time.time() - t_img:.1f}s{Colors.RESET}")
 
     # Load transformer models
     print(f"\n{Colors.BLUE}Loading transformer model(s)...{Colors.RESET}")
     if quantization:
-        print(f"{Colors.DIM}  Using {quantization['bits']}-bit quantized weights (group_size={quantization['group_size']}){Colors.RESET}")
+        print(
+            f"{Colors.DIM}  Using {quantization['bits']}-bit quantized weights (group_size={quantization['group_size']}){Colors.RESET}"
+        )
     t2 = time.time()
 
     # Merge per-model LoRAs with shared LoRAs
@@ -399,10 +438,16 @@ def generate_video(
     if is_dual:
         low_noise_path = model_dir / "low_noise_model.safetensors"
         high_noise_path = model_dir / "high_noise_model.safetensors"
-        low_noise_model = load_wan_model(low_noise_path, config, quantization, loras=_loras_low)
-        high_noise_model = load_wan_model(high_noise_path, config, quantization, loras=_loras_high)
+        low_noise_model = load_wan_model(
+            low_noise_path, config, quantization, loras=_loras_low
+        )
+        high_noise_model = load_wan_model(
+            high_noise_path, config, quantization, loras=_loras_high
+        )
     else:
-        single_model = load_wan_model(model_dir / "model.safetensors", config, quantization, loras=_loras_single)
+        single_model = load_wan_model(
+            model_dir / "model.safetensors", config, quantization, loras=_loras_single
+        )
     print(f"{Colors.DIM}  Models loaded: {time.time() - t2:.1f}s{Colors.RESET}")
 
     # Precompute text embeddings once (avoids redundant MLP in every step)
@@ -424,8 +469,12 @@ def generate_video(
             context_emb_low = low_noise_model.embed_text([context, context_null])
             context_emb_high = high_noise_model.embed_text([context, context_null])
             mx.eval(context_emb_low, context_emb_high)
-            context_cfg_low = mx.concatenate([context_emb_low[0:1], context_emb_low[1:2]], axis=0)
-            context_cfg_high = mx.concatenate([context_emb_high[0:1], context_emb_high[1:2]], axis=0)
+            context_cfg_low = mx.concatenate(
+                [context_emb_low[0:1], context_emb_low[1:2]], axis=0
+            )
+            context_cfg_high = mx.concatenate(
+                [context_emb_high[0:1], context_emb_high[1:2]], axis=0
+            )
         else:
             context_emb = single_model.embed_text([context, context_null])
             mx.eval(context_emb)
@@ -494,8 +543,11 @@ def generate_video(
     # Configure TeaCache
     if teacache_thresh > 0 and not spectrum:
         if config.teacache_coefficients is None:
-            print(f"{Colors.YELLOW}  Warning: TeaCache not available for this model (no profiled coefficients). Ignoring --teacache-thresh.{Colors.RESET}")
+            print(
+                f"{Colors.YELLOW}  Warning: TeaCache not available for this model (no profiled coefficients). Ignoring --teacache-thresh.{Colors.RESET}"
+            )
         else:
+
             def _configure_teacache(m, steps):
                 m.teacache.enabled = True
                 m.teacache.threshold = teacache_thresh
@@ -503,6 +555,7 @@ def generate_video(
                 m.teacache.num_steps = steps
                 m.teacache.ret_steps = 2
                 m.teacache.cutoff_steps = steps - 2
+                m.teacache.verbose = teacache_verbose
                 m.teacache.reset()
 
             if is_dual:
@@ -516,7 +569,9 @@ def generate_video(
     use_caching = False
     if spectrum:
         if teacache_thresh > 0:
-            print(f"{Colors.YELLOW}  Warning: Spectrum and TeaCache are mutually exclusive. Using Spectrum.{Colors.RESET}")
+            print(
+                f"{Colors.YELLOW}  Warning: Spectrum and TeaCache are mutually exclusive. Using Spectrum.{Colors.RESET}"
+            )
 
         def _configure_spectrum(m, num_steps):
             m.spectrum.enabled = True
@@ -537,11 +592,15 @@ def generate_video(
             if low_steps >= 8:
                 _configure_spectrum(low_noise_model, low_steps)
             else:
-                print(f"{Colors.DIM}  Spectrum: disabled for low-noise model ({low_steps} steps, need ≥8){Colors.RESET}")
+                print(
+                    f"{Colors.DIM}  Spectrum: disabled for low-noise model ({low_steps} steps, need ≥8){Colors.RESET}"
+                )
         else:
             _configure_spectrum(single_model, steps)
         use_caching = True
-        print(f"{Colors.DIM}  Spectrum: w={spectrum_w}, flex_window={spectrum_flex_window}, warmup={spectrum_warmup}{Colors.RESET}")
+        print(
+            f"{Colors.DIM}  Spectrum: w={spectrum_w}, flex_window={spectrum_flex_window}, warmup={spectrum_warmup}{Colors.RESET}"
+        )
     elif teacache_thresh > 0:
         use_caching = True
 
@@ -575,7 +634,7 @@ def generate_video(
             rcs = rope_cos_sin
 
         # Use compiled forward when available (faster after first trace)
-        _call = getattr(model, '_compiled', model)
+        _call = getattr(model, "_compiled", model)
 
         if cfg_disabled:
             # No CFG: B=1 forward pass (2x faster than B=2 CFG batch)
@@ -593,7 +652,9 @@ def generate_video(
             y_arg = [y_i2v] if is_i2v_channel_concat else None
 
             if is_dual:
-                ctx = context_cond_high if timestep_val >= boundary else context_cond_low
+                ctx = (
+                    context_cond_high if timestep_val >= boundary else context_cond_low
+                )
             else:
                 ctx = context_cond
             preds = _call(
@@ -612,7 +673,11 @@ def generate_video(
             if is_dual:
                 gs = guide_scale[1] if timestep_val >= boundary else guide_scale[0]
             else:
-                gs = guide_scale if isinstance(guide_scale, (int, float)) else guide_scale[0]
+                gs = (
+                    guide_scale
+                    if isinstance(guide_scale, (int, float))
+                    else guide_scale[0]
+                )
 
             if is_i2v_mask_blend:
                 t_tokens = i2v_mask_tokens * timestep_val
@@ -627,8 +692,10 @@ def generate_video(
 
             y_arg = [y_i2v, y_i2v] if is_i2v_channel_concat else None
 
-            ctx = context_cfg if not is_dual else (
-                context_cfg_high if timestep_val >= boundary else context_cfg_low
+            ctx = (
+                context_cfg
+                if not is_dual
+                else (context_cfg_high if timestep_val >= boundary else context_cfg_low)
             )
             preds = _call(
                 [latents, latents],
@@ -665,7 +732,9 @@ def generate_video(
         total_computed = sum(m.teacache.steps_computed for _, m in models_to_report)
         total = total_skipped + total_computed
         if total > 0:
-            print(f"{Colors.DIM}  TeaCache: {total_skipped}/{total} steps skipped ({total_skipped/total*100:.0f}%){Colors.RESET}")
+            print(
+                f"{Colors.DIM}  TeaCache: {total_skipped}/{total} steps skipped ({total_skipped/total*100:.0f}%){Colors.RESET}"
+            )
 
     if spectrum:
         models_to_report = (
@@ -677,7 +746,9 @@ def generate_video(
         total_computed = sum(m.spectrum.steps_computed for _, m in models_to_report)
         total = total_predicted + total_computed
         if total > 0:
-            print(f"{Colors.DIM}  Spectrum: {total_predicted}/{total} steps predicted ({total_predicted/total*100:.0f}% skipped){Colors.RESET}")
+            print(
+                f"{Colors.DIM}  Spectrum: {total_predicted}/{total} steps predicted ({total_predicted/total*100:.0f}% skipped){Colors.RESET}"
+            )
 
     # Free transformer models and text embeddings
     if is_dual:
@@ -695,7 +766,8 @@ def generate_video(
     del model, kv, context
     if context_null is not None:
         del context_null
-    gc.collect(); mx.clear_cache()
+    gc.collect()
+    mx.clear_cache()
 
     # Load VAE and decode
     print(f"\n{Colors.BLUE}Decoding with VAE...{Colors.RESET}")
@@ -723,13 +795,25 @@ def generate_video(
     elif tiling == "temporal":
         tiling_config = TilingConfig.temporal_only()
     else:
-        print(f"{Colors.YELLOW}  Unknown tiling mode '{tiling}', using auto{Colors.RESET}")
+        print(
+            f"{Colors.YELLOW}  Unknown tiling mode '{tiling}', using auto{Colors.RESET}"
+        )
         tiling_config = TilingConfig.auto(height, width, num_frames)
 
     if tiling_config is not None:
-        spatial_info = f"{tiling_config.spatial_config.tile_size_in_pixels}px" if tiling_config.spatial_config else "none"
-        temporal_info = f"{tiling_config.temporal_config.tile_size_in_frames}f" if tiling_config.temporal_config else "none"
-        print(f"{Colors.DIM}  Tiling ({tiling}): spatial={spatial_info}, temporal={temporal_info}{Colors.RESET}")
+        spatial_info = (
+            f"{tiling_config.spatial_config.tile_size_in_pixels}px"
+            if tiling_config.spatial_config
+            else "none"
+        )
+        temporal_info = (
+            f"{tiling_config.temporal_config.tile_size_in_frames}f"
+            if tiling_config.temporal_config
+            else "none"
+        )
+        print(
+            f"{Colors.DIM}  Tiling ({tiling}): spatial={spatial_info}, temporal={temporal_info}{Colors.RESET}"
+        )
 
     if is_wan22_vae:
         from mlx_video.models.wan.vae22 import denormalize_latents
@@ -767,7 +851,12 @@ def generate_video(
 
 def main():
     parser = argparse.ArgumentParser(description="Wan Text-to-Video Generation (MLX)")
-    parser.add_argument("--model-dir", type=str, required=True, help="Path to converted MLX model directory")
+    parser.add_argument(
+        "--model-dir",
+        type=str,
+        required=True,
+        help="Path to converted MLX model directory",
+    )
     parser.add_argument("--prompt", type=str, required=True, help="Text prompt")
     parser.add_argument("--image", type=str, default=None,
                         help="Path to input image for I2V (omit for T2V mode)")
@@ -784,47 +873,107 @@ def main():
     parser.add_argument("--seed", type=int, default=-1, help="Random seed")
     parser.add_argument("--output-path", type=str, default="output.mp4", help="Output video path")
     parser.add_argument(
-        "--scheduler", type=str, default="unipc",
+        "--num-frames", type=int, default=81, help="Number of frames (must be 4n+1)"
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help="Number of diffusion steps (default: from config)",
+    )
+    parser.add_argument(
+        "--guide-scale",
+        type=str,
+        default=None,
+        help="Guidance scale: single float or low,high pair",
+    )
+    parser.add_argument(
+        "--shift",
+        type=float,
+        default=None,
+        help="Noise schedule shift (default: from config)",
+    )
+    parser.add_argument("--seed", type=int, default=-1, help="Random seed")
+    parser.add_argument(
+        "--output-path", type=str, default="output.mp4", help="Output video path"
+    )
+    parser.add_argument(
+        "--scheduler",
+        type=str,
+        default="unipc",
         choices=["euler", "dpm++", "unipc"],
         help="Diffusion solver: euler (1st order), dpm++ (2nd order), unipc (2nd order PC, default/official)",
     )
     parser.add_argument(
-        "--teacache-thresh", type=float, default=0.0,
-        help="TeaCache threshold (0=disabled, 0.1=~2x speedup, 0.2=~3x speedup)"
+        "--teacache-thresh",
+        type=float,
+        default=0.0,
+        help="TeaCache threshold (0=disabled, 0.1=~2x speedup, 0.2=~3x speedup)",
     )
     parser.add_argument(
-        "--spectrum", action="store_true", default=False,
-        help="Enable Spectrum acceleration (Chebyshev feature forecasting, ~3.5x speedup)"
+        "--teacache-verbose",
+        action="store_true",
+        default=False,
+        help="Print per-step TeaCache diagnostics (rel_l1, rescaled, skip/compute)",
     )
     parser.add_argument(
-        "--spectrum-w", type=float, default=0.5,
-        help="Spectrum blend weight: 0=Taylor only, 1=Chebyshev only (default: 0.5)"
+        "--spectrum",
+        action="store_true",
+        default=False,
+        help="Enable Spectrum acceleration (Chebyshev feature forecasting, ~3.5x speedup)",
     )
     parser.add_argument(
-        "--spectrum-flex-window", type=float, default=0.75,
-        help="Spectrum window growth rate (0.75=~3.5x speedup, 3.0=~5x, more aggressive)"
+        "--spectrum-w",
+        type=float,
+        default=0.5,
+        help="Spectrum blend weight: 0=Taylor only, 1=Chebyshev only (default: 0.5)",
     )
     parser.add_argument(
-        "--spectrum-warmup", type=int, default=5,
-        help="Spectrum warmup steps (always compute first N steps, default: 5)"
+        "--spectrum-flex-window",
+        type=float,
+        default=0.75,
+        help="Spectrum window growth rate (0.75=~3.5x speedup, 3.0=~5x, more aggressive)",
     )
     parser.add_argument(
-        "--lora", nargs=2, action="append", metavar=("PATH", "STRENGTH"),
+        "--spectrum-warmup",
+        type=int,
+        default=5,
+        help="Spectrum warmup steps (always compute first N steps, default: 5)",
+    )
+    parser.add_argument(
+        "--lora",
+        nargs=2,
+        action="append",
+        metavar=("PATH", "STRENGTH"),
         help="Apply a LoRA to all models (repeatable). Format: --lora path.safetensors 0.8",
     )
     parser.add_argument(
-        "--lora-high", nargs=2, action="append", metavar=("PATH", "STRENGTH"),
+        "--lora-high",
+        nargs=2,
+        action="append",
+        metavar=("PATH", "STRENGTH"),
         help="Apply a LoRA to high-noise model only (dual-model, repeatable)",
     )
     parser.add_argument(
-        "--lora-low", nargs=2, action="append", metavar=("PATH", "STRENGTH"),
+        "--lora-low",
+        nargs=2,
+        action="append",
+        metavar=("PATH", "STRENGTH"),
         help="Apply a LoRA to low-noise model only (dual-model, repeatable)",
     )
     parser.add_argument(
         "--tiling",
         type=str,
         default="auto",
-        choices=["auto", "none", "default", "aggressive", "conservative", "spatial", "temporal"],
+        choices=[
+            "auto",
+            "none",
+            "default",
+            "aggressive",
+            "conservative",
+            "spatial",
+            "temporal",
+        ],
         help="VAE tiling mode to reduce memory during decoding (default: auto)",
     )
     parser.add_argument(
@@ -865,6 +1014,7 @@ def main():
         output_path=args.output_path,
         scheduler=args.scheduler,
         teacache_thresh=args.teacache_thresh,
+        teacache_verbose=args.teacache_verbose,
         spectrum=args.spectrum,
         spectrum_w=args.spectrum_w,
         spectrum_flex_window=args.spectrum_flex_window,

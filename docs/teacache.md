@@ -9,11 +9,14 @@
 
 During diffusion, most consecutive steps produce very similar intermediate results — the transformer blocks do nearly identical work. TeaCache detects this by:
 
-1. Computing the **relative L1 distance** between consecutive timestep embeddings (`e0`)
+1. Computing the **relative L1 distance** between consecutive projected time embeddings (`e0`)
 2. Applying a **polynomial rescaling** to map that distance to expected output change
 3. Accumulating the rescaled distance; when it stays below a threshold, **reuse the cached residual** instead of running all transformer blocks
 
 The key insight is that timestep embedding distance is a cheap proxy for output distance — no need to actually compute the output to know it hasn't changed much.
+
+**Important**: The similarity metric uses the projected time embedding `e0` (the 6×-dim projection used by transformer blocks) with ret-mode polynomial coefficients profiled against `e0`.
+
 
 ### Polynomial Rescaling
 
@@ -122,11 +125,11 @@ prev_e0 = None
 prev_output = None
 
 for step in diffusion_steps:
-    e0 = compute_timestep_embedding(timestep)
+    e0 = compute_projected_time_embedding(timestep)  # after 6×-dim projection
     output = run_all_transformer_blocks(x, e0, ...)
 
     if prev_e0 is not None:
-        # Input distance: relative L1 of timestep embeddings
+        # Input distance: relative L1 of projected time embeddings
         input_dist = abs(e0 - prev_e0).mean() / abs(prev_e0).mean()
         # Output distance: relative L1 of block outputs
         output_dist = abs(output - prev_output).mean() / abs(prev_output).mean()

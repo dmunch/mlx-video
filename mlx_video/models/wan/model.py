@@ -17,9 +17,15 @@ class TeaCacheState:
     """Tracks TeaCache state for skipping redundant transformer computations.
 
     TeaCache (Timestep Embedding Aware Cache) monitors the relative L1 distance
-    between consecutive timestep embeddings (e0). When the accumulated rescaled
-    distance is below a threshold, the transformer blocks are skipped and the
-    cached residual from the previous step is reused.
+    between consecutive projected time embeddings (e0). When the accumulated
+    rescaled distance is below a threshold, the transformer blocks are skipped
+    and the cached residual from the previous step is reused.
+
+    Uses the ret-mode approach: similarity is computed on `e0` (the projected
+    time embedding passed to transformer blocks), with polynomial coefficients
+    profiled against `e0`. This gives better skip calibration across different
+    step counts and schedule shifts than the non-ret approach using raw `e`.
+
 
     Since batched CFG shares the same scalar timestep across cond/uncond, we
     track a single e0 / residual for the whole batch.
@@ -28,6 +34,7 @@ class TeaCacheState:
     enabled: bool = False
     threshold: float = 0.0
     coefficients: tuple = ()
+    verbose: bool = False
 
     # Single tracking for the whole batch (same timestep → same e0)
     previous_e0: object = None  # mx.array | None
@@ -81,7 +88,9 @@ class Head(nn.Module):
         proj_dim = math.prod(patch_size) * out_dim
         self.norm = WanLayerNorm(dim, eps)
         self.head = nn.Linear(dim, proj_dim)
-        self.modulation = (mx.random.normal((1, 2, dim)) * (dim**-0.5)).astype(mx.float32)
+        self.modulation = (mx.random.normal((1, 2, dim)) * (dim**-0.5)).astype(
+            mx.float32
+        )
 
     def __call__(self, x: mx.array, e: mx.array) -> mx.array:
         """
@@ -155,11 +164,14 @@ class WanModel(nn.Module):
         # Reference computes three rope_params with different dim normalizations
         # so each axis (temporal/height/width) gets its own full frequency range.
         d = dim // config.num_heads
-        self.freqs = mx.concatenate([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-        ], axis=1)
+        self.freqs = mx.concatenate(
+            [
+                rope_params(1024, d - 4 * (d // 6)),
+                rope_params(1024, 2 * (d // 6)),
+                rope_params(1024, 2 * (d // 6)),
+            ],
+            axis=1,
+        )
 
         # Precompute sinusoidal inv_freq for time embedding
         # Use numpy float64 for precision (matches reference torch.float64),
@@ -348,12 +360,19 @@ class WanModel(nn.Module):
                 seq_lens_list.append(p.shape[1])
             x = mx.concatenate(
                 [
-                    mx.concatenate(
-                        [p, mx.zeros((1, seq_len - p.shape[1], self.dim), dtype=p.dtype)],
-                        axis=1,
+                    (
+                        mx.concatenate(
+                            [
+                                p,
+                                mx.zeros(
+                                    (1, seq_len - p.shape[1], self.dim), dtype=p.dtype
+                                ),
+                            ],
+                            axis=1,
+                        )
+                        if p.shape[1] < seq_len
+                        else p
                     )
-                    if p.shape[1] < seq_len
-                    else p
                     for p in patches
                 ],
                 axis=0,
@@ -440,11 +459,15 @@ class WanModel(nn.Module):
             if tc.cnt < tc.ret_steps or tc.cnt >= tc.cutoff_steps:
                 # Always compute first/last steps (they change the most)
                 tc.accumulated_distance = 0.0
+                if tc.verbose:
+                    tag = "first" if tc.cnt < tc.ret_steps else "last"
+                    print(f"    [TeaCache] step {tc.cnt}: forced compute ({tag})")
             elif tc.previous_e0 is not None:
                 # Compute relative L1 distance between current and previous e0
+                # (projected time embedding — ret-mode coefficients are profiled
+                # against e0 for proper calibration across step counts)
                 rel_l1 = (
-                    mx.abs(e0 - tc.previous_e0).mean()
-                    / mx.abs(tc.previous_e0).mean()
+                    mx.abs(e0 - tc.previous_e0).mean() / mx.abs(tc.previous_e0).mean()
                 )
 
                 # Polynomial rescaling in MLX (Horner's method)
@@ -452,12 +475,24 @@ class WanModel(nn.Module):
                 for c in tc.coefficients[1:]:
                     rescaled = rescaled * rel_l1 + c
 
-                tc.accumulated_distance += rescaled.item()
+                rescaled_val = rescaled.item()
+                rel_l1_val = rel_l1.item()
+                tc.accumulated_distance += rescaled_val
 
                 if tc.accumulated_distance < tc.threshold:
                     should_skip = True
                 else:
                     tc.accumulated_distance = 0.0
+
+                if tc.verbose:
+                    decision = "SKIP" if should_skip else "COMPUTE"
+                    print(
+                        f"    [TeaCache] step {tc.cnt}: rel_l1={rel_l1_val:.6f}  rescaled={rescaled_val:.4f}  accum={tc.accumulated_distance:.4f}  → {decision}"
+                    )
+            else:
+                if tc.verbose:
+                    print(f"    [TeaCache] step {tc.cnt}: compute (no previous)")
+
 
             tc.previous_e0 = e0
 
