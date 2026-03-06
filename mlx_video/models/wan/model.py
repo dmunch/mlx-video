@@ -8,6 +8,7 @@ import numpy as np
 from .attention import WanLayerNorm, _linear_dtype
 from .config import WanModelConfig
 from .rope import rope_params, rope_precompute_cos_sin
+from .spectrum import SpectrumState
 from .transformer import WanAttentionBlock
 
 
@@ -171,6 +172,9 @@ class WanModel(nn.Module):
 
         # TeaCache state (disabled by default)
         self.teacache = TeaCacheState()
+
+        # Spectrum state (disabled by default)
+        self.spectrum = SpectrumState()
 
     def _patchify(self, x: mx.array) -> tuple:
         """Convert video tensor to patch embeddings.
@@ -408,8 +412,28 @@ class WanModel(nn.Module):
             attn_mask=attn_mask,
         )
 
-        # Run transformer blocks (with optional TeaCache skip)
-        if self.teacache.enabled:
+        # Run transformer blocks (with optional TeaCache or Spectrum skip)
+        if self.spectrum.enabled:
+            sp = self.spectrum
+            forecaster = sp.get_or_create_forecaster()
+            do_compute = sp.should_compute()
+
+            if do_compute:
+                for i, block in enumerate(self.blocks):
+                    kv = cross_kv_caches[i] if cross_kv_caches is not None else None
+                    x = block(x, cross_kv_cache=kv, **kwargs)
+                # Cache flattened features and update Chebyshev fit
+                h_flat = x.reshape(-1)
+                forecaster.update(sp.cnt, h_flat)
+                mx.eval(forecaster.cheb.H_buf, forecaster.cheb.t_buf)
+            else:
+                # Predict features using fitted Chebyshev polynomials
+                h_pred = forecaster.predict(sp.cnt)
+                mx.eval(h_pred)
+                x = h_pred.reshape(x.shape)
+
+            sp.step(do_compute)
+        elif self.teacache.enabled:
             tc = self.teacache
             should_skip = False
 

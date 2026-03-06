@@ -68,6 +68,10 @@ def generate_video(
     output_path: str = "output.mp4",
     scheduler: str = "unipc",
     teacache_thresh: float = 0.0,
+    spectrum: bool = False,
+    spectrum_w: float = 0.5,
+    spectrum_flex_window: float = 0.75,
+    spectrum_warmup: int = 5,
     loras: list | None = None,
     loras_high: list | None = None,
     loras_low: list | None = None,
@@ -91,6 +95,10 @@ def generate_video(
         output_path: Output video path
         scheduler: Solver type: 'euler', 'dpm++', or 'unipc' (default)
         teacache_thresh: TeaCache threshold (0=disabled, 0.1=~2x speedup, 0.2=~3x speedup)
+        spectrum: Enable Spectrum acceleration (Chebyshev polynomial feature forecasting)
+        spectrum_w: Spectrum blend weight: 0=Taylor only, 1=Chebyshev only (default: 0.5)
+        spectrum_flex_window: Window growth rate controlling speedup (0.75=~3.5x, 3.0=~5x)
+        spectrum_warmup: Always compute first N steps to build cache (default: 5)
         loras: Optional list of (path, strength) tuples applied to all models
         loras_high: Optional list of (path, strength) tuples for high-noise model only
         loras_low: Optional list of (path, strength) tuples for low-noise model only
@@ -484,7 +492,7 @@ def generate_video(
     t3 = time.time()
 
     # Configure TeaCache
-    if teacache_thresh > 0:
+    if teacache_thresh > 0 and not spectrum:
         if config.teacache_coefficients is None:
             print(f"{Colors.YELLOW}  Warning: TeaCache not available for this model (no profiled coefficients). Ignoring --teacache-thresh.{Colors.RESET}")
         else:
@@ -504,8 +512,41 @@ def generate_video(
                 _configure_teacache(single_model, steps)
             print(f"{Colors.DIM}  TeaCache: threshold={teacache_thresh}{Colors.RESET}")
 
-    # Compile model forward for faster denoising (incompatible with TeaCache)
-    if teacache_thresh <= 0 and not no_compile:
+    # Configure Spectrum (mutually exclusive with TeaCache)
+    use_caching = False
+    if spectrum:
+        if teacache_thresh > 0:
+            print(f"{Colors.YELLOW}  Warning: Spectrum and TeaCache are mutually exclusive. Using Spectrum.{Colors.RESET}")
+
+        def _configure_spectrum(m, num_steps):
+            m.spectrum.enabled = True
+            m.spectrum.num_steps = num_steps
+            m.spectrum.m = 4
+            m.spectrum.lam = 0.1
+            m.spectrum.w = spectrum_w
+            m.spectrum.warmup_steps = spectrum_warmup
+            m.spectrum.window_size = 2
+            m.spectrum.flex_window = spectrum_flex_window
+            m.spectrum.reset()
+
+        if is_dual:
+            # Count steps per model using the boundary
+            high_steps = sum(1 for tv in sched.timesteps.tolist() if tv >= boundary)
+            low_steps = steps - high_steps
+            _configure_spectrum(high_noise_model, high_steps)
+            if low_steps >= 8:
+                _configure_spectrum(low_noise_model, low_steps)
+            else:
+                print(f"{Colors.DIM}  Spectrum: disabled for low-noise model ({low_steps} steps, need ≥8){Colors.RESET}")
+        else:
+            _configure_spectrum(single_model, steps)
+        use_caching = True
+        print(f"{Colors.DIM}  Spectrum: w={spectrum_w}, flex_window={spectrum_flex_window}, warmup={spectrum_warmup}{Colors.RESET}")
+    elif teacache_thresh > 0:
+        use_caching = True
+
+    # Compile model forward for faster denoising (incompatible with TeaCache/Spectrum)
+    if not use_caching and not no_compile:
         models_to_compile = (
             [high_noise_model, low_noise_model] if is_dual else [single_model]
         )
@@ -614,7 +655,7 @@ def generate_video(
 
     print(f"{Colors.DIM}  Denoising: {time.time() - t3:.1f}s{Colors.RESET}")
 
-    if teacache_thresh > 0:
+    if teacache_thresh > 0 and not spectrum:
         models_to_report = (
             [("low-noise", low_noise_model), ("high-noise", high_noise_model)]
             if is_dual
@@ -625,6 +666,18 @@ def generate_video(
         total = total_skipped + total_computed
         if total > 0:
             print(f"{Colors.DIM}  TeaCache: {total_skipped}/{total} steps skipped ({total_skipped/total*100:.0f}%){Colors.RESET}")
+
+    if spectrum:
+        models_to_report = (
+            [("low-noise", low_noise_model), ("high-noise", high_noise_model)]
+            if is_dual
+            else [("model", single_model)]
+        )
+        total_predicted = sum(m.spectrum.steps_predicted for _, m in models_to_report)
+        total_computed = sum(m.spectrum.steps_computed for _, m in models_to_report)
+        total = total_predicted + total_computed
+        if total > 0:
+            print(f"{Colors.DIM}  Spectrum: {total_predicted}/{total} steps predicted ({total_predicted/total*100:.0f}% skipped){Colors.RESET}")
 
     # Free transformer models and text embeddings
     if is_dual:
@@ -740,6 +793,22 @@ def main():
         help="TeaCache threshold (0=disabled, 0.1=~2x speedup, 0.2=~3x speedup)"
     )
     parser.add_argument(
+        "--spectrum", action="store_true", default=False,
+        help="Enable Spectrum acceleration (Chebyshev feature forecasting, ~3.5x speedup)"
+    )
+    parser.add_argument(
+        "--spectrum-w", type=float, default=0.5,
+        help="Spectrum blend weight: 0=Taylor only, 1=Chebyshev only (default: 0.5)"
+    )
+    parser.add_argument(
+        "--spectrum-flex-window", type=float, default=0.75,
+        help="Spectrum window growth rate (0.75=~3.5x speedup, 3.0=~5x, more aggressive)"
+    )
+    parser.add_argument(
+        "--spectrum-warmup", type=int, default=5,
+        help="Spectrum warmup steps (always compute first N steps, default: 5)"
+    )
+    parser.add_argument(
         "--lora", nargs=2, action="append", metavar=("PATH", "STRENGTH"),
         help="Apply a LoRA to all models (repeatable). Format: --lora path.safetensors 0.8",
     )
@@ -796,6 +865,10 @@ def main():
         output_path=args.output_path,
         scheduler=args.scheduler,
         teacache_thresh=args.teacache_thresh,
+        spectrum=args.spectrum,
+        spectrum_w=args.spectrum_w,
+        spectrum_flex_window=args.spectrum_flex_window,
+        spectrum_warmup=args.spectrum_warmup,
         loras=_parse_lora_args(args.lora),
         loras_high=_parse_lora_args(args.lora_high),
         loras_low=_parse_lora_args(args.lora_low),
