@@ -7,6 +7,7 @@ import numpy as np
 
 from .attention import WanLayerNorm, _linear_dtype
 from .config import WanModelConfig
+from .magcache import MagCacheState
 from .rope import rope_params, rope_precompute_cos_sin
 from .spectrum import SpectrumState
 from .transformer import WanAttentionBlock
@@ -187,6 +188,9 @@ class WanModel(nn.Module):
 
         # Spectrum state (disabled by default)
         self.spectrum = SpectrumState()
+
+        # MagCache state (disabled by default)
+        self.magcache = MagCacheState()
 
     def _patchify(self, x: mx.array) -> tuple:
         """Convert video tensor to patch embeddings.
@@ -431,8 +435,119 @@ class WanModel(nn.Module):
             attn_mask=attn_mask,
         )
 
-        # Run transformer blocks (with optional TeaCache or Spectrum skip)
-        if self.spectrum.enabled:
+        # Run transformer blocks (with optional caching/skip acceleration)
+        if self.magcache.calibrating:
+            # Calibration mode: always compute, record magnitude ratios
+            mc = self.magcache
+            ori_x = x
+            for i, block in enumerate(self.blocks):
+                kv = cross_kv_caches[i] if cross_kv_caches is not None else None
+                x = block(x, cross_kv_cache=kv, **kwargs)
+            mc.record_ratio(x - ori_x)
+            mc.advance()
+
+        elif self.magcache.enabled and self.spectrum.enabled:
+            # Hybrid MagCache+Spectrum mode
+            sp = self.spectrum
+            mc = self.magcache
+            forecaster = sp.get_or_create_forecaster()
+
+            if sp.cnt < sp.warmup_steps:
+                # Phase 1: MagCache accelerates Spectrum warmup
+                mc_skip = mc.should_skip()
+
+                if mc_skip and mc.residual_cache is not None:
+                    x = x + mc.residual_cache
+                    mc.steps_skipped += 1
+                    # Feed approximate features to Spectrum cache
+                    h_flat = x.reshape(-1)
+                    forecaster.update(sp.cnt, h_flat)
+                    mx.eval(forecaster.cheb.H_buf, forecaster.cheb.t_buf)
+                    sp.step(computed=False)
+                    if mc.verbose:
+                        print(
+                            f"    [MagCache+Spectrum] step {mc.cnt}: Phase1 SKIP (warmup)"
+                        )
+                else:
+                    ori_x = x
+                    for i, block in enumerate(self.blocks):
+                        kv = cross_kv_caches[i] if cross_kv_caches is not None else None
+                        x = block(x, cross_kv_cache=kv, **kwargs)
+                    mc.residual_cache = x - ori_x
+                    mc.steps_computed += 1
+                    # Feed real features to Spectrum cache
+                    h_flat = x.reshape(-1)
+                    forecaster.update(sp.cnt, h_flat)
+                    mx.eval(forecaster.cheb.H_buf, forecaster.cheb.t_buf)
+                    sp.step(computed=True)
+                    if mc.verbose:
+                        print(
+                            f"    [MagCache+Spectrum] step {mc.cnt}: Phase1 COMPUTE (warmup)"
+                        )
+            else:
+                # Phase 2: Spectrum with MagCache gatekeeper
+                do_compute = sp.should_compute()
+
+                if not do_compute and mc.should_veto_spectrum():
+                    do_compute = True
+                    mc.steps_vetoed += 1
+                    if mc.verbose:
+                        ratio = mc.get_ratio(mc.cnt)
+                        print(
+                            f"    [MagCache+Spectrum] step {mc.cnt}: Phase2 VETO (ratio={ratio:.5f})"
+                        )
+
+                if do_compute:
+                    ori_x = x
+                    for i, block in enumerate(self.blocks):
+                        kv = cross_kv_caches[i] if cross_kv_caches is not None else None
+                        x = block(x, cross_kv_cache=kv, **kwargs)
+                    mc.residual_cache = x - ori_x
+                    mc.steps_computed += 1
+                    h_flat = x.reshape(-1)
+                    forecaster.update(sp.cnt, h_flat)
+                    mx.eval(forecaster.cheb.H_buf, forecaster.cheb.t_buf)
+                    if mc.verbose:
+                        print(
+                            f"    [MagCache+Spectrum] step {mc.cnt}: Phase2 COMPUTE"
+                        )
+                else:
+                    h_pred = forecaster.predict(sp.cnt)
+                    mx.eval(h_pred)
+                    x = h_pred.reshape(x.shape)
+                    mc.steps_skipped += 1
+                    if mc.verbose:
+                        print(
+                            f"    [MagCache+Spectrum] step {mc.cnt}: Phase2 SKIP (Spectrum predict)"
+                        )
+
+                sp.step(do_compute)
+
+            mc.advance()
+
+        elif self.magcache.enabled:
+            # Standalone MagCache mode
+            mc = self.magcache
+            mc_skip = mc.should_skip()
+
+            if mc_skip and mc.residual_cache is not None:
+                x = x + mc.residual_cache
+                mc.steps_skipped += 1
+                if mc.verbose:
+                    print(f"    [MagCache] step {mc.cnt}: SKIP")
+            else:
+                ori_x = x
+                for i, block in enumerate(self.blocks):
+                    kv = cross_kv_caches[i] if cross_kv_caches is not None else None
+                    x = block(x, cross_kv_cache=kv, **kwargs)
+                mc.residual_cache = x - ori_x
+                mc.steps_computed += 1
+                if mc.verbose:
+                    print(f"    [MagCache] step {mc.cnt}: COMPUTE")
+
+            mc.advance()
+
+        elif self.spectrum.enabled:
             sp = self.spectrum
             forecaster = sp.get_or_create_forecaster()
             do_compute = sp.should_compute()

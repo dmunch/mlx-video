@@ -282,6 +282,51 @@ Set `--teacache-thresh 0` (the default) to disable. Higher thresholds = more spe
 
 > **Note**: TeaCache requires model-specific polynomial coefficients. Pre-profiled coefficients are included for T2V-14B and T2V-1.3B. For unsupported models (e.g. TI2V-5B, I2V-14B), TeaCache is automatically disabled with a warning. See [docs/teacache.md](docs/teacache.md) for details on how TeaCache works, recommended thresholds, and how to profile coefficients for new models locally.
 
+#### MagCache (Magnitude-Aware Cache) — Recommended for Wan2.2
+
+MagCache is a more stable alternative to TeaCache for Wan2.2 models. It uses pre-calibrated **magnitude ratios** of transformer residuals to decide which steps to skip — avoiding the instability that TeaCache's L2-distance metric encounters with Wan2.2's MoE expert switching.
+
+```bash
+# ~1.5-2x speedup (standalone)
+python -m mlx_video.generate_wan \
+    --model-dir wan22_mlx \
+    --prompt "A cat playing piano" \
+    --magcache
+
+# ~2.5-3.5x speedup (hybrid with Spectrum)
+python -m mlx_video.generate_wan \
+    --model-dir wan22_mlx \
+    --prompt "A cat playing piano" \
+    --magcache --spectrum
+```
+
+Pre-calibrated ratios are included for all Wan2.2 models (T2V-14B, I2V-14B, TI2V-5B). You can also calibrate custom ratios for LoRAs or to extend MagCache to both dual-model stages:
+
+```bash
+# Calibrate (run once, saves ratios to JSON)
+python -m mlx_video.generate_wan --model-dir wan22_mlx --prompt "..." --magcache-calibrate
+
+# Use custom ratios (enables MagCache on both high-noise and low-noise models)
+python -m mlx_video.generate_wan --model-dir wan22_mlx --prompt "..." \
+    --magcache --magcache-ratios magcache_ratios_t2v_40steps.json
+```
+
+> See [docs/MAGCACHE-WAN22.md](docs/MAGCACHE-WAN22.md) for details on algorithm, calibration, hybrid mode, and tuning parameters.
+
+#### Spectrum (Spectral Feature Forecasting)
+
+Spectrum accelerates inference by **predicting transformer features using Chebyshev polynomials** instead of running full forward passes at every step. It achieves higher speedup than residual-caching methods but requires a warmup period.
+
+```bash
+# ~3-4x speedup (standalone)
+python -m mlx_video.generate_wan \
+    --model-dir wan22_mlx \
+    --prompt "A cat playing piano" \
+    --spectrum
+```
+
+Best results come from combining Spectrum with MagCache (see above). See [docs/SPECTRUM-WAN22.md](docs/SPECTRUM-WAN22.md) for details.
+
 ### Wan Model Specifications
 
 **Transformer (14B)**

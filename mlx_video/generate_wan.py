@@ -68,6 +68,13 @@ def generate_video(
     spectrum_w: float = 0.5,
     spectrum_flex_window: float = 0.75,
     spectrum_warmup: int = 5,
+    magcache: bool = False,
+    magcache_thresh: float = 0.06,
+    magcache_K: int = 2,
+    magcache_retention_ratio: float = 0.2,
+    magcache_verbose: bool = False,
+    magcache_calibrate: bool = False,
+    magcache_ratios: str | None = None,
     loras: list | None = None,
     loras_high: list | None = None,
     loras_low: list | None = None,
@@ -96,6 +103,13 @@ def generate_video(
         spectrum_w: Spectrum blend weight: 0=Taylor only, 1=Chebyshev only (default: 0.5)
         spectrum_flex_window: Window growth rate controlling speedup (0.75=~3.5x, 3.0=~5x)
         spectrum_warmup: Always compute first N steps to build cache (default: 5)
+        magcache: Enable MagCache acceleration (magnitude-aware residual caching)
+        magcache_thresh: MagCache accumulated error threshold (0.06=~1.5-2x speedup)
+        magcache_K: Max consecutive skip steps (default: 2)
+        magcache_retention_ratio: Fraction of early steps that always compute (default: 0.2)
+        magcache_verbose: Print per-step MagCache diagnostics
+        magcache_calibrate: Run calibration mode (full compute, record ratios to JSON)
+        magcache_ratios: Path to custom calibration JSON (overrides built-in ratios)
         loras: Optional list of (path, strength) tuples applied to all models
         loras_high: Optional list of (path, strength) tuples for high-noise model only
         loras_low: Optional list of (path, strength) tuples for low-noise model only
@@ -541,7 +555,7 @@ def generate_video(
     t3 = time.time()
 
     # Configure TeaCache
-    if teacache_thresh > 0 and not spectrum:
+    if teacache_thresh > 0 and not spectrum and not magcache:
         if config.teacache_coefficients is None:
             print(
                 f"{Colors.YELLOW}  Warning: TeaCache not available for this model (no profiled coefficients). Ignoring --teacache-thresh.{Colors.RESET}"
@@ -565,10 +579,122 @@ def generate_video(
                 _configure_teacache(single_model, steps)
             print(f"{Colors.DIM}  TeaCache: threshold={teacache_thresh}{Colors.RESET}")
 
+    # Configure MagCache calibration mode (mutually exclusive with --magcache)
+    if magcache_calibrate:
+        if magcache:
+            print(
+                f"{Colors.YELLOW}  Warning: --magcache-calibrate and --magcache are mutually exclusive. Using calibration mode.{Colors.RESET}"
+            )
+            magcache = False
+
+        from mlx_video.models.wan.magcache import save_calibration
+
+        def _configure_calibration(m, num_steps):
+            m.magcache.verbose = magcache_verbose
+            m.magcache.configure_calibration(num_steps)
+
+        if is_dual:
+            high_steps = sum(
+                1 for tv in sched.timesteps.tolist() if tv >= boundary
+            )
+            low_steps = steps - high_steps
+            _configure_calibration(high_noise_model, high_steps)
+            _configure_calibration(low_noise_model, low_steps)
+            print(
+                f"{Colors.DIM}  MagCache calibration: recording ratios for high-noise ({high_steps} steps) + low-noise ({low_steps} steps){Colors.RESET}"
+            )
+        else:
+            _configure_calibration(single_model, steps)
+            print(
+                f"{Colors.DIM}  MagCache calibration: recording ratios for {steps} steps{Colors.RESET}"
+            )
+
+    # Configure MagCache (mutually exclusive with TeaCache, compatible with Spectrum)
+    if magcache:
+        if teacache_thresh > 0:
+            print(
+                f"{Colors.YELLOW}  Warning: MagCache and TeaCache are mutually exclusive. Using MagCache.{Colors.RESET}"
+            )
+
+        has_custom_ratios = magcache_ratios is not None
+        has_builtin_ratios = config.magcache_ratios_key is not None
+
+        if not has_custom_ratios and not has_builtin_ratios:
+            print(
+                f"{Colors.YELLOW}  Warning: MagCache not available for this model (no pre-calibrated ratios). "
+                f"Use --magcache-calibrate to generate ratios. Ignoring --magcache.{Colors.RESET}"
+            )
+            magcache = False
+        else:
+
+            def _configure_magcache_common(m):
+                m.magcache.enabled = True
+                m.magcache.threshold = magcache_thresh
+                m.magcache.K = magcache_K
+                m.magcache.retention_ratio = magcache_retention_ratio
+                m.magcache.verbose = magcache_verbose
+
+            if has_custom_ratios:
+                # Load ratios from calibration JSON file
+                if is_dual:
+                    high_steps = sum(
+                        1 for tv in sched.timesteps.tolist() if tv >= boundary
+                    )
+                    low_steps = steps - high_steps
+                    _configure_magcache_common(high_noise_model)
+                    high_noise_model.magcache.configure_from_file(
+                        high_steps, magcache_ratios, "high_noise"
+                    )
+                    # Try loading low-noise ratios if present in the file
+                    try:
+                        _configure_magcache_common(low_noise_model)
+                        low_noise_model.magcache.configure_from_file(
+                            low_steps, magcache_ratios, "low_noise"
+                        )
+                        print(
+                            f"{Colors.DIM}  MagCache: loaded custom ratios for both models from {magcache_ratios}{Colors.RESET}"
+                        )
+                    except (ValueError, KeyError):
+                        print(
+                            f"{Colors.DIM}  MagCache: loaded custom ratios for high-noise model from {magcache_ratios}{Colors.RESET}"
+                        )
+                else:
+                    _configure_magcache_common(single_model)
+                    single_model.magcache.configure_from_file(
+                        steps, magcache_ratios, "model"
+                    )
+                    print(
+                        f"{Colors.DIM}  MagCache: loaded custom ratios from {magcache_ratios}{Colors.RESET}"
+                    )
+            else:
+                # Use built-in pre-calibrated ratios
+                ratios_key = config.magcache_ratios_key
+                if config.model_type == "ti2v" and is_i2v:
+                    ratios_key = "ti2v_5b_i2v"
+
+                if is_dual:
+                    high_steps = sum(
+                        1 for tv in sched.timesteps.tolist() if tv >= boundary
+                    )
+                    _configure_magcache_common(high_noise_model)
+                    high_noise_model.magcache.configure(high_steps, ratios_key)
+                else:
+                    _configure_magcache_common(single_model)
+                    single_model.magcache.configure(steps, ratios_key)
+
+            if spectrum:
+                print(
+                    f"{Colors.DIM}  MagCache+Spectrum hybrid: thresh={magcache_thresh}, K={magcache_K}, retention={magcache_retention_ratio}{Colors.RESET}"
+                )
+            elif not has_custom_ratios:
+                print(
+                    f"{Colors.DIM}  MagCache: thresh={magcache_thresh}, K={magcache_K}, retention={magcache_retention_ratio}{Colors.RESET}"
+                )
+
     # Configure Spectrum (mutually exclusive with TeaCache)
     use_caching = False
     if spectrum:
-        if teacache_thresh > 0:
+        if teacache_thresh > 0 and not magcache:
             print(
                 f"{Colors.YELLOW}  Warning: Spectrum and TeaCache are mutually exclusive. Using Spectrum.{Colors.RESET}"
             )
@@ -598,13 +724,20 @@ def generate_video(
         else:
             _configure_spectrum(single_model, steps)
         use_caching = True
-        print(
-            f"{Colors.DIM}  Spectrum: w={spectrum_w}, flex_window={spectrum_flex_window}, warmup={spectrum_warmup}{Colors.RESET}"
-        )
-    elif teacache_thresh > 0:
+        if not magcache:
+            print(
+                f"{Colors.DIM}  Spectrum: w={spectrum_w}, flex_window={spectrum_flex_window}, warmup={spectrum_warmup}{Colors.RESET}"
+            )
+    elif teacache_thresh > 0 and not magcache:
         use_caching = True
 
-    # Compile model forward for faster denoising (incompatible with TeaCache/Spectrum)
+    if magcache:
+        use_caching = True
+
+    if magcache_calibrate:
+        use_caching = True
+
+    # Compile model forward for faster denoising (incompatible with caching strategies)
     if not use_caching and not no_compile:
         models_to_compile = (
             [high_noise_model, low_noise_model] if is_dual else [single_model]
@@ -722,7 +855,7 @@ def generate_video(
 
     print(f"{Colors.DIM}  Denoising: {time.time() - t3:.1f}s{Colors.RESET}")
 
-    if teacache_thresh > 0 and not spectrum:
+    if teacache_thresh > 0 and not spectrum and not magcache:
         models_to_report = (
             [("low-noise", low_noise_model), ("high-noise", high_noise_model)]
             if is_dual
@@ -735,6 +868,46 @@ def generate_video(
             print(
                 f"{Colors.DIM}  TeaCache: {total_skipped}/{total} steps skipped ({total_skipped/total*100:.0f}%){Colors.RESET}"
             )
+
+    if magcache:
+        models_to_report = (
+            [("high-noise", high_noise_model)]
+            if is_dual
+            else [("model", single_model)]
+        )
+        # Include low-noise model if it has magcache enabled (custom ratios)
+        if is_dual and low_noise_model.magcache.enabled:
+            models_to_report.append(("low-noise", low_noise_model))
+        total_skipped = sum(m.magcache.steps_skipped for _, m in models_to_report)
+        total_computed = sum(m.magcache.steps_computed for _, m in models_to_report)
+        total_vetoed = sum(m.magcache.steps_vetoed for _, m in models_to_report)
+        total = total_skipped + total_computed
+        if total > 0:
+            msg = f"  MagCache: {total_skipped}/{total} steps skipped ({total_skipped/total*100:.0f}%)"
+            if total_vetoed > 0:
+                msg += f", {total_vetoed} Spectrum vetoes"
+            print(f"{Colors.DIM}{msg}{Colors.RESET}")
+
+    if magcache_calibrate:
+        # Save calibration results to JSON
+        output_dir = str(Path(output_path).parent)
+        cal_filename = f"magcache_ratios_{config.model_type}_{steps}steps.json"
+        cal_path = str(Path(output_dir) / cal_filename)
+
+        results = {}
+        if is_dual:
+            results["high_noise"] = high_noise_model.magcache.get_calibration_result()
+            results["low_noise"] = low_noise_model.magcache.get_calibration_result()
+        else:
+            results["model"] = single_model.magcache.get_calibration_result()
+
+        save_calibration(
+            cal_path,
+            model_type=config.model_type,
+            model_version=config.model_version,
+            steps=steps,
+            results=results,
+        )
 
     if spectrum:
         models_to_report = (
@@ -941,6 +1114,49 @@ def main():
         help="Spectrum warmup steps (always compute first N steps, default: 5)",
     )
     parser.add_argument(
+        "--magcache",
+        action="store_true",
+        default=False,
+        help="Enable MagCache acceleration (magnitude-aware residual caching, ~1.5-2x speedup)",
+    )
+    parser.add_argument(
+        "--magcache-thresh",
+        type=float,
+        default=0.06,
+        help="MagCache accumulated error threshold (default: 0.06, lower=better quality)",
+    )
+    parser.add_argument(
+        "--magcache-K",
+        type=int,
+        default=2,
+        help="MagCache max consecutive skip steps (default: 2)",
+    )
+    parser.add_argument(
+        "--magcache-retention-ratio",
+        type=float,
+        default=0.2,
+        help="MagCache fraction of early steps that always compute (default: 0.2)",
+    )
+    parser.add_argument(
+        "--magcache-verbose",
+        action="store_true",
+        default=False,
+        help="Print per-step MagCache diagnostics",
+    )
+    parser.add_argument(
+        "--magcache-calibrate",
+        action="store_true",
+        default=False,
+        help="Run MagCache calibration (full compute, records magnitude ratios to JSON for future --magcache runs)",
+    )
+    parser.add_argument(
+        "--magcache-ratios",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Load custom MagCache ratios from a calibration JSON file (overrides built-in ratios)",
+    )
+    parser.add_argument(
         "--lora",
         nargs=2,
         action="append",
@@ -1019,6 +1235,13 @@ def main():
         spectrum_w=args.spectrum_w,
         spectrum_flex_window=args.spectrum_flex_window,
         spectrum_warmup=args.spectrum_warmup,
+        magcache=args.magcache,
+        magcache_thresh=args.magcache_thresh,
+        magcache_K=args.magcache_K,
+        magcache_retention_ratio=args.magcache_retention_ratio,
+        magcache_verbose=args.magcache_verbose,
+        magcache_calibrate=args.magcache_calibrate,
+        magcache_ratios=args.magcache_ratios,
         loras=_parse_lora_args(args.lora),
         loras_high=_parse_lora_args(args.lora_high),
         loras_low=_parse_lora_args(args.lora_low),

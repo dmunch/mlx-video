@@ -61,6 +61,11 @@ class WanModelConfig(BaseModelConfig):
 
     # Resolution constraints
     max_area: int = 0  # 0 = no limit; e.g. 704*1280 for TI2V-5B
+
+    # MagCache ratio key for pre-calibrated magnitude ratios (see magcache.py)
+    magcache_ratios_key: Optional[str] = "t2v_14b_high"
+
+    # T5
     t5_vocab_size: int = 256384
     t5_dim: int = 4096
     t5_dim_attn: int = 4096
@@ -83,6 +88,7 @@ class WanModelConfig(BaseModelConfig):
             sample_shift=5.0,
             sample_steps=50,
             sample_guide_scale=5.0,
+            magcache_ratios_key=None,
         )
 
     @classmethod
@@ -106,12 +112,15 @@ class WanModelConfig(BaseModelConfig):
                 1.36987616e01,
                 -4.99875664e-02,
             ),
+            magcache_ratios_key=None,
         )
 
     @classmethod
     def wan22_t2v_14b(cls) -> "WanModelConfig":
         """Wan2.2 T2V 14B: dual model, 40 layers, dim=5120 (default)."""
-        return cls()
+        return cls(
+            magcache_ratios_key="t2v_14b_high",
+        )
 
     @classmethod
     def wan22_i2v_14b(cls) -> "WanModelConfig":
@@ -133,6 +142,7 @@ class WanModelConfig(BaseModelConfig):
                 -1.35890334e01,
                 1.32517977e-01,
             ),
+            magcache_ratios_key="i2v_14b_high",
         )
 
     @classmethod
@@ -157,4 +167,5 @@ class WanModelConfig(BaseModelConfig):
             max_area=704 * 1280,
             # No profiled TeaCache coefficients for this model yet
             teacache_coefficients=None,
+            magcache_ratios_key="ti2v_5b_t2v",
         )
