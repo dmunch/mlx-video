@@ -676,8 +676,17 @@ def generate_video(
                     high_steps = sum(
                         1 for tv in sched.timesteps.tolist() if tv >= boundary
                     )
+                    low_steps = steps - high_steps
                     _configure_magcache_common(high_noise_model)
                     high_noise_model.magcache.configure(high_steps, ratios_key)
+                    # Try low-noise model (MLX-calibrated ratios may be available)
+                    low_key = ratios_key.replace("_high", "_low")
+                    try:
+                        _configure_magcache_common(low_noise_model)
+                        low_noise_model.magcache.configure(low_steps, low_key)
+                    except ValueError:
+                        # No low-noise ratios available, disable on low-noise model
+                        low_noise_model.magcache.enabled = False
                 else:
                     _configure_magcache_common(single_model)
                     single_model.magcache.configure(steps, ratios_key)

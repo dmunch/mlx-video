@@ -114,13 +114,54 @@ _RATIO_REGISTRY: dict[str, tuple[list[float], int]] = {
     "ti2v_5b_i2v": (_RAW_RATIOS_TI2V_5B_I2V, 50),
 }
 
+# MLX-calibrated per-step ratios (already averaged, no interleaving conversion needed).
+# Calibrated on Apple Silicon with B=2 batched CFG at 50 steps.
+
+# T2V-14B high-noise model (50 steps → 32 high-noise steps, 31 ratios)
+_MLX_RATIOS_T2V_14B_HIGH_50 = [
+    1.00079, 0.99962, 0.9961, 0.99903, 0.99734, 0.99667, 0.99636, 0.99712,
+    0.99646, 0.99734, 0.99702, 0.99895, 0.99459, 0.99779, 0.99802, 0.99537,
+    0.99713, 0.99621, 0.99567, 0.99604, 0.99644, 0.9954, 0.9947, 0.99561,
+    0.99611, 0.99398, 0.99604, 0.99306, 0.99383, 0.99191, 0.99312,
+]
+
+# T2V-14B low-noise model (50 steps → 18 low-noise steps, 17 ratios)
+_MLX_RATIOS_T2V_14B_LOW_50 = [
+    0.99188, 0.99132, 0.99179, 0.99, 0.98858, 0.98613, 0.98525, 0.98467,
+    0.979, 0.97701, 0.97194, 0.96432, 0.95333, 0.94049, 0.91857, 0.87633,
+    0.79284,
+]
+
+# I2V-14B high-noise model (50 steps → 18 high-noise steps, 17 ratios)
+_MLX_RATIOS_I2V_14B_HIGH_50 = [
+    0.99641, 0.99614, 0.99416, 0.99602, 0.99501, 0.99593, 0.99467, 0.99482,
+    0.99571, 0.9951, 0.99537, 0.99402, 0.99584, 0.99358, 0.99452, 0.99497,
+    0.99401,
+]
+
+# I2V-14B low-noise model (50 steps → 32 low-noise steps, 31 ratios)
+_MLX_RATIOS_I2V_14B_LOW_50 = [
+    0.99574, 0.99146, 0.99168, 0.99155, 0.99015, 0.99142, 0.98965, 0.99221,
+    0.98856, 0.98868, 0.98938, 0.98671, 0.98741, 0.98608, 0.98219, 0.98337,
+    0.98071, 0.97811, 0.97785, 0.97481, 0.97145, 0.9663, 0.96392, 0.95929,
+    0.94928, 0.94187, 0.92944, 0.91126, 0.88665, 0.85097, 0.79769,
+]
+
+# MLX-calibrated registry: (per_step_ratios, calibration_steps_for_this_model)
+_MLX_RATIO_REGISTRY: dict[str, tuple[list[float], int]] = {
+    "t2v_14b_high_50": (_MLX_RATIOS_T2V_14B_HIGH_50, 32),
+    "t2v_14b_low_50": (_MLX_RATIOS_T2V_14B_LOW_50, 18),
+    "i2v_14b_high_50": (_MLX_RATIOS_I2V_14B_HIGH_50, 18),
+    "i2v_14b_low_50": (_MLX_RATIOS_I2V_14B_LOW_50, 32),
+}
+
 
 def get_magcache_ratios(key: str, num_steps: int) -> np.ndarray:
     """Get per-step magnitude ratios for the given model variant and step count.
 
-    Converts interleaved cond/uncond ratios to per-step averages, prepends
-    a 1.0 padding entry (first step has no previous residual), and interpolates
-    to match the requested step count.
+    Looks up MLX-calibrated ratios first (50-step calibrations), then falls back
+    to reference interleaved ratios (40-step calibrations). Interpolates to match
+    the requested step count.
 
     Args:
         key: Model variant key (e.g., "t2v_14b_high")
@@ -129,26 +170,33 @@ def get_magcache_ratios(key: str, num_steps: int) -> np.ndarray:
     Returns:
         Array of magnitude ratios with shape (num_steps,), where index 0 = 1.0 (padding)
     """
-    if key not in _RATIO_REGISTRY:
-        raise ValueError(
-            f"No pre-calibrated MagCache ratios for key '{key}'. "
-            f"Available: {list(_RATIO_REGISTRY.keys())}"
-        )
+    # Try MLX-calibrated ratios first (already per-step, no conversion needed)
+    mlx_key = f"{key}_50"
+    if mlx_key in _MLX_RATIO_REGISTRY:
+        per_step, calibration_steps = _MLX_RATIO_REGISTRY[mlx_key]
+        ratios = np.concatenate([[1.0], np.array(per_step)])
+        if len(ratios) != calibration_steps:
+            ratios = _nearest_interp(ratios, calibration_steps)
+        if num_steps != calibration_steps:
+            ratios = _nearest_interp(ratios, num_steps)
+        return ratios
 
-    raw_ratios, calibration_steps = _RATIO_REGISTRY[key]
-    per_step = _convert_interleaved_ratios(raw_ratios)
+    # Fall back to reference interleaved ratios
+    if key in _RATIO_REGISTRY:
+        raw_ratios, calibration_steps = _RATIO_REGISTRY[key]
+        per_step = _convert_interleaved_ratios(raw_ratios)
+        ratios = np.concatenate([[1.0], per_step])
+        if len(ratios) != calibration_steps:
+            ratios = _nearest_interp(ratios, calibration_steps)
+        if num_steps != calibration_steps:
+            ratios = _nearest_interp(ratios, num_steps)
+        return ratios
 
-    # Prepend padding (first step always computes, no previous ratio)
-    ratios = np.concatenate([[1.0], per_step])  # length = calibration_steps
-
-    if len(ratios) != calibration_steps:
-        ratios = _nearest_interp(ratios, calibration_steps)
-
-    # Interpolate to target step count if different from calibration
-    if num_steps != calibration_steps:
-        ratios = _nearest_interp(ratios, num_steps)
-
-    return ratios
+    raise ValueError(
+        f"No pre-calibrated MagCache ratios for key '{key}'. "
+        f"Available: {list(_RATIO_REGISTRY.keys())} + "
+        f"{list(_MLX_RATIO_REGISTRY.keys())}"
+    )
 
 
 def load_ratios_from_file(path: str, num_steps: int, model_key: str) -> np.ndarray:
