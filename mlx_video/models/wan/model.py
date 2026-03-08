@@ -349,7 +349,27 @@ class WanModel(nn.Module):
         bc.blocks_computed += middle_start
 
         # Phase 2: middle section — group skip or compute
-        group_l1 = bc.compute_group_l1(x)
+        # Fingerprint includes timestep conditioning (via first middle block's
+        # modulation) so the L1 catches changes in both x AND timestep e.
+        # Without this, two steps with similar x but different e would wrongly
+        # reuse a residual conditioned on the old timestep → artifacts.
+        first_middle = self.blocks[middle_start]
+        e = kwargs["e"]
+        w_dtype = _linear_dtype(first_middle.self_attn.q)
+        mod = (first_middle.modulation + e).astype(w_dtype)
+        e0 = mod[:, :, 0, :]
+        e1 = mod[:, :, 1, :]
+
+        is_broadcast_e = e.shape[-3] == 1
+        if is_broadcast_e:
+            # Pool-first: mean(norm(x)) then modulate on [B, dim]
+            norm_mean = first_middle.norm1(x).mean(axis=-2)
+            fingerprint = norm_mean * (1 + e1.squeeze(-2)) + e0.squeeze(-2)
+        else:
+            x_mod = first_middle.norm1(x) * (1 + e1) + e0
+            fingerprint = x_mod.mean(axis=-2)
+
+        group_l1 = bc.compute_group_l1(fingerprint)
 
         if not calibrating and group_l1 < bc.thresh and bc.middle_residual is not None:
             # Reuse cached middle-section residual
