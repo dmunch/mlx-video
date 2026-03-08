@@ -254,7 +254,8 @@ class BWCacheState:
     def finish_calibration(self):
         """Set threshold from observed L1 distribution at target skip percentile.
 
-        Called after warmup completes. Uses l1_history to find the threshold
+        Called after warmup completes and then every subsequent step for
+        continuous recalibration. Uses l1_history to find the threshold
         that would skip `target_skip_ratio` fraction of middle blocks.
         """
         if not self.l1_history:
@@ -268,7 +269,7 @@ class BWCacheState:
         old_thresh = self.thresh
         self.thresh = sorted_l1[idx]
 
-        if self.verbose:
+        if self.verbose and abs(self.thresh - old_thresh) > 1e-4:
             pcts = self.l1_percentiles()
             print(
                 f"    [BWCache] Auto-calibrated: thresh {old_thresh:.4f} → {self.thresh:.4f} "

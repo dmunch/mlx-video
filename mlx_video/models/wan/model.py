@@ -379,11 +379,17 @@ class WanModel(nn.Module):
 
         bc.cnt += 1
 
-        # Auto-calibration: count computed steps, fire when warmup completes
+        # Auto-calibration: count computed steps, fire when warmup completes.
+        # After warmup, continue recalibrating every step so the threshold
+        # adapts as MagCache step-skipping creates larger timestep gaps
+        # (early calibration steps are consecutive → low L1; later computed
+        # steps have larger gaps → higher L1).
         if calibrating:
             bc.calibration_steps_seen += 1
             if bc.calibration_steps_seen >= bc.calibration_warmup:
                 bc.finish_calibration()
+        elif bc.auto_thresh:
+            bc.finish_calibration()
 
         return x
 
