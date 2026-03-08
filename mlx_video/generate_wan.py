@@ -73,6 +73,7 @@ def generate_video(
     spectrum_w: float = 0.5,
     spectrum_flex_window: float = 0.75,
     spectrum_warmup: int = 5,
+    spectrum_cutoff: int = 0,
     magcache: bool = False,
     magcache_thresh: float = 0.06,
     magcache_K: int = 2,
@@ -118,6 +119,7 @@ def generate_video(
         spectrum_w: Spectrum blend weight: 0=Taylor only, 1=Chebyshev only (default: 0.5)
         spectrum_flex_window: Window growth rate controlling speedup (0.75=~3.5x, 3.0=~5x)
         spectrum_warmup: Always compute first N steps to build cache (default: 5)
+        spectrum_cutoff: Always compute last N steps to protect fine details (default: 0)
         magcache: Enable MagCache acceleration (magnitude-aware residual caching)
         magcache_thresh: MagCache accumulated error threshold (0.06=~1.5-2x speedup)
         magcache_K: Max consecutive skip steps (default: 2)
@@ -740,6 +742,7 @@ def generate_video(
             m.spectrum.lam = 0.1
             m.spectrum.w = spectrum_w
             m.spectrum.warmup_steps = spectrum_warmup
+            m.spectrum.cutoff_steps = spectrum_cutoff
             m.spectrum.window_size = 2
             m.spectrum.flex_window = spectrum_flex_window
             m.spectrum.reset()
@@ -759,8 +762,9 @@ def generate_video(
             _configure_spectrum(single_model, steps)
         use_caching = True
         if not magcache:
+            cutoff_str = f", cutoff={spectrum_cutoff}" if spectrum_cutoff > 0 else ""
             print(
-                f"{Colors.DIM}  Spectrum: w={spectrum_w}, flex_window={spectrum_flex_window}, warmup={spectrum_warmup}{Colors.RESET}"
+                f"{Colors.DIM}  Spectrum: w={spectrum_w}, flex_window={spectrum_flex_window}, warmup={spectrum_warmup}{cutoff_str}{Colors.RESET}"
             )
     elif teacache_thresh > 0 and not magcache:
         use_caching = True
@@ -1249,6 +1253,12 @@ def main():
         help="Spectrum warmup steps (always compute first N steps, default: 5)",
     )
     parser.add_argument(
+        "--spectrum-cutoff",
+        type=int,
+        default=0,
+        help="Spectrum cutoff steps (always compute last N steps to protect fine details, default: 0)",
+    )
+    parser.add_argument(
         "--magcache",
         action="store_true",
         default=False,
@@ -1431,6 +1441,7 @@ def main():
         spectrum_w=args.spectrum_w,
         spectrum_flex_window=args.spectrum_flex_window,
         spectrum_warmup=args.spectrum_warmup,
+        spectrum_cutoff=args.spectrum_cutoff,
         magcache=args.magcache,
         magcache_thresh=args.magcache_thresh,
         magcache_K=args.magcache_K,

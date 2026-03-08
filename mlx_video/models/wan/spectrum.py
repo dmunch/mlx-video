@@ -219,6 +219,7 @@ class SpectrumState:
     w: float = 0.5              # Chebyshev/Taylor blend weight
     k_max: int = 100            # Maximum cache size
     warmup_steps: int = 5       # Always compute first N steps
+    cutoff_steps: int = 0       # Always compute last N steps (detail protection)
     window_size: int = 2        # Initial compute interval
     flex_window: float = 0.75   # Window growth rate (α in paper)
 
@@ -237,11 +238,15 @@ class SpectrumState:
         """Determine whether to run the full transformer at the current step.
 
         Uses the adaptive scheduling from the Spectrum paper:
-        - Always compute during warmup
+        - Always compute during warmup (first N steps)
+        - Always compute during cutoff (last N steps, protects fine details)
         - After warmup, compute when consecutive cached steps hits the window threshold
         - The window grows by flex_window after each compute step
         """
         if self.cnt < self.warmup_steps:
+            return True
+
+        if self.cutoff_steps > 0 and self.cnt >= self.num_steps - self.cutoff_steps:
             return True
 
         should = (self.num_consecutive_cached + 1) % math.floor(self.curr_ws) == 0

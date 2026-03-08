@@ -146,6 +146,40 @@ class TestSpectrumState:
         # First 3 should always be computed (warmup)
         assert computed_steps[:3] == [0, 1, 2]
 
+    def test_cutoff_always_computes_tail(self):
+        """Last N steps should always compute when cutoff is set."""
+        ss = SpectrumState(
+            enabled=True, warmup_steps=3, window_size=2,
+            flex_window=0.75, cutoff_steps=3, num_steps=20,
+        )
+        computed_steps = []
+        for i in range(20):
+            do_it = ss.should_compute()
+            if do_it:
+                computed_steps.append(i)
+            ss.step(computed=do_it)
+
+        # Last 3 steps (17, 18, 19) must always be computed
+        assert 17 in computed_steps
+        assert 18 in computed_steps
+        assert 19 in computed_steps
+
+    def test_cutoff_increases_nfe(self):
+        """Cutoff should add NFEs compared to no cutoff."""
+        ss_no_cutoff = SpectrumState(
+            enabled=True, warmup_steps=5, window_size=2,
+            flex_window=0.75, cutoff_steps=0, num_steps=30,
+        )
+        ss_cutoff = SpectrumState(
+            enabled=True, warmup_steps=5, window_size=2,
+            flex_window=0.75, cutoff_steps=3, num_steps=30,
+        )
+        for i in range(30):
+            ss_no_cutoff.step(computed=ss_no_cutoff.should_compute())
+            ss_cutoff.step(computed=ss_cutoff.should_compute())
+
+        assert ss_cutoff.steps_computed > ss_no_cutoff.steps_computed
+
     def test_reset(self):
         ss = SpectrumState(enabled=True, num_steps=50)
         ss.cnt = 10
