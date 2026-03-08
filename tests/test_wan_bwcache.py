@@ -147,32 +147,41 @@ class TestBWCacheState:
         for i in range(34, 40):
             assert bc.is_boundary_block(i) is True
 
-    def test_should_skip_block_boundary(self):
-        bc = BWCacheState(enabled=True, num_blocks=40, boundary_blocks=6, thresh=0.15)
+    def test_compute_group_l1_first_call(self):
+        """First group L1 call returns sentinel."""
+        bc = BWCacheState(enabled=True, num_blocks=40, boundary_blocks=6)
         bc.reset()
-        # Boundary block should never skip regardless of L1
-        bc.block_fingerprints[0] = (mx.ones((1, 64)), mx.array(1.0))
-        assert bc.should_skip_block(0, l1=0.01) is False
+        x = mx.ones((1, 10, 64))
+        l1 = bc.compute_group_l1(x)
+        assert l1 == 1000.0
+        assert bc.group_fingerprint is not None
 
-    def test_should_skip_block_middle_below_thresh(self):
-        bc = BWCacheState(enabled=True, num_blocks=40, boundary_blocks=6, thresh=0.15)
+    def test_compute_group_l1_similarity(self):
+        """Identical inputs give L1 ≈ 0."""
+        bc = BWCacheState(enabled=True, num_blocks=40, boundary_blocks=6)
         bc.reset()
-        # Middle block with fingerprint and low L1 → skip
-        bc.block_fingerprints[20] = (mx.ones((1, 64)), mx.array(1.0))
-        assert bc.should_skip_block(20, l1=0.05) is True
+        x = mx.ones((1, 10, 64))
+        bc.compute_group_l1(x)
+        l1 = bc.compute_group_l1(x)
+        assert l1 == pytest.approx(0.0, abs=1e-6)
 
-    def test_should_skip_block_middle_above_thresh(self):
-        bc = BWCacheState(enabled=True, num_blocks=40, boundary_blocks=6, thresh=0.15)
+    def test_compute_group_l1_difference(self):
+        """Different inputs give L1 > 0 and value is recorded in l1_history."""
+        bc = BWCacheState(enabled=True, num_blocks=40, boundary_blocks=6)
         bc.reset()
-        # Middle block with fingerprint and high L1 → compute
-        bc.block_fingerprints[20] = (mx.ones((1, 64)), mx.array(1.0))
-        assert bc.should_skip_block(20, l1=0.25) is False
+        bc.compute_group_l1(mx.ones((1, 10, 64)))
+        l1 = bc.compute_group_l1(mx.ones((1, 10, 64)) * 2.0)
+        assert l1 > 0.0
+        assert len(bc.l1_history) == 1
 
-    def test_should_skip_block_no_fingerprint(self):
-        bc = BWCacheState(enabled=True, num_blocks=40, boundary_blocks=6, thresh=0.15)
+    def test_group_residual_stored_after_reset(self):
+        """middle_residual and group_fingerprint should be None after reset."""
+        bc = BWCacheState(enabled=True, num_blocks=5)
+        bc.group_fingerprint = (mx.ones((1, 64)), mx.array(1.0))
+        bc.middle_residual = mx.ones((1, 10, 64))
         bc.reset()
-        # Middle block without fingerprint (first step) → compute
-        assert bc.should_skip_block(20, l1=0.05) is False
+        assert bc.group_fingerprint is None
+        assert bc.middle_residual is None
 
     def test_cache_and_get_step_residual(self):
         bc = BWCacheState(enabled=True)
@@ -421,3 +430,32 @@ class TestBWCacheIntegration:
         if self.model.bwcache.l1_history:
             # Threshold was set from data — it may differ from initial
             assert self.model.bwcache.thresh >= 0  # sanity check
+
+    def test_bwcache_group_residual_reuse(self):
+        """Middle blocks should be skipped via residual reuse when L1 is low."""
+        self.model.bwcache.enabled = True
+        self.model.bwcache.mode = "block"
+        self.model.bwcache.thresh = 1000.0  # very high threshold → always reuse
+        self.model.bwcache.auto_thresh = False
+        self.model.bwcache.boundary_blocks = 1
+        self.model.bwcache.num_steps = 3
+        self.model.bwcache.reset()
+
+        x_list, t, context, seq_len = self._make_inputs()
+
+        # Step 1: all computed (no previous fingerprint/residual)
+        outputs = self.model(x_list, mx.array([900.0]), context, seq_len)
+        mx.eval(outputs[0])
+        step1_computed = self.model.bwcache.blocks_computed
+        step1_skipped = self.model.bwcache.blocks_skipped
+        assert step1_skipped == 0  # first step never skips
+        assert step1_computed == self.config.num_layers
+
+        # Step 2: middle blocks should be skipped (high thresh = always reuse)
+        outputs = self.model(x_list, mx.array([600.0]), context, seq_len)
+        mx.eval(outputs[0])
+        # Boundary blocks computed: 1 start + 1 end = 2
+        # Middle blocks skipped: num_layers - 2
+        num_middle = self.config.num_layers - 2
+        assert self.model.bwcache.blocks_skipped == num_middle
+        assert self.model.bwcache.middle_residual is not None

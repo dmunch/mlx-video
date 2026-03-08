@@ -6,17 +6,19 @@ Transformers through Block-Wise Caching" (arXiv:2509.13789v3).
 Two operating modes:
   - "step": Paper-faithful step-level caching. Aggregated block L1 similarity
     triggers a cal_list schedule that skips entire denoising steps.
-  - "block": Enhanced per-block caching. Always computes boundary blocks
-    (first/last N), skips middle blocks whose compact L1 fingerprint is
-    below threshold (identity skip — zero additional memory).
+  - "block": Group residual caching. Always computes boundary blocks
+    (first/last N). For the middle section, checks a compact L1 fingerprint
+    of the input; if similar to the previous step, reuses the cached
+    residual (output - input) instead of computing all middle blocks.
 
 Block mode is designed to layer on top of step-level methods (MagCache,
 Spectrum) — it only activates within steps those methods decide to compute.
 
-Memory design: Block mode uses spatially-pooled fingerprints ([B, dim]) for
-L1 comparison instead of full hidden states, and identity-skip instead of
-cached per-block residuals. This keeps memory overhead under ~2 MB regardless
-of resolution/frame count.
+Memory design: Block mode stores one group fingerprint ([B, dim] ~10 KB) plus
+one middle-section residual ([B, seq_len, dim] ~400 MB at 480p). The residual
+is necessary for quality — identity skip (zeroing the middle blocks'
+contribution) causes artifacts, while residual reuse preserves the actual
+learned transformations.
 """
 
 import math
@@ -34,10 +36,11 @@ class BWCacheState:
     the middle. BWCache exploits this by skipping blocks when their input
     features barely changed from the previous step.
 
-    Block mode uses *identity skip*: skipped blocks contribute nothing (the
-    hidden state passes through unchanged). This is valid because low L1
-    means the block's input barely changed, so its output delta is also small.
-    This avoids storing per-block residuals (~1.5 GB each at high resolution).
+    Block mode uses *group residual reuse*: the middle section (all blocks
+    between boundary regions) is treated as a single unit. A compact fingerprint
+    of the input to the middle section is compared across steps. If similar,
+    the cached residual (middle_output - middle_input from the previous step)
+    is added to the current input, skipping all middle blocks at once.
     """
 
     enabled: bool = False
@@ -60,9 +63,14 @@ class BWCacheState:
     cal_list_triggered: bool = False
     previous_residual: object = None  # mx.array — step-level residual cache
 
-    # Block-level state: compact fingerprints for L1 comparison
+    # Block-level state: per-block fingerprints for step-mode lazy L1
     # Each entry is (fingerprint [B, dim], abs_mean scalar) or None
     block_fingerprints: list = field(default_factory=list)
+
+    # Block-level state: group residual caching for block mode
+    # Single fingerprint for the input to the middle section
+    group_fingerprint: object = None  # (fingerprint [B, dim], abs_mean scalar) or None
+    middle_residual: object = None  # mx.array — cached residual of middle blocks
 
     # Auto-calibration state
     auto_thresh: bool = True  # Enable auto-threshold calibration (block mode)
@@ -84,6 +92,8 @@ class BWCacheState:
         self.cal_list_triggered = False
         self.previous_residual = None
         self.block_fingerprints = [None] * self.num_blocks
+        self.group_fingerprint = None
+        self.middle_residual = None
         self.calibration_steps_seen = 0
         self.steps_skipped = 0
         self.steps_computed = 0
@@ -157,8 +167,38 @@ class BWCacheState:
             )
 
     # ------------------------------------------------------------------ #
-    #  Block-level mode (enhanced, memory-efficient)
+    #  Block-level mode: group residual caching
     # ------------------------------------------------------------------ #
+
+    def compute_group_l1(self, x: mx.array) -> float:
+        """Compute relative L1 for the middle-section input fingerprint.
+
+        Compares a compact spatial-mean fingerprint of x (the input to the
+        middle section after boundary blocks) against the previous step's
+        fingerprint.
+
+        Args:
+            x: Input tensor [B, seq_len, dim] at the boundary between
+               start boundary blocks and middle blocks.
+
+        Returns:
+            Relative L1 distance (float). Returns 1000.0 sentinel on first call.
+        """
+        fingerprint = x.mean(axis=-2) if x.ndim == 3 else x  # [B, dim]
+
+        if self.group_fingerprint is None:
+            abs_mean = mx.abs(fingerprint).mean()
+            self.group_fingerprint = (fingerprint, abs_mean)
+            return 1000.0
+
+        prev, prev_abs_mean = self.group_fingerprint
+
+        l1 = (mx.abs(fingerprint - prev).mean() / prev_abs_mean).item()
+
+        abs_mean = mx.abs(fingerprint).mean()
+        self.group_fingerprint = (fingerprint, abs_mean)
+        self.l1_history.append(l1)
+        return l1
 
     def compute_block_l1(self, block_idx: int, x_mod: mx.array) -> float:
         """Compute relative L1 distance using compact spatial-mean fingerprints.
@@ -224,22 +264,6 @@ class BWCacheState:
             block_idx < self.boundary_blocks
             or block_idx >= self.num_blocks - self.boundary_blocks
         )
-
-    def should_skip_block(self, block_idx: int, l1: float) -> bool:
-        """Decide whether to skip a block in block mode (identity skip).
-
-        A block can be skipped if:
-        1. It's not a boundary block
-        2. It has been seen before (fingerprint exists from previous step)
-        3. Its L1 similarity is below threshold
-
-        When skipped, the block is not executed and x passes through unchanged.
-        """
-        if self.is_boundary_block(block_idx):
-            return False
-        if self.block_fingerprints[block_idx] is None:
-            return False
-        return l1 < self.thresh
 
     # ------------------------------------------------------------------ #
     #  Auto-calibration

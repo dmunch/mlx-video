@@ -312,78 +312,78 @@ class WanModel(nn.Module):
         cross_kv_caches: list | None,
         kwargs: dict,
     ) -> mx.array:
-        """Run transformer blocks with BWCache block-level skip decisions.
+        """Run transformer blocks with BWCache group residual caching.
 
-        Always computes boundary blocks (first/last N). For middle blocks,
-        checks per-block L1 similarity via compact fingerprints and uses
-        identity-skip when below threshold (block not executed, x unchanged).
+        Three-phase execution:
+        1. Start boundary blocks (first N): always compute
+        2. Middle section (all blocks between boundaries): compute or reuse
+           cached residual based on L1 similarity of the section's input
+        3. End boundary blocks (last N): always compute
+
+        When the middle section's input fingerprint is similar to the previous
+        step (L1 < threshold), the cached residual (middle_output - middle_input
+        from the last computed step) is reused instead of running all middle
+        blocks. This preserves quality (unlike identity skip) while skipping
+        the most expensive part of the transformer.
 
         During auto-calibration warmup, all blocks compute (no skipping) while
-        L1 values are collected. After warmup, threshold is auto-set from the
-        observed L1 distribution to target the desired skip ratio.
-
-        Performance optimizations (per fast-mlx guide):
-        - Boundary blocks: no L1/fingerprint overhead (they never skip)
-        - Pool-first fingerprint: for T2V, applies spatial mean to norm(x)
-          BEFORE modulation, avoiding materializing full [B, seq_len, dim]
-          x_mod. Saves ~90 GB bandwidth per step at 480p×201f.
-        - Cached fingerprint denominator: avoids recomputing |prev| each check
-        - Fingerprint L1 is computed on tiny [B, dim] tensors (~10 KB)
+        L1 values are collected. After warmup, threshold is continuously
+        recalibrated from the growing L1 history.
 
         Increments bc.cnt (step counter) each time it's called.
         """
         bc = self.bwcache
-        e = kwargs["e"]
-        # T2V: e is [B, 1, 6, dim] (broadcast). I2V: e is [B, L, 6, dim].
-        is_broadcast_e = e.shape[-3] == 1
+        num_blocks = len(self.blocks)
+        boundary = bc.boundary_blocks
+        middle_start = boundary
+        middle_end = num_blocks - boundary
+        num_middle = middle_end - middle_start
         calibrating = bc.is_calibrating()
 
-        for i, block in enumerate(self.blocks):
-            kv = cross_kv_caches[i] if cross_kv_caches is not None else None
+        def _kv(i):
+            return cross_kv_caches[i] if cross_kv_caches is not None else None
 
-            if bc.is_boundary_block(i):
-                # Boundary blocks always compute — no L1/fingerprint needed
-                x = block(x, cross_kv_cache=kv, **kwargs)
-                bc.blocks_computed += 1
-            else:
-                # Middle block: compute compact fingerprint for skip decision
-                w_dtype = _linear_dtype(block.self_attn.q)
-                mod = (block.modulation + e).astype(w_dtype)
-                e0 = mod[:, :, 0, :]
-                e1 = mod[:, :, 1, :]
+        # Phase 1: start boundary blocks (always compute)
+        for i in range(middle_start):
+            x = self.blocks[i](x, cross_kv_cache=_kv(i), **kwargs)
+        bc.blocks_computed += middle_start
 
-                if is_broadcast_e:
-                    # Pool-first: mean(norm(x)) then modulate on [B, dim]
-                    # Avoids materializing full [B, seq_len, dim] x_mod
-                    norm_mean = block.norm1(x).mean(axis=-2)
-                    fingerprint = norm_mean * (1 + e1.squeeze(-2)) + e0.squeeze(-2)
-                else:
-                    # I2V: per-token modulation requires full x_mod first
-                    x_mod = block.norm1(x) * (1 + e1) + e0
-                    fingerprint = x_mod.mean(axis=-2)
+        # Phase 2: middle section — group skip or compute
+        group_l1 = bc.compute_group_l1(x)
 
-                l1 = bc.compute_block_l1(i, fingerprint)
+        if not calibrating and group_l1 < bc.thresh and bc.middle_residual is not None:
+            # Reuse cached middle-section residual
+            x = x + bc.middle_residual
+            bc.blocks_skipped += num_middle
+            if bc.verbose:
+                print(
+                    f"      [BWCache] Middle blocks {middle_start}-{middle_end-1}: "
+                    f"REUSE residual (group_l1={group_l1:.4f} < thresh={bc.thresh:.4f})"
+                )
+        else:
+            # Compute all middle blocks, cache residual
+            x_before_middle = x
+            for i in range(middle_start, middle_end):
+                x = self.blocks[i](x, cross_kv_cache=_kv(i), **kwargs)
+            bc.middle_residual = x - x_before_middle
+            bc.blocks_computed += num_middle
+            if bc.verbose:
+                label = "CALIBRATE" if calibrating else "COMPUTE"
+                print(
+                    f"      [BWCache] Middle blocks {middle_start}-{middle_end-1}: "
+                    f"{label} (group_l1={group_l1:.4f})"
+                )
 
-                if not calibrating and bc.should_skip_block(i, l1):
-                    bc.blocks_skipped += 1
-                    if bc.verbose:
-                        print(f"      [BWCache block] block {i}: SKIP (l1={l1:.4f})")
-                    continue
-
-                # Compute the block fully
-                x = block(x, cross_kv_cache=kv, **kwargs)
-                bc.blocks_computed += 1
-                if bc.verbose:
-                    label = "CALIBRATE" if calibrating else "COMPUTE"
-                    print(f"      [BWCache block] block {i}: {label} (l1={l1:.4f})")
+        # Phase 3: end boundary blocks (always compute)
+        for i in range(middle_end, num_blocks):
+            x = self.blocks[i](x, cross_kv_cache=_kv(i), **kwargs)
+        bc.blocks_computed += num_blocks - middle_end
 
         bc.cnt += 1
 
         # Auto-calibration: count computed steps, fire when warmup completes.
         # After warmup, continue recalibrating every step so the threshold
-        # adapts as MagCache step-skipping creates larger timestep gaps
-        # (early calibration steps are consecutive → low L1; later computed
-        # steps have larger gaps → higher L1).
+        # adapts as MagCache step-skipping creates larger timestep gaps.
         if calibrating:
             bc.calibration_steps_seen += 1
             if bc.calibration_steps_seen >= bc.calibration_warmup:
