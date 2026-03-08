@@ -86,6 +86,9 @@ def generate_video(
     bwcache_reuse_interval: int = 3,
     bwcache_last_step: float = 0.5,
     bwcache_boundary_blocks: int = 6,
+    bwcache_auto_thresh: bool = True,
+    bwcache_calibration_steps: int = 3,
+    bwcache_target_skip_ratio: float = 0.5,
     bwcache_verbose: bool = False,
     loras: list | None = None,
     loras_high: list | None = None,
@@ -124,10 +127,13 @@ def generate_video(
         magcache_ratios: Path to custom calibration JSON (overrides built-in ratios)
         bwcache: Enable BWCache acceleration (block-wise caching)
         bwcache_mode: BWCache mode: 'step' (paper-faithful) or 'block' (per-block skip, default)
-        bwcache_thresh: BWCache similarity threshold δ (default: 0.15)
+        bwcache_thresh: BWCache similarity threshold δ (default: 0.15, used when auto-thresh disabled)
         bwcache_reuse_interval: Periodic recomputation interval R for step mode (default: 3)
         bwcache_last_step: Fraction of tail steps to always compute in step mode (default: 0.5)
         bwcache_boundary_blocks: First/last N blocks always computed in block mode (default: 6)
+        bwcache_auto_thresh: Auto-calibrate threshold from observed L1 distribution (default: True)
+        bwcache_calibration_steps: Computed steps for calibration warmup (default: 3)
+        bwcache_target_skip_ratio: Target fraction of middle blocks to skip (default: 0.5)
         bwcache_verbose: Print per-step/block BWCache diagnostics
         loras: Optional list of (path, strength) tuples applied to all models
         loras_high: Optional list of (path, strength) tuples for high-noise model only
@@ -774,10 +780,6 @@ def generate_video(
             )
             bwcache_mode = "block"
 
-        # Block mode uses a tighter default threshold for quality
-        if bwcache_mode == "block" and bwcache_thresh == 0.15:
-            bwcache_thresh = 0.08
-
         def _configure_bwcache(m, num_steps):
             m.bwcache.enabled = True
             m.bwcache.mode = bwcache_mode
@@ -785,8 +787,20 @@ def generate_video(
             m.bwcache.reuse_interval = bwcache_reuse_interval
             m.bwcache.last_step_ratio = bwcache_last_step
             m.bwcache.boundary_blocks = bwcache_boundary_blocks
+            m.bwcache.auto_thresh = bwcache_auto_thresh and bwcache_mode == "block"
+            m.bwcache.calibration_warmup = bwcache_calibration_steps
+            m.bwcache.target_skip_ratio = bwcache_target_skip_ratio
             m.bwcache.verbose = bwcache_verbose
             m.bwcache.num_steps = num_steps
+            # Disable BWCache if model has fewer steps than calibration warmup
+            if bwcache_auto_thresh and num_steps <= bwcache_calibration_steps:
+                m.bwcache.enabled = False
+                if bwcache_verbose:
+                    print(
+                        f"{Colors.YELLOW}  BWCache disabled for model with {num_steps} steps "
+                        f"(< {bwcache_calibration_steps} calibration steps){Colors.RESET}"
+                    )
+                return
             m.bwcache.reset()
 
         if is_dual:
@@ -798,6 +812,9 @@ def generate_video(
             _configure_bwcache(single_model, steps)
 
         use_caching = True
+        auto_label = ""
+        if bwcache_auto_thresh and bwcache_mode == "block":
+            auto_label = f", auto-thresh (warmup={bwcache_calibration_steps}, target={bwcache_target_skip_ratio:.0%})"
         print(
             f"{Colors.DIM}  BWCache: mode={bwcache_mode}, thresh={bwcache_thresh}"
             + (
@@ -805,6 +822,7 @@ def generate_video(
                 if bwcache_mode == "block"
                 else f", reuse_interval={bwcache_reuse_interval}"
             )
+            + auto_label
             + f"{Colors.RESET}"
         )
 
@@ -1010,6 +1028,25 @@ def generate_video(
                 print(
                     f"{Colors.DIM}  BWCache (block): {total_block_skipped}/{total_blocks} blocks skipped "
                     f"({total_block_skipped/total_blocks*100:.0f}%){Colors.RESET}"
+                )
+            # Print L1 distribution to help with threshold tuning
+            all_l1 = []
+            for _, m in models_to_report:
+                all_l1.extend(m.bwcache.l1_history)
+            if all_l1:
+                s = sorted(all_l1)
+                n = len(s)
+                p25 = s[min(int(n * 0.25), n - 1)]
+                p50 = s[min(int(n * 0.50), n - 1)]
+                p75 = s[min(int(n * 0.75), n - 1)]
+                # Determine effective threshold (may have been auto-calibrated)
+                eff_thresh = models_to_report[0][1].bwcache.thresh
+                if is_dual and models_to_report[1][1].bwcache.enabled:
+                    # Use the low-noise model's thresh (has more steps)
+                    eff_thresh = models_to_report[1][1].bwcache.thresh
+                print(
+                    f"{Colors.DIM}  BWCache L1: p25={p25:.4f}, p50={p50:.4f}, p75={p75:.4f} "
+                    f"(thresh={eff_thresh:.4f}){Colors.RESET}"
                 )
         else:
             total_skipped = sum(m.bwcache.steps_skipped for _, m in models_to_report)
@@ -1298,6 +1335,24 @@ def main():
         help="Print per-step/block BWCache diagnostics",
     )
     parser.add_argument(
+        "--bwcache-auto-thresh",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-calibrate block-mode threshold from observed L1 distribution (default: enabled)",
+    )
+    parser.add_argument(
+        "--bwcache-calibration-steps",
+        type=int,
+        default=3,
+        help="Number of computed steps for auto-threshold calibration warmup (default: 3)",
+    )
+    parser.add_argument(
+        "--bwcache-target-skip-ratio",
+        type=float,
+        default=0.5,
+        help="Target fraction of middle blocks to skip after calibration (default: 0.5)",
+    )
+    parser.add_argument(
         "--lora",
         nargs=2,
         action="append",
@@ -1389,6 +1444,9 @@ def main():
         bwcache_reuse_interval=args.bwcache_reuse_interval,
         bwcache_last_step=args.bwcache_last_step,
         bwcache_boundary_blocks=args.bwcache_boundary_blocks,
+        bwcache_auto_thresh=args.bwcache_auto_thresh,
+        bwcache_calibration_steps=args.bwcache_calibration_steps,
+        bwcache_target_skip_ratio=args.bwcache_target_skip_ratio,
         bwcache_verbose=args.bwcache_verbose,
         loras=_parse_lora_args(args.lora),
         loras_high=_parse_lora_args(args.lora_high),

@@ -61,14 +61,21 @@ class BWCacheState:
     previous_residual: object = None  # mx.array — step-level residual cache
 
     # Block-level state: compact fingerprints for L1 comparison
-    # Each entry is [B, dim] (spatially-pooled), NOT full [B, seq_len, dim]
+    # Each entry is (fingerprint [B, dim], abs_mean scalar) or None
     block_fingerprints: list = field(default_factory=list)
 
-    # --- Stats ---
+    # Auto-calibration state
+    auto_thresh: bool = True  # Enable auto-threshold calibration (block mode)
+    calibration_warmup: int = 3  # Computed steps before calibration fires
+    target_skip_ratio: float = 0.5  # Target fraction of middle blocks to skip
+    calibration_steps_seen: int = 0  # Computed steps during warmup
+
+    # --- Stats & diagnostics ---
     steps_skipped: int = 0
     steps_computed: int = 0
     blocks_skipped: int = 0
     blocks_computed: int = 0
+    l1_history: list = field(default_factory=list)  # All non-sentinel L1 values
 
     def reset(self):
         """Reset all runtime state for a new generation run."""
@@ -77,10 +84,12 @@ class BWCacheState:
         self.cal_list_triggered = False
         self.previous_residual = None
         self.block_fingerprints = [None] * self.num_blocks
+        self.calibration_steps_seen = 0
         self.steps_skipped = 0
         self.steps_computed = 0
         self.blocks_skipped = 0
         self.blocks_computed = 0
+        self.l1_history = []
 
     # ------------------------------------------------------------------ #
     #  Step-level mode (paper-faithful)
@@ -182,6 +191,7 @@ class BWCacheState:
 
         abs_mean = mx.abs(fingerprint).mean()
         self.block_fingerprints[block_idx] = (fingerprint, abs_mean)
+        self.l1_history.append(l1)
         return l1
 
     def compute_block_l1_lazy(self, block_idx: int, x_mod: mx.array) -> mx.array:
@@ -232,6 +242,42 @@ class BWCacheState:
         return l1 < self.thresh
 
     # ------------------------------------------------------------------ #
+    #  Auto-calibration
+    # ------------------------------------------------------------------ #
+
+    def is_calibrating(self) -> bool:
+        """True during warmup period when collecting L1 data (no skipping)."""
+        if not self.auto_thresh or self.mode != "block":
+            return False
+        return self.calibration_steps_seen < self.calibration_warmup
+
+    def finish_calibration(self):
+        """Set threshold from observed L1 distribution at target skip percentile.
+
+        Called after warmup completes. Uses l1_history to find the threshold
+        that would skip `target_skip_ratio` fraction of middle blocks.
+        """
+        if not self.l1_history:
+            return
+
+        sorted_l1 = sorted(self.l1_history)
+        # target_skip_ratio = 0.5 → set threshold at the 50th percentile
+        # so that 50% of L1 values fall below it → 50% would be skipped
+        idx = int(len(sorted_l1) * self.target_skip_ratio)
+        idx = min(idx, len(sorted_l1) - 1)
+        old_thresh = self.thresh
+        self.thresh = sorted_l1[idx]
+
+        if self.verbose:
+            pcts = self.l1_percentiles()
+            print(
+                f"    [BWCache] Auto-calibrated: thresh {old_thresh:.4f} → {self.thresh:.4f} "
+                f"(target {self.target_skip_ratio:.0%} skip, "
+                f"L1 p50={pcts.get('p50', 0):.4f}, p75={pcts.get('p75', 0):.4f}, "
+                f"from {len(self.l1_history)} samples)"
+            )
+
+    # ------------------------------------------------------------------ #
     #  Step-level residual helpers
     # ------------------------------------------------------------------ #
 
@@ -246,6 +292,27 @@ class BWCacheState:
     # ------------------------------------------------------------------ #
     #  Diagnostics
     # ------------------------------------------------------------------ #
+
+    def l1_percentiles(self) -> dict:
+        """Return L1 distribution percentiles from collected history."""
+        if not self.l1_history:
+            return {}
+        s = sorted(self.l1_history)
+        n = len(s)
+
+        def pct(p):
+            idx = min(int(n * p / 100), n - 1)
+            return s[idx]
+
+        return {
+            "p10": pct(10),
+            "p25": pct(25),
+            "p50": pct(50),
+            "p75": pct(75),
+            "p90": pct(90),
+            "mean": sum(s) / n,
+            "count": n,
+        }
 
     def summary(self) -> str:
         """Return a summary string of caching statistics."""

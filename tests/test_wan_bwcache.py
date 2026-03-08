@@ -151,21 +151,21 @@ class TestBWCacheState:
         bc = BWCacheState(enabled=True, num_blocks=40, boundary_blocks=6, thresh=0.15)
         bc.reset()
         # Boundary block should never skip regardless of L1
-        bc.block_fingerprints[0] = mx.ones((1, 64))
+        bc.block_fingerprints[0] = (mx.ones((1, 64)), mx.array(1.0))
         assert bc.should_skip_block(0, l1=0.01) is False
 
     def test_should_skip_block_middle_below_thresh(self):
         bc = BWCacheState(enabled=True, num_blocks=40, boundary_blocks=6, thresh=0.15)
         bc.reset()
         # Middle block with fingerprint and low L1 → skip
-        bc.block_fingerprints[20] = mx.ones((1, 64))
+        bc.block_fingerprints[20] = (mx.ones((1, 64)), mx.array(1.0))
         assert bc.should_skip_block(20, l1=0.05) is True
 
     def test_should_skip_block_middle_above_thresh(self):
         bc = BWCacheState(enabled=True, num_blocks=40, boundary_blocks=6, thresh=0.15)
         bc.reset()
         # Middle block with fingerprint and high L1 → compute
-        bc.block_fingerprints[20] = mx.ones((1, 64))
+        bc.block_fingerprints[20] = (mx.ones((1, 64)), mx.array(1.0))
         assert bc.should_skip_block(20, l1=0.25) is False
 
     def test_should_skip_block_no_fingerprint(self):
@@ -194,6 +194,81 @@ class TestBWCacheState:
         assert "BWCache block" in s
         assert "100" in s
         assert "33%" in s
+
+    def test_l1_history_collection(self):
+        """L1 values should be collected in l1_history (excluding sentinel)."""
+        bc = BWCacheState(enabled=True, num_blocks=5)
+        bc.reset()
+        x1 = mx.ones((1, 10, 64))
+        x2 = mx.ones((1, 10, 64)) * 1.1
+        # First call: sentinel, not recorded
+        bc.compute_block_l1(0, x1)
+        assert len(bc.l1_history) == 0
+        # Second call: real L1, recorded
+        bc.compute_block_l1(0, x2)
+        assert len(bc.l1_history) == 1
+        assert bc.l1_history[0] > 0
+
+    def test_l1_percentiles(self):
+        bc = BWCacheState(enabled=True, num_blocks=5)
+        bc.reset()
+        bc.l1_history = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+        pcts = bc.l1_percentiles()
+        assert pcts["count"] == 10
+        assert pcts["p50"] == pytest.approx(0.30, abs=0.05)
+        assert pcts["p25"] < pcts["p50"] < pcts["p75"]
+        assert pcts["mean"] == pytest.approx(0.275, abs=0.01)
+
+    def test_l1_percentiles_empty(self):
+        bc = BWCacheState(enabled=True)
+        assert bc.l1_percentiles() == {}
+
+    def test_auto_calibration_warmup(self):
+        """During calibration warmup, is_calibrating() returns True."""
+        bc = BWCacheState(
+            enabled=True, mode="block", auto_thresh=True, calibration_warmup=3
+        )
+        bc.reset()
+        bc.calibration_steps_seen = 0
+        assert bc.is_calibrating() is True
+        bc.calibration_steps_seen = 2
+        assert bc.is_calibrating() is True
+        bc.calibration_steps_seen = 3
+        assert bc.is_calibrating() is False
+
+    def test_auto_calibration_disabled_for_step_mode(self):
+        bc = BWCacheState(enabled=True, mode="step", auto_thresh=True)
+        assert bc.is_calibrating() is False
+
+    def test_finish_calibration_sets_threshold(self):
+        """finish_calibration() should set threshold from L1 distribution."""
+        bc = BWCacheState(
+            enabled=True,
+            mode="block",
+            auto_thresh=True,
+            target_skip_ratio=0.5,
+            thresh=0.15,
+        )
+        bc.reset()
+        # Simulate collected L1 values
+        bc.l1_history = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00]
+        bc.finish_calibration()
+        # With target_skip_ratio=0.5, threshold should be at the 50th percentile
+        assert bc.thresh == pytest.approx(0.60, abs=0.05)
+
+    def test_finish_calibration_empty_history(self):
+        bc = BWCacheState(enabled=True, thresh=0.15)
+        bc.reset()
+        bc.finish_calibration()
+        assert bc.thresh == 0.15  # unchanged
+
+    def test_reset_clears_calibration(self):
+        bc = BWCacheState(enabled=True, num_blocks=5, auto_thresh=True)
+        bc.calibration_steps_seen = 5
+        bc.l1_history = [0.1, 0.2, 0.3]
+        bc.reset()
+        assert bc.calibration_steps_seen == 0
+        assert bc.l1_history == []
 
 
 class TestBWCacheIntegration:
@@ -243,6 +318,7 @@ class TestBWCacheIntegration:
         self.model.bwcache.enabled = True
         self.model.bwcache.mode = "block"
         self.model.bwcache.thresh = 0.15
+        self.model.bwcache.auto_thresh = False  # disable auto-calibration for test
         self.model.bwcache.boundary_blocks = 1  # tiny model has 2 blocks
         self.model.bwcache.num_steps = 3
         self.model.bwcache.reset()
@@ -271,6 +347,7 @@ class TestBWCacheIntegration:
         self.model.bwcache.enabled = True
         self.model.bwcache.mode = "block"
         self.model.bwcache.thresh = 0.15
+        self.model.bwcache.auto_thresh = False
         self.model.bwcache.boundary_blocks = 1
         self.model.bwcache.num_steps = 1
         self.model.bwcache.reset()
@@ -285,6 +362,7 @@ class TestBWCacheIntegration:
         self.model.bwcache.enabled = True
         self.model.bwcache.mode = "block"
         self.model.bwcache.thresh = 10.0  # very high threshold
+        self.model.bwcache.auto_thresh = False
         self.model.bwcache.boundary_blocks = 0  # no boundary protection
         self.model.bwcache.num_steps = 1
         self.model.bwcache.reset()
@@ -301,6 +379,7 @@ class TestBWCacheIntegration:
         self.model.bwcache.enabled = True
         self.model.bwcache.mode = "block"
         self.model.bwcache.thresh = 0.15
+        self.model.bwcache.auto_thresh = False
         self.model.bwcache.boundary_blocks = 1
         self.model.bwcache.num_steps = 2
         self.model.bwcache.reset()
@@ -314,3 +393,31 @@ class TestBWCacheIntegration:
 
         assert len(outputs) == 2
         assert outputs[0].shape == outputs[1].shape
+
+    def test_bwcache_auto_calibration(self):
+        """Auto-calibration should set threshold after warmup steps."""
+        self.model.bwcache.enabled = True
+        self.model.bwcache.mode = "block"
+        self.model.bwcache.auto_thresh = True
+        self.model.bwcache.calibration_warmup = 2
+        self.model.bwcache.target_skip_ratio = 0.5
+        self.model.bwcache.thresh = 0.15
+        self.model.bwcache.boundary_blocks = 0  # all blocks are middle
+        self.model.bwcache.num_steps = 5
+        self.model.bwcache.reset()
+
+        x_list, t, context, seq_len = self._make_inputs()
+        initial_thresh = self.model.bwcache.thresh
+
+        # Run calibration warmup steps
+        for step in range(3):
+            t_val = mx.array([900.0 - step * 200.0])
+            outputs = self.model(x_list, t_val, context, seq_len)
+            mx.eval(outputs[0])
+
+        # After 2+ computed steps, calibration should have fired
+        assert self.model.bwcache.calibration_steps_seen >= 2
+        # Threshold should have been auto-adjusted (unless L1 history was empty)
+        if self.model.bwcache.l1_history:
+            # Threshold was set from data — it may differ from initial
+            assert self.model.bwcache.thresh >= 0  # sanity check

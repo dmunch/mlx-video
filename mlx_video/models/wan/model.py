@@ -318,6 +318,10 @@ class WanModel(nn.Module):
         checks per-block L1 similarity via compact fingerprints and uses
         identity-skip when below threshold (block not executed, x unchanged).
 
+        During auto-calibration warmup, all blocks compute (no skipping) while
+        L1 values are collected. After warmup, threshold is auto-set from the
+        observed L1 distribution to target the desired skip ratio.
+
         Performance optimizations (per fast-mlx guide):
         - Boundary blocks: no L1/fingerprint overhead (they never skip)
         - Pool-first fingerprint: for T2V, applies spatial mean to norm(x)
@@ -332,6 +336,7 @@ class WanModel(nn.Module):
         e = kwargs["e"]
         # T2V: e is [B, 1, 6, dim] (broadcast). I2V: e is [B, L, 6, dim].
         is_broadcast_e = e.shape[-3] == 1
+        calibrating = bc.is_calibrating()
 
         for i, block in enumerate(self.blocks):
             kv = cross_kv_caches[i] if cross_kv_caches is not None else None
@@ -359,7 +364,7 @@ class WanModel(nn.Module):
 
                 l1 = bc.compute_block_l1(i, fingerprint)
 
-                if bc.should_skip_block(i, l1):
+                if not calibrating and bc.should_skip_block(i, l1):
                     bc.blocks_skipped += 1
                     if bc.verbose:
                         print(f"      [BWCache block] block {i}: SKIP (l1={l1:.4f})")
@@ -369,9 +374,17 @@ class WanModel(nn.Module):
                 x = block(x, cross_kv_cache=kv, **kwargs)
                 bc.blocks_computed += 1
                 if bc.verbose:
-                    print(f"      [BWCache block] block {i}: COMPUTE (l1={l1:.4f})")
+                    label = "CALIBRATE" if calibrating else "COMPUTE"
+                    print(f"      [BWCache block] block {i}: {label} (l1={l1:.4f})")
 
         bc.cnt += 1
+
+        # Auto-calibration: count computed steps, fire when warmup completes
+        if calibrating:
+            bc.calibration_steps_seen += 1
+            if bc.calibration_steps_seen >= bc.calibration_warmup:
+                bc.finish_calibration()
+
         return x
 
     def _run_blocks_plain(
