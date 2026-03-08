@@ -14,9 +14,14 @@ import numpy as np
 from tqdm import tqdm
 
 from mlx_video.models.wan.i2v_utils import build_i2v_mask, preprocess_image
-from mlx_video.models.wan.loading import (_clean_text, encode_text,
-                                          load_t5_encoder, load_vae_decoder,
-                                          load_vae_encoder, load_wan_model)
+from mlx_video.models.wan.loading import (
+    _clean_text,
+    encode_text,
+    load_t5_encoder,
+    load_vae_decoder,
+    load_vae_encoder,
+    load_wan_model,
+)
 from mlx_video.postprocess import save_video
 from mlx_video.utils import Colors
 
@@ -75,6 +80,13 @@ def generate_video(
     magcache_verbose: bool = False,
     magcache_calibrate: bool = False,
     magcache_ratios: str | None = None,
+    bwcache: bool = False,
+    bwcache_mode: str = "block",
+    bwcache_thresh: float = 0.15,
+    bwcache_reuse_interval: int = 3,
+    bwcache_last_step: float = 0.5,
+    bwcache_boundary_blocks: int = 6,
+    bwcache_verbose: bool = False,
     loras: list | None = None,
     loras_high: list | None = None,
     loras_low: list | None = None,
@@ -110,6 +122,13 @@ def generate_video(
         magcache_verbose: Print per-step MagCache diagnostics
         magcache_calibrate: Run calibration mode (full compute, record ratios to JSON)
         magcache_ratios: Path to custom calibration JSON (overrides built-in ratios)
+        bwcache: Enable BWCache acceleration (block-wise caching)
+        bwcache_mode: BWCache mode: 'step' (paper-faithful) or 'block' (per-block skip, default)
+        bwcache_thresh: BWCache similarity threshold δ (default: 0.15)
+        bwcache_reuse_interval: Periodic recomputation interval R for step mode (default: 3)
+        bwcache_last_step: Fraction of tail steps to always compute in step mode (default: 0.5)
+        bwcache_boundary_blocks: First/last N blocks always computed in block mode (default: 6)
+        bwcache_verbose: Print per-step/block BWCache diagnostics
         loras: Optional list of (path, strength) tuples applied to all models
         loras_high: Optional list of (path, strength) tuples for high-noise model only
         loras_low: Optional list of (path, strength) tuples for low-noise model only
@@ -124,9 +143,11 @@ def generate_video(
     import json
 
     from mlx_video.models.wan.config import WanModelConfig
-    from mlx_video.models.wan.scheduler import (FlowDPMPP2MScheduler,
-                                                FlowMatchEulerScheduler,
-                                                FlowUniPCScheduler)
+    from mlx_video.models.wan.scheduler import (
+        FlowDPMPP2MScheduler,
+        FlowMatchEulerScheduler,
+        FlowUniPCScheduler,
+    )
 
     model_dir = Path(model_dir)
 
@@ -594,9 +615,7 @@ def generate_video(
             m.magcache.configure_calibration(num_steps)
 
         if is_dual:
-            high_steps = sum(
-                1 for tv in sched.timesteps.tolist() if tv >= boundary
-            )
+            high_steps = sum(1 for tv in sched.timesteps.tolist() if tv >= boundary)
             low_steps = steps - high_steps
             _configure_calibration(high_noise_model, high_steps)
             _configure_calibration(low_noise_model, low_steps)
@@ -746,6 +765,49 @@ def generate_video(
     if magcache_calibrate:
         use_caching = True
 
+    # Configure BWCache (block mode compatible with MagCache/Spectrum; step mode standalone)
+    if bwcache:
+        if bwcache_mode == "step" and (magcache or spectrum or teacache_thresh > 0):
+            print(
+                f"{Colors.YELLOW}  Warning: BWCache step mode is mutually exclusive with other step-level caches. "
+                f"Switching to block mode.{Colors.RESET}"
+            )
+            bwcache_mode = "block"
+
+        # Block mode uses a tighter default threshold for quality
+        if bwcache_mode == "block" and bwcache_thresh == 0.15:
+            bwcache_thresh = 0.08
+
+        def _configure_bwcache(m, num_steps):
+            m.bwcache.enabled = True
+            m.bwcache.mode = bwcache_mode
+            m.bwcache.thresh = bwcache_thresh
+            m.bwcache.reuse_interval = bwcache_reuse_interval
+            m.bwcache.last_step_ratio = bwcache_last_step
+            m.bwcache.boundary_blocks = bwcache_boundary_blocks
+            m.bwcache.verbose = bwcache_verbose
+            m.bwcache.num_steps = num_steps
+            m.bwcache.reset()
+
+        if is_dual:
+            high_steps = sum(1 for tv in sched.timesteps.tolist() if tv >= boundary)
+            low_steps = steps - high_steps
+            _configure_bwcache(high_noise_model, high_steps)
+            _configure_bwcache(low_noise_model, low_steps)
+        else:
+            _configure_bwcache(single_model, steps)
+
+        use_caching = True
+        print(
+            f"{Colors.DIM}  BWCache: mode={bwcache_mode}, thresh={bwcache_thresh}"
+            + (
+                f", boundary_blocks={bwcache_boundary_blocks}"
+                if bwcache_mode == "block"
+                else f", reuse_interval={bwcache_reuse_interval}"
+            )
+            + f"{Colors.RESET}"
+        )
+
     # Compile model forward for faster denoising (incompatible with caching strategies)
     if not use_caching and not no_compile:
         models_to_compile = (
@@ -880,9 +942,7 @@ def generate_video(
 
     if magcache:
         models_to_report = (
-            [("high-noise", high_noise_model)]
-            if is_dual
-            else [("model", single_model)]
+            [("high-noise", high_noise_model)] if is_dual else [("model", single_model)]
         )
         # Include low-noise model if it has magcache enabled (custom ratios)
         if is_dual and low_noise_model.magcache.enabled:
@@ -931,6 +991,35 @@ def generate_video(
             print(
                 f"{Colors.DIM}  Spectrum: {total_predicted}/{total} steps predicted ({total_predicted/total*100:.0f}% skipped){Colors.RESET}"
             )
+
+    if bwcache:
+        models_to_report = (
+            [("high-noise", high_noise_model), ("low-noise", low_noise_model)]
+            if is_dual
+            else [("model", single_model)]
+        )
+        if bwcache_mode == "block":
+            total_block_skipped = sum(
+                m.bwcache.blocks_skipped for _, m in models_to_report
+            )
+            total_block_computed = sum(
+                m.bwcache.blocks_computed for _, m in models_to_report
+            )
+            total_blocks = total_block_skipped + total_block_computed
+            if total_blocks > 0:
+                print(
+                    f"{Colors.DIM}  BWCache (block): {total_block_skipped}/{total_blocks} blocks skipped "
+                    f"({total_block_skipped/total_blocks*100:.0f}%){Colors.RESET}"
+                )
+        else:
+            total_skipped = sum(m.bwcache.steps_skipped for _, m in models_to_report)
+            total_computed = sum(m.bwcache.steps_computed for _, m in models_to_report)
+            total = total_skipped + total_computed
+            if total > 0:
+                print(
+                    f"{Colors.DIM}  BWCache (step): {total_skipped}/{total} steps skipped "
+                    f"({total_skipped/total*100:.0f}%){Colors.RESET}"
+                )
 
     # Free transformer models and text embeddings
     if is_dual:
@@ -1166,6 +1255,49 @@ def main():
         help="Load custom MagCache ratios from a calibration JSON file (overrides built-in ratios)",
     )
     parser.add_argument(
+        "--bwcache",
+        action="store_true",
+        default=False,
+        help="Enable BWCache acceleration (block-wise caching for DiT blocks)",
+    )
+    parser.add_argument(
+        "--bwcache-mode",
+        type=str,
+        default="block",
+        choices=["step", "block"],
+        help="BWCache mode: 'step' (paper-faithful step-level) or 'block' (per-block skip, default)",
+    )
+    parser.add_argument(
+        "--bwcache-thresh",
+        type=float,
+        default=0.15,
+        help="BWCache similarity threshold δ (default: 0.15, lower=better quality)",
+    )
+    parser.add_argument(
+        "--bwcache-reuse-interval",
+        type=int,
+        default=3,
+        help="BWCache periodic recomputation interval for step mode (default: 3)",
+    )
+    parser.add_argument(
+        "--bwcache-last-step",
+        type=float,
+        default=0.5,
+        help="BWCache fraction of tail steps to always compute in step mode (default: 0.5)",
+    )
+    parser.add_argument(
+        "--bwcache-boundary-blocks",
+        type=int,
+        default=6,
+        help="BWCache: first/last N blocks always computed in block mode (default: 6)",
+    )
+    parser.add_argument(
+        "--bwcache-verbose",
+        action="store_true",
+        default=False,
+        help="Print per-step/block BWCache diagnostics",
+    )
+    parser.add_argument(
         "--lora",
         nargs=2,
         action="append",
@@ -1251,6 +1383,13 @@ def main():
         magcache_verbose=args.magcache_verbose,
         magcache_calibrate=args.magcache_calibrate,
         magcache_ratios=args.magcache_ratios,
+        bwcache=args.bwcache,
+        bwcache_mode=args.bwcache_mode,
+        bwcache_thresh=args.bwcache_thresh,
+        bwcache_reuse_interval=args.bwcache_reuse_interval,
+        bwcache_last_step=args.bwcache_last_step,
+        bwcache_boundary_blocks=args.bwcache_boundary_blocks,
+        bwcache_verbose=args.bwcache_verbose,
         loras=_parse_lora_args(args.lora),
         loras_high=_parse_lora_args(args.lora_high),
         loras_low=_parse_lora_args(args.lora_low),

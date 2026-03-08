@@ -6,6 +6,7 @@ import mlx.nn as nn
 import numpy as np
 
 from .attention import WanLayerNorm, _linear_dtype
+from .bwcache import BWCacheState
 from .config import WanModelConfig
 from .magcache import MagCacheState
 from .rope import rope_params, rope_precompute_cos_sin
@@ -192,6 +193,10 @@ class WanModel(nn.Module):
         # MagCache state (disabled by default)
         self.magcache = MagCacheState()
 
+        # BWCache state (disabled by default)
+        self.bwcache = BWCacheState()
+        self.bwcache.num_blocks = config.num_layers
+
     def _patchify(self, x: mx.array) -> tuple:
         """Convert video tensor to patch embeddings.
 
@@ -300,6 +305,97 @@ class WanModel(nn.Module):
         """
         w_dtype = _linear_dtype(self.patch_embedding_proj)
         return rope_precompute_cos_sin(grid_sizes, self.freqs, dtype=w_dtype)
+
+    def _run_blocks_bwcache(
+        self,
+        x: mx.array,
+        cross_kv_caches: list | None,
+        kwargs: dict,
+    ) -> mx.array:
+        """Run transformer blocks with BWCache block-level skip decisions.
+
+        Always computes boundary blocks (first/last N). For middle blocks,
+        checks per-block L1 similarity via compact fingerprints and uses
+        identity-skip when below threshold (block not executed, x unchanged).
+
+        Performance optimizations (per fast-mlx guide):
+        - Boundary blocks: no L1/fingerprint overhead (they never skip)
+        - Pool-first fingerprint: for T2V, applies spatial mean to norm(x)
+          BEFORE modulation, avoiding materializing full [B, seq_len, dim]
+          x_mod. Saves ~90 GB bandwidth per step at 480p×201f.
+        - Cached fingerprint denominator: avoids recomputing |prev| each check
+        - Fingerprint L1 is computed on tiny [B, dim] tensors (~10 KB)
+
+        Increments bc.cnt (step counter) each time it's called.
+        """
+        bc = self.bwcache
+        e = kwargs["e"]
+        # T2V: e is [B, 1, 6, dim] (broadcast). I2V: e is [B, L, 6, dim].
+        is_broadcast_e = e.shape[-3] == 1
+
+        for i, block in enumerate(self.blocks):
+            kv = cross_kv_caches[i] if cross_kv_caches is not None else None
+
+            if bc.is_boundary_block(i):
+                # Boundary blocks always compute — no L1/fingerprint needed
+                x = block(x, cross_kv_cache=kv, **kwargs)
+                bc.blocks_computed += 1
+            else:
+                # Middle block: compute compact fingerprint for skip decision
+                w_dtype = _linear_dtype(block.self_attn.q)
+                mod = (block.modulation + e).astype(w_dtype)
+                e0 = mod[:, :, 0, :]
+                e1 = mod[:, :, 1, :]
+
+                if is_broadcast_e:
+                    # Pool-first: mean(norm(x)) then modulate on [B, dim]
+                    # Avoids materializing full [B, seq_len, dim] x_mod
+                    norm_mean = block.norm1(x).mean(axis=-2)
+                    fingerprint = norm_mean * (1 + e1.squeeze(-2)) + e0.squeeze(-2)
+                else:
+                    # I2V: per-token modulation requires full x_mod first
+                    x_mod = block.norm1(x) * (1 + e1) + e0
+                    fingerprint = x_mod.mean(axis=-2)
+
+                l1 = bc.compute_block_l1(i, fingerprint)
+
+                if bc.should_skip_block(i, l1):
+                    bc.blocks_skipped += 1
+                    if bc.verbose:
+                        print(f"      [BWCache block] block {i}: SKIP (l1={l1:.4f})")
+                    continue
+
+                # Compute the block fully
+                x = block(x, cross_kv_cache=kv, **kwargs)
+                bc.blocks_computed += 1
+                if bc.verbose:
+                    print(f"      [BWCache block] block {i}: COMPUTE (l1={l1:.4f})")
+
+        bc.cnt += 1
+        return x
+
+    def _run_blocks_plain(
+        self,
+        x: mx.array,
+        cross_kv_caches: list | None,
+        kwargs: dict,
+    ) -> mx.array:
+        """Run all transformer blocks without any caching."""
+        for i, block in enumerate(self.blocks):
+            kv = cross_kv_caches[i] if cross_kv_caches is not None else None
+            x = block(x, cross_kv_cache=kv, **kwargs)
+        return x
+
+    def _run_blocks(
+        self,
+        x: mx.array,
+        cross_kv_caches: list | None,
+        kwargs: dict,
+    ) -> mx.array:
+        """Run transformer blocks, routing through BWCache block mode if active."""
+        if self.bwcache.enabled and self.bwcache.mode == "block":
+            return self._run_blocks_bwcache(x, cross_kv_caches, kwargs)
+        return self._run_blocks_plain(x, cross_kv_caches, kwargs)
 
     def __call__(
         self,
@@ -446,6 +542,44 @@ class WanModel(nn.Module):
             mc.record_ratio(x - ori_x)
             mc.advance()
 
+        elif self.bwcache.enabled and self.bwcache.mode == "step":
+            # BWCache step-level mode (paper-faithful)
+            # Lazy L1: accumulate as mx.array, single .item() after all blocks
+            bc = self.bwcache
+
+            if bc.cal_list_triggered and bc.should_skip_step(bc.cnt):
+                x = x + bc.previous_residual
+                bc.steps_skipped += 1
+                if bc.verbose:
+                    print(f"    [BWCache step] step {bc.cnt}: SKIP (cal_list)")
+            else:
+                ori_x = x
+                acu_l1 = mx.array(0.0)
+                for i, block in enumerate(self.blocks):
+                    kv = cross_kv_caches[i] if cross_kv_caches is not None else None
+                    # Compute L1 lazily (no GPU sync per block)
+                    w_dtype = _linear_dtype(block.self_attn.q)
+                    mod = (block.modulation + kwargs["e"]).astype(w_dtype)
+                    e0 = mod[:, :, 0, :]
+                    e1 = mod[:, :, 1, :]
+                    x_mod = block.norm1(x) * (1 + e1) + e0
+                    acu_l1 = acu_l1 + bc.compute_block_l1_lazy(i, x_mod)
+                    # Run block normally (no bwcache_ctx needed)
+                    x = block(x, cross_kv_cache=kv, **kwargs)
+                # Single sync point for the entire step
+                acu_l1_val = acu_l1.item()
+                bc.cache_step_residual(x - ori_x)
+                bc.update_schedule(acu_l1_val, len(self.blocks), bc.cnt)
+                bc.steps_computed += 1
+                if bc.verbose:
+                    mean_l1 = acu_l1_val / len(self.blocks)
+                    print(
+                        f"    [BWCache step] step {bc.cnt}: COMPUTE "
+                        f"(mean_l1={mean_l1:.4f}, triggered={bc.cal_list_triggered})"
+                    )
+
+            bc.cnt += 1
+
         elif self.magcache.enabled and self.spectrum.enabled:
             # Hybrid MagCache+Spectrum mode
             sp = self.spectrum
@@ -470,9 +604,7 @@ class WanModel(nn.Module):
                         )
                 else:
                     ori_x = x
-                    for i, block in enumerate(self.blocks):
-                        kv = cross_kv_caches[i] if cross_kv_caches is not None else None
-                        x = block(x, cross_kv_cache=kv, **kwargs)
+                    x = self._run_blocks(x, cross_kv_caches, kwargs)
                     mc.residual_cache = x - ori_x
                     mc.steps_computed += 1
                     # Feed real features to Spectrum cache
@@ -499,18 +631,14 @@ class WanModel(nn.Module):
 
                 if do_compute:
                     ori_x = x
-                    for i, block in enumerate(self.blocks):
-                        kv = cross_kv_caches[i] if cross_kv_caches is not None else None
-                        x = block(x, cross_kv_cache=kv, **kwargs)
+                    x = self._run_blocks(x, cross_kv_caches, kwargs)
                     mc.residual_cache = x - ori_x
                     mc.steps_computed += 1
                     h_flat = x.reshape(-1)
                     forecaster.update(sp.cnt, h_flat)
                     mx.eval(forecaster.cheb.H_buf, forecaster.cheb.t_buf)
                     if mc.verbose:
-                        print(
-                            f"    [MagCache+Spectrum] step {mc.cnt}: Phase2 COMPUTE"
-                        )
+                        print(f"    [MagCache+Spectrum] step {mc.cnt}: Phase2 COMPUTE")
                 else:
                     h_pred = forecaster.predict(sp.cnt)
                     mx.eval(h_pred)
@@ -537,9 +665,7 @@ class WanModel(nn.Module):
                     print(f"    [MagCache] step {mc.cnt}: SKIP")
             else:
                 ori_x = x
-                for i, block in enumerate(self.blocks):
-                    kv = cross_kv_caches[i] if cross_kv_caches is not None else None
-                    x = block(x, cross_kv_cache=kv, **kwargs)
+                x = self._run_blocks(x, cross_kv_caches, kwargs)
                 mc.residual_cache = x - ori_x
                 mc.steps_computed += 1
                 if mc.verbose:
@@ -553,9 +679,7 @@ class WanModel(nn.Module):
             do_compute = sp.should_compute()
 
             if do_compute:
-                for i, block in enumerate(self.blocks):
-                    kv = cross_kv_caches[i] if cross_kv_caches is not None else None
-                    x = block(x, cross_kv_cache=kv, **kwargs)
+                x = self._run_blocks(x, cross_kv_caches, kwargs)
                 # Cache flattened features and update Chebyshev fit
                 h_flat = x.reshape(-1)
                 forecaster.update(sp.cnt, h_flat)
@@ -618,18 +742,14 @@ class WanModel(nn.Module):
             else:
                 # Full forward pass through transformer blocks
                 ori_x = x
-                for i, block in enumerate(self.blocks):
-                    kv = cross_kv_caches[i] if cross_kv_caches is not None else None
-                    x = block(x, cross_kv_cache=kv, **kwargs)
+                x = self._run_blocks(x, cross_kv_caches, kwargs)
                 # Cache the residual for potential reuse
                 tc.previous_residual = x - ori_x
                 tc.steps_computed += 1
 
             tc.cnt += 1
         else:
-            for i, block in enumerate(self.blocks):
-                kv = cross_kv_caches[i] if cross_kv_caches is not None else None
-                x = block(x, cross_kv_cache=kv, **kwargs)
+            x = self._run_blocks(x, cross_kv_caches, kwargs)
 
         # Output head
         x = self.head(x, e)
