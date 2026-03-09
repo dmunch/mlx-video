@@ -90,9 +90,8 @@ class Head(nn.Module):
         """
         if e.ndim == 2:
             e = e[:, None, :]  # [B, 1, dim]
-        # Compute modulation in float32 for precision, cast to working dtype
-        w_dtype = _linear_dtype(self.head)
-        mod = (self.modulation[:, None, :, :] + e[:, :, None, :]).astype(w_dtype)
+        # Compute modulation in float32 (matching reference's autocast(float32))
+        mod = self.modulation[:, None, :, :] + e[:, :, None, :]  # float32
         e0 = mod[:, :, 0, :]  # [B, L_e, dim] shift
         e1 = mod[:, :, 1, :]  # [B, L_e, dim] scale
         x_norm = self.norm(x)
