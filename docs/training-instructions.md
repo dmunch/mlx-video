@@ -478,11 +478,20 @@ QLoRA dramatically reduces memory bandwidth by storing base model weights in 4-b
 
 ### Pre-converting the model
 
+Convert from PyTorch and quantize in one step:
 ```bash
 python -m mlx_video.convert_wan \
-  --model-dir /path/to/wan22_bf16 \
+  --checkpoint-dir /path/to/Wan2.2-T2V-A14B \
   --output-dir /path/to/wan22_4bit \
-  --quantize --q-bits 4 --q-group-size 64
+  --quantize --bits 4 --group-size 64
+```
+
+Or quantize an already-converted MLX model (much faster — skips PyTorch conversion):
+```bash
+python -m mlx_video.convert_wan \
+  --checkpoint-dir /path/to/wan22_mlx_bf16 \
+  --output-dir /path/to/wan22_4bit \
+  --quantize-only --bits 4 --group-size 64
 ```
 
 This creates a quantized copy with `config.json` containing `{"quantization": {"bits": 4, "group_size": 64}}`. The original model is unchanged.
