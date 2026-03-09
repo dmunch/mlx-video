@@ -715,16 +715,17 @@ def train_simultaneous(
             # Record previous step's deferred loss (ready by now — GPU moved on)
             if _prev_loss is not None:
                 loss_val = _prev_loss.item()
-                epoch_loss += loss_val
-                if _prev_expert == "H":
-                    epoch_h_loss += loss_val
-                    epoch_h_steps += 1
-                else:
-                    epoch_l_loss += loss_val
-                    epoch_l_steps += 1
-                running_loss += loss_val
-                loss_count += 1
-                avg_loss = running_loss / loss_count
+                if not (loss_val != loss_val):  # skip NaN (NaN != NaN is True)
+                    epoch_loss += loss_val
+                    if _prev_expert == "H":
+                        epoch_h_loss += loss_val
+                        epoch_h_steps += 1
+                    else:
+                        epoch_l_loss += loss_val
+                        epoch_l_steps += 1
+                    running_loss += loss_val
+                    loss_count += 1
+                avg_loss = running_loss / max(1, loss_count)
                 pbar.set_postfix(
                     loss=f"{loss_val:.4f}", avg=f"{avg_loss:.4f}", expert=_prev_expert,
                     H=high_steps, L=low_steps,
@@ -786,15 +787,16 @@ def train_simultaneous(
         # Flush last step's deferred loss
         if _prev_loss is not None:
             loss_val = _prev_loss.item()
-            epoch_loss += loss_val
-            if _prev_expert == "H":
-                epoch_h_loss += loss_val
-                epoch_h_steps += 1
-            else:
-                epoch_l_loss += loss_val
-                epoch_l_steps += 1
-            running_loss += loss_val
-            loss_count += 1
+            if not (loss_val != loss_val):  # skip NaN
+                epoch_loss += loss_val
+                if _prev_expert == "H":
+                    epoch_h_loss += loss_val
+                    epoch_h_steps += 1
+                else:
+                    epoch_l_loss += loss_val
+                    epoch_l_steps += 1
+                running_loss += loss_val
+                loss_count += 1
             _prev_loss = None
 
         # Record epoch averages (combined + per-expert)

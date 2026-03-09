@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.utils
 
 from mlx_video.utils import Colors
 
@@ -103,6 +104,22 @@ def _load_model(model_dir: Path, weight_file: str, base_loras=None):
 
     model.load_weights(list(weights.items()), strict=False)
     mx.eval(model.parameters())
+
+    # Validate model weights: check for NaN/Inf in bias tensors
+    bad_keys = []
+    for name, param in mlx.utils.tree_flatten(model.parameters()):
+        if name.endswith(".bias") and not name.endswith(".biases"):
+            if mx.any(mx.isnan(param)).item() or mx.any(mx.isinf(param)).item():
+                bad_keys.append(name)
+    if bad_keys:
+        raise RuntimeError(
+            f"Corrupted model weights in {weight_file}: "
+            f"{len(bad_keys)} bias tensors contain NaN/Inf "
+            f"(e.g. {bad_keys[0]}). Please reconvert the model with: "
+            f"python -m mlx_video.convert_wan --checkpoint-dir <src> "
+            f"--output-dir {model_dir} --quantize"
+        )
+
     del weights
     gc.collect()
     mx.clear_cache()
