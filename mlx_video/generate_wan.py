@@ -334,7 +334,7 @@ def generate_video(
             mx.eval(img_tensor)
 
             vae_enc = load_vae_encoder(vae_path, config)
-            z_img = vae_enc(img_tensor)  # [1, 1, H_lat, W_lat, z_dim]
+            z_img = vae_enc.encode(img_tensor)  # [1, 1, H_lat, W_lat, z_dim]
             mx.eval(z_img)
             z_img = z_img[0].transpose(3, 0, 1, 2)  # [z_dim, 1, H_lat, W_lat]
             i2v_mask, i2v_mask_tokens = build_i2v_mask(target_shape, config.patch_size)
