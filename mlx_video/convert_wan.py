@@ -619,6 +619,67 @@ def _quantize_saved_model(
     print(f"  Updated config.json with quantization metadata")
 
 
+def quantize_mlx_model(
+    mlx_model_dir: str,
+    output_dir: str,
+    bits: int = 4,
+    group_size: int = 64,
+):
+    """Quantize an already-converted MLX model (skips PyTorch conversion).
+
+    Args:
+        mlx_model_dir: Path to existing MLX model directory (bf16/fp16).
+        output_dir: Path to output quantized model directory.
+        bits: Quantization bits (4 or 8).
+        group_size: Quantization group size (32, 64, or 128).
+    """
+    import json
+    import shutil
+
+    src = Path(mlx_model_dir)
+    dst = Path(output_dir)
+
+    config_path = src / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"No config.json found in {src}")
+
+    with open(config_path) as f:
+        cfg = json.load(f)
+
+    if cfg.get("quantization"):
+        raise ValueError(
+            f"Model at {src} is already quantized "
+            f"({cfg['quantization']['bits']}-bit). Use a bf16/fp16 source."
+        )
+
+    # Detect dual vs single expert
+    is_dual = (src / "low_noise_model.safetensors").exists() and (
+        src / "high_noise_model.safetensors"
+    ).exists()
+
+    # Build model config
+    from mlx_video.models.wan.config import WanModelConfig
+
+    config_dict = {k: v for k, v in cfg.items() if k in WanModelConfig.__dataclass_fields__}
+    for key in ("patch_size", "vae_stride", "window_size", "sample_guide_scale"):
+        if key in config_dict and isinstance(config_dict[key], list):
+            config_dict[key] = tuple(config_dict[key])
+    config = WanModelConfig(**config_dict)
+
+    # Copy files to output dir if different from source
+    if dst.resolve() != src.resolve():
+        dst.mkdir(parents=True, exist_ok=True)
+        for f in src.iterdir():
+            if f.is_file():
+                shutil.copy2(f, dst / f.name)
+        print(f"Copied MLX model from {src} to {dst}")
+
+    print(f"Quantizing transformer weights ({bits}-bit, group_size={group_size})...")
+    _quantize_saved_model(dst, config, is_dual, bits, group_size)
+
+    print(f"\nQuantization complete! Output: {dst}")
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -655,6 +716,11 @@ if __name__ == "__main__":
         help="Quantize transformer weights for faster inference",
     )
     parser.add_argument(
+        "--quantize-only",
+        action="store_true",
+        help="Quantize an already-converted MLX model (skips PyTorch conversion)",
+    )
+    parser.add_argument(
         "--bits",
         type=int,
         choices=[4, 8],
@@ -669,7 +735,14 @@ if __name__ == "__main__":
         help="Quantization group size (default: 64)",
     )
     args = parser.parse_args()
-    convert_wan_checkpoint(
-        args.checkpoint_dir, args.output_dir, args.dtype, args.model_version,
-        quantize=args.quantize, bits=args.bits, group_size=args.group_size,
-    )
+
+    if args.quantize_only:
+        quantize_mlx_model(
+            args.checkpoint_dir, args.output_dir,
+            bits=args.bits, group_size=args.group_size,
+        )
+    else:
+        convert_wan_checkpoint(
+            args.checkpoint_dir, args.output_dir, args.dtype, args.model_version,
+            quantize=args.quantize, bits=args.bits, group_size=args.group_size,
+        )
