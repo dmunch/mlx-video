@@ -162,10 +162,13 @@ class WanModel(nn.Module):
         ], axis=1)
 
         # Precompute sinusoidal inv_freq for time embedding
+        # Use numpy float64 for precision (matches reference torch.float64),
+        # then store as float32 since MLX GPU doesn't support float64.
         half = config.freq_dim // 2
-        self._inv_freq = mx.power(
-            10000.0, -mx.arange(half).astype(mx.float32) / half
+        inv_freq_np = np.power(
+            10000.0, -np.arange(half, dtype=np.float64) / half
         )
+        self._inv_freq = mx.array(inv_freq_np.astype(np.float32))
 
         # TeaCache state (disabled by default)
         self.teacache = TeaCacheState()

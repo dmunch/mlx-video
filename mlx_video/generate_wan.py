@@ -48,6 +48,7 @@ def generate_video(
     loras_high: list | None = None,
     loras_low: list | None = None,
     tiling: str = "auto",
+    no_compile: bool = False,
 ):
     """Generate video using Wan pipeline (supports T2V and I2V).
 
@@ -75,6 +76,7 @@ def generate_video(
             - "default", "aggressive", "conservative": Preset tiling configs
             - "spatial": Spatial tiling only
             - "temporal": Temporal tiling only
+        no_compile: If True, skip mx.compile on models (useful for debugging)
     """
     import json
 
@@ -180,12 +182,7 @@ def generate_video(
     # Validate frame count
     assert (num_frames - 1) % 4 == 0, f"num_frames must be 4n+1, got {num_frames}"
 
-    # For T2V: generate 1 extra latent frame so the VAE's causal zero-padding
-    # artifacts land on throwaway frames. The reference Wan2.2 speech2video.py
-    # uses a similar "drop_first_motion" approach (drops 3 pixel frames).
-    # For I2V the reference image provides real first-frame content, so no extra needed.
-    extra_frames = config.vae_stride[0] if not is_i2v else 0
-    gen_frames = num_frames + extra_frames
+    gen_frames = num_frames
 
     version_str = f"Wan{config.model_version}"
     mode_str = "dual-model" if is_dual else "single-model"
@@ -248,8 +245,6 @@ def generate_video(
     )
 
     print(f"{Colors.DIM}  Latent shape: {target_shape}")
-    if extra_frames > 0:
-        print(f"  Generating {extra_frames} extra pixel frames to absorb VAE boundary artifacts")
     print(f"  Sequence length: {seq_len}{Colors.RESET}")
 
     # Load T5 encoder
@@ -426,7 +421,7 @@ def generate_video(
         rope_cos_sin_high = high_noise_model.prepare_rope(rope_grid_sizes)
         mx.eval(rope_cos_sin_low, rope_cos_sin_high)
     else:
-        rope_cos_sin = ref_model.prepare_rope(rope_grid_sizes)
+        rope_cos_sin = single_model.prepare_rope(rope_grid_sizes)
         mx.eval(rope_cos_sin)
 
     # Setup scheduler
@@ -477,7 +472,7 @@ def generate_video(
             print(f"{Colors.DIM}  TeaCache: threshold={teacache_thresh}{Colors.RESET}")
 
     # Compile model forward for faster denoising (incompatible with TeaCache)
-    if teacache_thresh <= 0:
+    if teacache_thresh <= 0 and not no_compile:
         models_to_compile = (
             [high_noise_model, low_noise_model] if is_dual else [single_model]
         )
@@ -664,9 +659,6 @@ def generate_video(
         print(f"{Colors.DIM}  VAE decode: {time.time() - t4:.1f}s{Colors.RESET}")
 
         video = np.array(video[0])  # [T', H', W', 3]
-        # Trim extra frames generated for zero-padding warmup
-        if extra_frames > 0:
-            video = video[extra_frames:]
         video = (video + 1.0) / 2.0
         video = np.clip(video * 255.0, 0, 255).astype(np.uint8)
     else:
@@ -733,6 +725,10 @@ def main():
         choices=["auto", "none", "default", "aggressive", "conservative", "spatial", "temporal"],
         help="VAE tiling mode to reduce memory during decoding (default: auto)",
     )
+    parser.add_argument(
+        "--no-compile", action="store_true",
+        help="Disable mx.compile on models (for debugging)",
+    )
     args = parser.parse_args()
 
     # Parse guide scale
@@ -771,6 +767,7 @@ def main():
         loras_high=_parse_lora_args(args.lora_high),
         loras_low=_parse_lora_args(args.lora_low),
         tiling=args.tiling,
+        no_compile=args.no_compile,
     )
 
 
