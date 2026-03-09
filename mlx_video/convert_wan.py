@@ -582,6 +582,21 @@ def _quantize_saved_model(
 
         # Save quantized weights
         weights_dict = dict(mlx.utils.tree_flatten(model.parameters()))
+
+        # Validate: check for NaN/Inf in bias tensors (corruption canary)
+        bad_keys = []
+        for k, v in weights_dict.items():
+            if k.endswith(".bias") and not k.endswith(".biases"):
+                mx.eval(v)
+                if mx.any(mx.isnan(v)).item() or mx.any(mx.isinf(v)).item():
+                    bad_keys.append(k)
+        if bad_keys:
+            raise RuntimeError(
+                f"Quantization produced corrupted weights in {model_path.name}: "
+                f"{len(bad_keys)} bias tensors contain NaN/Inf "
+                f"(e.g. {bad_keys[0]}). Try re-running with more available memory."
+            )
+
         mx.save_safetensors(str(model_path), weights_dict)
         n_quantized = sum(1 for k in weights_dict if ".scales" in k)
         print(f"    {n_quantized} layers quantized, {len(weights_dict)} tensors saved")
